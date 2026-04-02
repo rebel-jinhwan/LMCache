@@ -47,6 +47,8 @@ from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
 
+_PATH_SLASH_REPLACEMENT = "-SEP-"
+
 
 # ---------------------------------------------------------------
 # ObjectKey <-> file path helpers
@@ -56,7 +58,8 @@ logger = init_logger(__name__)
 def _object_key_to_filename(key: ObjectKey) -> str:
     """Derive a deterministic file name from an ObjectKey."""
     chunk_hex = key.chunk_hash.hex()
-    return f"{key.model_name}_{key.kv_rank:08x}_{chunk_hex}.bin"
+    safe_model_name = key.model_name.replace("/", _PATH_SLASH_REPLACEMENT)
+    return f"{safe_model_name}_{key.kv_rank:08x}_{chunk_hex}.bin"
 
 
 def _filename_to_object_key(filename: str) -> ObjectKey:
@@ -64,7 +67,7 @@ def _filename_to_object_key(filename: str) -> ObjectKey:
     stem = filename.removesuffix(".bin")
     # Split from the right: last part is chunk_hash, second-last is kv_rank
     parts = stem.rsplit("_", 2)
-    model_name = parts[0]
+    model_name = parts[0].replace(_PATH_SLASH_REPLACEMENT, "/")
     kv_rank = int(parts[1], 16)
     chunk_hash = bytes.fromhex(parts[2])
     return ObjectKey(chunk_hash=chunk_hash, model_name=model_name, kv_rank=kv_rank)
@@ -453,7 +456,9 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
                     }
                 entries.append(entry)
 
-        os.makedirs(os.path.dirname(config.persist_path), exist_ok=True)
+        persist_dir = os.path.dirname(config.persist_path)
+        if persist_dir:
+            os.makedirs(persist_dir, exist_ok=True)
         with open(config.persist_path, "w") as f:
             json.dump(entries, f)
 
