@@ -3,7 +3,7 @@
 
 # mypy: disable-error-code="union-attr"
 # Standard
-from typing import Optional
+from typing import Optional, cast
 
 # Third Party
 import torch
@@ -56,6 +56,31 @@ class VLLM_Detector(EngineDetector):
 
         if list_depth == 0:
             return lmc_ops.EngineKVFormat.NB_NL_TWO_BS_NH_HS, kv_caches
+        if (
+            list_depth == 1
+            and tensor_ndim == 6
+            and torch_device_type == "rbln"
+            and isinstance(kv_caches, list)
+        ):
+            # vLLM-RBLN adds a singleton axis between heads and block tokens.
+            # It is always 1, so squeezing it is a free view onto identical
+            # bytes and yields exactly NL_X_TWO_NB_NH_BS_HS. Normalizing here
+            # (rather than in the connector alone) is what lets the
+            # multiprocess path work: its register / gather / scatter helpers
+            # resolve layouts through this function, never through a connector.
+            # First Party
+            from lmcache.v1.platform.rbln.kv_layout import (
+                is_rbln_kv_layout,
+                squeeze_singleton_axis,
+            )
+
+            # ``list_depth == 1`` already established a flat list of tensors.
+            layers = cast("list[torch.Tensor]", kv_caches)
+            if is_rbln_kv_layout(cast("torch.Tensor", first_tensor)):
+                return (
+                    lmc_ops.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
+                    cast(DiscoverableKVCache, squeeze_singleton_axis(layers)),
+                )
         if list_depth == 1 and tensor_ndim == 5:
             if first_tensor.shape[0] == 2:  # K/V axis first
                 if is_hnd:

@@ -4,16 +4,14 @@
 vLLM-RBLN hands LMCache one 6-D tensor per layer,
 ``[2, num_blocks, num_kv_heads, 1, block_size, head_size]`` -- the HND layout
 with a singleton axis between heads and block tokens that the RBLN attention
-backend requires. Upstream format discovery only recognises the 5-D ranks, so
-the raw tensors are rejected.
+backend requires.
 
-Rather than teach the detector a sixth rank, this connector squeezes the
-singleton axis at registration and discovers the format from the resulting 5-D
-views. Axis 3 is always 1, so the squeeze is a free view onto identical bytes
-and yields exactly ``NL_X_TWO_NB_NH_BS_HS``. This mirrors what
-:class:`~lmcache.v1.gpu_connector.hpu_connector.VLLMPagedMemHPUConnectorV2`
-already does for HPU, which builds a proxy tensor list so its
-``List[Tuple[Tensor, Tensor]]`` caches can be discovered.
+Axis 3 is always 1, so squeezing it is a free view onto identical bytes that
+yields exactly ``NL_X_TWO_NB_NH_BS_HS``. The rule lives in
+:mod:`lmcache.v1.platform.rbln.kv_layout` and is applied by the vLLM format
+detector, so the multiprocess path -- which resolves layouts without ever
+touching a connector -- normalizes identically. This connector reuses the same
+helper because it also needs the 5-D views for its own slot indexing.
 
 The connector produces and consumes ``KV_2LTD`` memory objects
 (``[2, num_layers, num_tokens, num_heads * head_size]``), the same contract
@@ -57,6 +55,7 @@ from lmcache.v1.gpu_connector.utils import (
     normalize_kv_and_discover_format,
 )
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.platform.rbln.kv_layout import squeeze_singleton_axis
 
 if TYPE_CHECKING:
     # First Party
@@ -64,10 +63,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-#: Rank of the native RBLN per-layer KV tensor.
-_RBLN_KV_NDIM = 6
-#: Axis of the native layout that is always 1 and is squeezed away.
-_RBLN_SINGLETON_AXIS = 3
 #: vLLM-RBLN stores heads before block tokens.
 _RBLN_LAYOUT_HINTS: LayoutHints = {"kv_layout": "HND"}
 
@@ -115,30 +110,30 @@ class VLLMPagedMemRBLNConnectorV2(GPUConnectorInterface):
         if kvcaches is not None:
             self.kvcaches = kvcaches  # type: ignore[assignment]
 
-    @staticmethod
-    def squeeze_singleton_axis(kv_caches: List[torch.Tensor]) -> List[torch.Tensor]:
-        """Return 5-D HND views of the native 6-D RBLN KV tensors.
+    def register_kv_caches(self, kv_caches: List[torch.Tensor]) -> None:
+        """Register the per-layer KV caches and discover their geometry.
+
+        Transfers discover the geometry lazily on first use, which leaves
+        :meth:`get_shape` unusable until then. Callers that must size a memory
+        object up front -- benchmarks, or an engine that allocates before its
+        first transfer -- register explicitly here instead.
 
         Args:
-            kv_caches: Per-layer tensors shaped
-                ``[2, NB, NH, 1, BS, HS]``.
-
-        Returns:
-            list[torch.Tensor]: Views shaped ``[2, NB, NH, BS, HS]``, sharing
-            storage with the inputs.
+            kv_caches: Per-layer tensors shaped ``[2, NB, NH, 1, BS, HS]``, in
+                layer order.
 
         Raises:
-            ValueError: If a tensor is not 6-D with a singleton at axis 3.
+            ValueError: If ``kv_caches`` is empty, or a tensor is not 6-D with
+                a singleton at axis 3.
         """
-        views: List[torch.Tensor] = []
-        for tensor in kv_caches:
-            if tensor.ndim != _RBLN_KV_NDIM or tensor.shape[_RBLN_SINGLETON_AXIS] != 1:
-                raise ValueError(
-                    "RBLN KV caches must be [2, NB, NH, 1, BS, HS]; got "
-                    + str(tuple(tensor.shape))
-                )
-            views.append(tensor.squeeze(_RBLN_SINGLETON_AXIS))
-        return views
+        if not kv_caches:
+            raise ValueError("kv_caches must be non-empty")
+        self.kvcaches = list(kv_caches)
+        self._initialize_attributes(self.kvcaches)
+
+    #: Shared with the vLLM format detector so the in-process and multiprocess
+    #: paths normalize the native layout identically.
+    squeeze_singleton_axis = staticmethod(squeeze_singleton_axis)
 
     def _initialize_attributes(self, kv_caches: List[torch.Tensor]) -> None:
         """Discover the KV geometry once, from the squeezed 5-D views."""

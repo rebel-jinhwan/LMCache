@@ -55,7 +55,7 @@ def _slot_mapping(num_tokens: int) -> torch.Tensor:
 def _connector_with_attributes() -> VLLMPagedMemRBLNConnectorV2:
     """A connector that has already discovered its geometry."""
     connector = VLLMPagedMemRBLNConnectorV2()
-    connector._initialize_attributes(_native_kv())
+    connector.register_kv_caches(_native_kv())
     return connector
 
 
@@ -136,7 +136,7 @@ def test_gather_matches_an_independent_hnd_expectation() -> None:
     num_tokens = NUM_BLOCKS * BLOCK_SIZE
     slot_mapping = _slot_mapping(num_tokens)
 
-    connector._initialize_attributes(native)
+    connector.register_kv_caches(native)
     memory_obj = _allocator().allocate(connector.get_shape(num_tokens), DTYPE)
     assert memory_obj is not None
     connector.from_gpu(
@@ -163,7 +163,7 @@ def test_round_trip_restores_the_native_cache() -> None:
 
     reader = VLLMPagedMemRBLNConnectorV2()
     writer = VLLMPagedMemRBLNConnectorV2()
-    reader._initialize_attributes(src)
+    reader.register_kv_caches(src)
     memory_obj = _allocator().allocate(reader.get_shape(num_tokens), DTYPE)
     assert memory_obj is not None
 
@@ -184,7 +184,7 @@ def test_partial_slice_touches_only_its_tokens() -> None:
 
     reader = VLLMPagedMemRBLNConnectorV2()
     writer = VLLMPagedMemRBLNConnectorV2()
-    reader._initialize_attributes(src)
+    reader.register_kv_caches(src)
     memory_obj = _allocator().allocate(reader.get_shape(end - start), DTYPE)
     assert memory_obj is not None
 
@@ -215,12 +215,16 @@ def test_missing_slot_mapping_is_refused() -> None:
 
 
 def test_missing_kvcaches_is_refused() -> None:
-    """Nothing can be transferred before the caches are known."""
-    connector = _connector_with_attributes()
-    memory_obj = _allocator().allocate(connector.get_shape(4), DTYPE)
+    """Nothing can be transferred before the caches are known.
+
+    The shape comes from a separately registered connector so the connector
+    under test has never seen a KV cache at all.
+    """
+    memory_obj = _allocator().allocate(_connector_with_attributes().get_shape(4), DTYPE)
     assert memory_obj is not None
+    unregistered = VLLMPagedMemRBLNConnectorV2()
     with pytest.raises(ValueError, match="kvcaches"):
-        connector.from_gpu(memory_obj, 0, 4, slot_mapping=_slot_mapping(4))
+        unregistered.from_gpu(memory_obj, 0, 4, slot_mapping=_slot_mapping(4))
 
 
 def test_non_kv_2ltd_memory_object_is_refused() -> None:
@@ -235,3 +239,16 @@ def test_non_kv_2ltd_memory_object_is_refused() -> None:
         connector.from_gpu(
             memory_obj, 0, 4, kvcaches=native, slot_mapping=_slot_mapping(4)
         )
+
+
+def test_explicit_registration_enables_get_shape() -> None:
+    """`register_kv_caches` discovers geometry without a transfer first."""
+    connector = VLLMPagedMemRBLNConnectorV2()
+    connector.register_kv_caches(_native_kv())
+    assert connector.get_shape(8) == torch.Size([2, NUM_LAYERS, 8, HIDDEN_DIM])
+
+
+def test_registering_nothing_is_refused() -> None:
+    """An empty layer list is not a valid registration."""
+    with pytest.raises(ValueError, match="non-empty"):
+        VLLMPagedMemRBLNConnectorV2().register_kv_caches([])

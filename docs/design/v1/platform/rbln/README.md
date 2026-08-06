@@ -109,23 +109,32 @@ RBLN's per-layer KV cache is 6-D `[2, NB, NH, 1, BS, HS]`. The closest
 registered format, `NL_X_TWO_NB_NH_BS_HS` (6), is 5-D `[2, NB, NH, BS, HS]` --
 identical bytes and strides, one axis short.
 
-**No new `EngineKVFormat` member is registered.** `VLLMPagedMemRBLNConnectorV2`
-squeezes axis 3 at registration and discovers the format from the resulting 5-D
-views, which resolve to `NL_X_TWO_NB_NH_BS_HS`. The squeeze is a view onto the
-same storage, and it raises `ValueError` if axis 3 is not 1 rather than
-transferring the wrong slots.
+**No new `EngineKVFormat` is registered.** Axis 3 is always 1, so squeezing it
+is a free view that yields exactly format 6. The rule lives in
+`lmcache/v1/platform/rbln/kv_layout.py` and is applied at the one place both
+transfer paths pass through: the vLLM format detector.
 
-This follows `VLLMPagedMemHPUConnectorV2`, which already builds a proxy tensor
-list so its `List[Tuple[Tensor, Tensor]]` caches survive format discovery. The
-connector is the device-scoped extension point; normalising there keeps the
-detector, the format enum, the spec registry and `torch_ops` untouched.
+That placement is what makes the multiprocess path work. `compute_kv_layout`,
+`gather_paged_kv_to_cpu` and `scatter_cpu_to_paged_kv` all resolve layouts via
+`normalize_kv_and_discover_format` and never touch a connector, so normalizing
+in the connector alone would have left MP broken -- it raised
+`ValueError: unsupported kv_caches structure` on the native 6-D tensors.
+
+| path | reaches the layout through | normalized by |
+|---|---|---|
+| in-process | `VLLMPagedMemRBLNConnectorV2` | detector (plus its own 5-D views for slot indexing) |
+| multiprocess | `compute_kv_layout` / gather / scatter | detector |
+
+The detector branch is gated on `torch_device_type == "rbln"`, following the
+`torch_device_type == "cpu"` precedent already in that function, so no other
+accelerator's 6-D layout can be silently reinterpreted.
 
 ### Why not a new format
 
-A `NL_X_TWO_NB_NH_ONE_BS_HS` member was prototyped and dropped. It is
-reachable without touching C++ -- but only if its spec imports `EngineKVFormat`
-from `lmcache.v1.platform.ops_types` directly, because `lmcache.c_ops` is a PEP
-562 shim forwarding to `resolve_device_ops(torch_device_type)`, and
+A `NL_X_TWO_NB_NH_ONE_BS_HS` member was prototyped and dropped. It is reachable
+without touching C++ -- but only if its spec imports `EngineKVFormat` from
+`lmcache.v1.platform.ops_types` directly, because `lmcache.c_ops` is a PEP 562
+shim forwarding to `resolve_device_ops(torch_device_type)`, and
 `DeviceOps.bind_native()` replaces the enum wholesale with the compiled
 module's type:
 
@@ -139,29 +148,30 @@ device, a spec written the conventional way (`import lmcache.c_ops as lmc_ops`)
 raises `AttributeError` at import on a CUDA build.
 
 Even done correctly it costs an enum member, a spec file, and per-format
-branches in `torch_ops` (`is_layer_list`, `_is_hnd_format`,
-`_per_layer_paged_shape`, the HND transfer kernel, and the `multi_layer_kv_transfer`
-guard) -- to describe a layout indistinguishable in memory from one already
-registered. The connector-side squeeze achieves the same with none of it.
+branches in `torch_ops` -- to describe a layout indistinguishable in memory
+from one already registered. `tests/v1/gpu_connector/test_kv_format_classification.py`
+also pins the format set deliberately, so every addition is a reviewed
+decision. The squeeze achieves the same with none of it.
 
-### What the connector must handle itself
+### What the connector still handles itself
 
 HND puts the head axis *between* blocks and block tokens, so tokens are not
 contiguous within a layer. The flat `view(num_blocks * block_size, hidden_dim)`
 reshape the NHD connectors use would address the wrong slots, and a
-`permute(...).reshape(...)` would copy the whole KV cache. The connector
-instead resolves each slot into `(block, offset)` and uses advanced indexing,
+`permute(...).reshape(...)` would copy the whole KV cache. Each transfer
+instead resolves slots into `(block, offset)` and uses advanced indexing,
 touching only the request's tokens.
 
-It also passes `layout_hints={"kv_layout": "HND"}` explicitly. The vLLM
-detector defaults to NHD and only forces HND when `torch_device_type == "cpu"`
--- which is what RBLN was accidentally relying on before `RblnDeviceSpec`
-existed, since detection used to fall back to the CPU stub.
+The connector also passes `layout_hints={"kv_layout": "HND"}` explicitly. The
+vLLM detector defaults to NHD and only forces HND when
+`torch_device_type == "cpu"` -- which RBLN was accidentally relying on before
+`RblnDeviceSpec` existed, since detection used to fall back to the CPU stub.
 
-## MP mode is not covered by this
+## Running LMCache's own test suite on an RBLN host
 
-`EngineDrivenTransferContext.register()` calls `compute_kv_layout(kv_caches)`
-directly; no connector participates. The 6-D tensors are still rejected there,
-so the multiprocess path needs its own normalisation -- either at the adapter
-that supplies `kv_caches`, or a detector change. That is deliberately out of
-scope here.
+`RblnDeviceSpec` changes what `torch_device_type` resolves to on a machine with
+a free NPU, which changes behaviour for tests that assume a stream-capable
+device. `tests/v1/gpu_connector/test_gds_context.py` monkeypatched
+`torch_dev.current_stream`, which does not exist on `torch.rbln`; it now passes
+`raising=False`, matching its own "no CUDA needed" intent. Expect similar
+adjustments as more of the suite runs on RBLN CI.

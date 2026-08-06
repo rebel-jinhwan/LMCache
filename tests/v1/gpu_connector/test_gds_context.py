@@ -187,7 +187,9 @@ class TestRegisterGpuBuffer:
             lambda buf: sizes.append(buf.numel() * buf.element_size()),
         )
         monkeypatch.setattr(ca, "register_stream", lambda raw: None)
-        monkeypatch.setattr(torch_dev, "current_stream", lambda: _fake_stream(0))
+        monkeypatch.setattr(
+            torch_dev, "current_stream", lambda: _fake_stream(0), raising=False
+        )
 
         # The whole buffer is registered in <=16 MiB regions, irrespective of
         # any chunk/slot layout. A 40 MiB buffer -> 16 + 16 + 8 MiB.
@@ -209,7 +211,9 @@ class TestResolveBuffer:
         ctx.initialized = True
         monkeypatch.setattr(ca, "register_buffer", lambda b: None)
         monkeypatch.setattr(ca, "register_stream", lambda raw: None)
-        monkeypatch.setattr(torch_dev, "current_stream", lambda: _fake_stream(0))
+        monkeypatch.setattr(
+            torch_dev, "current_stream", lambda: _fake_stream(0), raising=False
+        )
         ctx.register_gpu_buffer(buf)
         resolved: list[tuple[int, int]] = []
         monkeypatch.setattr(
@@ -249,7 +253,10 @@ class TestPerStreamRegistration:
 
         def use_stream(handle: int):
             monkeypatch.setattr(
-                torch_dev, "current_stream", lambda: _fake_stream(handle)
+                torch_dev,
+                "current_stream",
+                lambda: _fake_stream(handle),
+                raising=False,
             )
 
         buf_a = torch.empty(24 << 20, dtype=torch.uint8)  # 2 regions on stream 11
