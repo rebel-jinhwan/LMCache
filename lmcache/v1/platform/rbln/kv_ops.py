@@ -24,26 +24,9 @@ from __future__ import annotations
 
 # Standard
 from typing import Sequence
-import os
 
 # Third Party
 import torch
-
-#: Copy the K and V halves separately.
-ENV_SPLIT_KV_COPY = "LMCACHE_RBLN_SPLIT_KV_COPY"
-
-
-def split_kv_copy_enabled() -> bool:
-    """Return whether the K and V halves are copied separately.
-
-    Writing ``dst.copy_(torch.stack([k, v]))`` in one shot can corrupt a half
-    through the underlying v2v stack-pair copy on some RBLN geometries; the
-    split copy makes each half byte-exact. Gated so both paths can be A/B'd.
-
-    Returns:
-        bool: ``True`` when ``LMCACHE_RBLN_SPLIT_KV_COPY`` is set.
-    """
-    return bool(os.environ.get(ENV_SPLIT_KV_COPY))
 
 
 def head_major_view(
@@ -98,11 +81,7 @@ def gather_blocks_head_major(
         for block in block_ids
     ]
     gathered = torch.cat(pieces, dim=3) if len(pieces) > 1 else pieces[0]
-    if split_kv_copy_enabled():
-        dst[0].copy_(gathered[0])
-        dst[1].copy_(gathered[1])
-    else:
-        dst.copy_(gathered)
+    dst.copy_(gathered)
 
 
 def scatter_head_major_to_blocks(
