@@ -21,6 +21,7 @@ import torch
 # First Party
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.kv_format import detectors
+from lmcache.v1.gpu_connector.kv_format.types import LayoutHints
 from lmcache.v1.gpu_connector.utils import normalize_kv_and_discover_format
 from lmcache.v1.platform.ops_types import EngineKVFormat
 from lmcache.v1.platform.rbln.kv_layout import (
@@ -45,7 +46,7 @@ def _native_kv() -> list[torch.Tensor]:
 def _discover(
     kv_caches: list[torch.Tensor],
     device_type: str = "rbln",
-    layout_hints: "dict[str, str] | None" = None,
+    layout_hints: "LayoutHints | None" = None,
 ):
     """Run discovery with ``torch_device_type`` forced to ``device_type``."""
     with patch.object(detectors.vllm, "torch_device_type", device_type):
