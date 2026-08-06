@@ -551,9 +551,11 @@ def multi_layer_kv_transfer(
     if int(engine_kv_format) in (
         int(EngineKVFormat.NL_X_TWO_NB_NH_BS_HS),
         int(EngineKVFormat.NL_X_NB_TWO_NH_BS_HS),
+        int(EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS),
     ):
         raise NotImplementedError(
-            "HND layouts (NL_X_TWO_NB_NH_BS_HS, NL_X_NB_TWO_NH_BS_HS) "
+            "HND layouts (NL_X_TWO_NB_NH_BS_HS, NL_X_NB_TWO_NH_BS_HS, "
+            "NL_X_TWO_NB_NH_ONE_BS_HS) "
             "are not supported in the non-CUDA fallback. "
             "head_size parameter is required but not implemented in this path."
         )
@@ -773,6 +775,7 @@ def is_layer_list(engine_kv_format: EngineKVFormat) -> bool:
         int(EngineKVFormat.NL_X_NB_NH_BS_CS),
         int(EngineKVFormat.NL_X_NB_BS_NH_CS),
         int(EngineKVFormat.NL_X_NB_BSV_BSS),
+        int(EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS),
     )
 
 
@@ -800,7 +803,58 @@ def _is_hnd_format(engine_kv_format: EngineKVFormat) -> bool:
     return int(engine_kv_format) in (
         int(EngineKVFormat.NL_X_TWO_NB_NH_BS_HS),
         int(EngineKVFormat.NL_X_NB_TWO_NH_BS_HS),
+        int(EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS),
     )
+
+
+def _is_kv_axis_first_hnd(engine_kv_format: EngineKVFormat) -> bool:
+    """Return True for HND formats whose leading per-layer axis is the K/V pair.
+
+    Distinguishes ``[2, NB, NH, ...]`` (indexed ``layer[0]`` / ``layer[1]``)
+    from ``[NB, 2, NH, ...]`` (indexed ``layer[:, 0]`` / ``layer[:, 1]``).
+    ``NL_X_TWO_NB_NH_ONE_BS_HS`` belongs here because
+    :func:`_squeeze_singleton_axis` has already reduced it to the
+    ``NL_X_TWO_NB_NH_BS_HS`` shape by the time the transfer runs.
+    """
+    return int(engine_kv_format) in (
+        int(EngineKVFormat.NL_X_TWO_NB_NH_BS_HS),
+        int(EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS),
+    )
+
+
+def _squeeze_singleton_axis(
+    engine_kv_format: EngineKVFormat,
+    layer_tensors: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Drop ``NL_X_TWO_NB_NH_ONE_BS_HS``'s singleton axis, leaving other formats alone.
+
+    RBLN's per-layer buffer is ``[2, NB, NH, 1, BS, HS]``; axis 3 is always 1,
+    so the squeeze is a free view onto identical bytes and yields exactly the
+    ``NL_X_TWO_NB_NH_BS_HS`` shape.  Normalizing here keeps the transfer
+    machinery free of a second HND rank.
+
+    Args:
+        engine_kv_format: Layout of ``layer_tensors``.
+        layer_tensors: Per-layer paged buffers.
+
+    Returns:
+        list[torch.Tensor]: Squeezed views for ``NL_X_TWO_NB_NH_ONE_BS_HS``,
+        otherwise ``layer_tensors`` unchanged.
+
+    Raises:
+        ValueError: If a tensor claims the format but axis 3 is not 1.
+    """
+    if int(engine_kv_format) != int(EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS):
+        return layer_tensors
+    squeezed: list[torch.Tensor] = []
+    for tensor in layer_tensors:
+        if tensor.ndim != 6 or tensor.shape[3] != 1:
+            raise ValueError(
+                "NL_X_TWO_NB_NH_ONE_BS_HS expects per-layer shape "
+                "[2, NB, NH, 1, BS, HS]; got " + str(tuple(tensor.shape))
+            )
+        squeezed.append(tensor.squeeze(3))
+    return squeezed
 
 
 def _is_fused_kv_format(engine_kv_format: EngineKVFormat) -> bool:
@@ -867,6 +921,10 @@ def _per_layer_paged_shape(
         return (nb, bs, hs)
     if fmt == int(EngineKVFormat.NL_X_TWO_NB_NH_BS_HS):
         return (2, nb, nh, bs, hs)
+    if fmt == int(EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS):
+        # RBLN HND: the singleton axis is physically present; it is squeezed
+        # away by _squeeze_singleton_axis once the tensor is reconstructed.
+        return (2, nb, nh, 1, bs, hs)
     if fmt == int(EngineKVFormat.NL_X_NB_TWO_NH_BS_HS):
         return (nb, 2, nh, bs, hs)
     if fmt in (
@@ -1578,11 +1636,16 @@ def _transfer_per_layer_hnd(
     if not layer_tensors or not object_tensors:
         return
 
+    # NL_X_TWO_NB_NH_ONE_BS_HS carries a singleton axis the other HND formats
+    # do not; dropping it here (a free view) keeps the rest of this function
+    # working on a single rank.
+    layer_tensors = _squeeze_singleton_axis(engine_kv_format, layer_tensors)
+
     target_device = layer_tensors[0].device
     block_ids_dev = torch.as_tensor(block_ids, dtype=torch.long, device=target_device)
 
     first_layer = layer_tensors[0]
-    if int(engine_kv_format) == int(EngineKVFormat.NL_X_TWO_NB_NH_BS_HS):
+    if _is_kv_axis_first_hnd(engine_kv_format):
         first_k = first_layer[0]
     else:
         first_k = first_layer[:, 0]
@@ -1621,7 +1684,7 @@ def _transfer_per_layer_hnd(
                 device=target_device,
             )
             for layer_idx, layer in enumerate(layer_tensors):
-                if int(engine_kv_format) == int(EngineKVFormat.NL_X_TWO_NB_NH_BS_HS):
+                if _is_kv_axis_first_hnd(engine_kv_format):
                     k_t, v_t = layer[0], layer[1]
                     torch.index_select(k_t, 0, eff_idx, out=scratch)
                     chunk_gpu[0, layer_idx].view(n_valid, block_size, nh0, hs0).copy_(
@@ -1649,7 +1712,7 @@ def _transfer_per_layer_hnd(
                 target_device, non_blocking=True
             )
             for layer_idx, layer in enumerate(layer_tensors):
-                if int(engine_kv_format) == int(EngineKVFormat.NL_X_TWO_NB_NH_BS_HS):
+                if _is_kv_axis_first_hnd(engine_kv_format):
                     k_t, v_t = layer[0], layer[1]
                 else:
                     k_t, v_t = layer[:, 0], layer[:, 1]

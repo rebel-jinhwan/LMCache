@@ -103,15 +103,47 @@ That makes the native kernel and the head-major engine-driven context a single
 inseparable change. A loader shim landed upstream on its own would be called by
 nothing.
 
-### The KV format
+## The KV format
 
-RBLN's per-layer KV cache is 6-D `[2, NB, NH, 1, BS, HS]`, and the closest
-registered format, `NL_X_TWO_NB_NH_BS_HS` (6), is 5-D `[2, NB, NH, BS, HS]`.
+RBLN's per-layer KV cache is 6-D `[2, NB, NH, 1, BS, HS]`. The closest
+registered format, `NL_X_TWO_NB_NH_BS_HS` (6), is 5-D `[2, NB, NH, BS, HS]` --
+identical bytes, one axis short.
 
-Adding a new `EngineKVFormat` member is **possible without touching C++**, but
-it is redundant. Both halves of that need care.
+`NL_X_TWO_NB_NH_ONE_BS_HS` (15) is registered for it, **Python-side only**.
+The engine's real rank stays visible everywhere it matters, and only the
+transfer kernel collapses it:
 
-#### A Python-only member works, if the spec imports the enum directly
+| Surface | Rank |
+|---|---|
+| `EngineKVFormat` member, `describe_shape()` | 6-D |
+| `NL_X_TWO_NB_NH_ONE_BS_HS_Spec` accessors | 6-D (`block_size` reads `shape[4]`) |
+| `torch_ops._per_layer_paged_shape()` | 6-D `(2, nb, nh, 1, bs, hs)` |
+| `torch_ops._transfer_per_layer_hnd()` | squeezed to 5-D on entry |
+
+### Why the transfer path squeezes
+
+`_squeeze_singleton_axis()` is about kernel reuse, not about the layout. The
+existing HND kernel is written against a 4-D per-K/V tensor:
+
+```python
+scratch = torch.empty(n_valid, nh0, block_size, hs0, ...)   # 4-D
+torch.index_select(k_t, 0, eff_idx, out=scratch)
+```
+
+With a 6-D layer, `k_t` is `[NB, NH, 1, BS, HS]` and `index_select` yields
+`[n_valid, NH, 1, BS, HS]`, which does not fit `scratch` -- and the singleton
+has to come off anyway before the `permute` into `[n_valid, BS, NH, HS]`. So
+the axis is dropped either once at the function's entry or three or four times
+inline. Once at entry is less code and less risk. The squeeze is a view over
+identical bytes, returns a new list (callers' tensors are untouched), and
+raises `ValueError` if axis 3 is not 1 rather than transferring the wrong
+slots.
+
+The equivalence is pinned by a round-trip test: the same data gathered through
+format 15 and format 6 must produce byte-identical staging chunks, and must
+restore identically.
+
+### A Python-only member works, if the spec imports the enum directly
 
 `EngineKVFormat` is dual-defined -- `lmcache/v1/platform/ops_types.py` and
 `csrc/engine_kv_format.h` -- and `lmcache.c_ops` is a PEP 562 shim installed by
@@ -148,14 +180,20 @@ native enum, and lookups for the existing formats still resolve through their
 native-enum keys. Only `ops_types.py`, the spec file, and per-format shape
 branches in `torch_ops._normalize_paged_layers` would be needed -- no C++.
 
-#### It is still redundant
+### The alternative that was not taken
 
-Axis 3 is a singleton that the RBLN kernels always index at `0`, so
-`[2, NB, NH, 1, BS, HS]` and format 6's `[2, NB, NH, BS, HS]` are byte- and
-stride-identical -- `squeeze(3)` is a free view, not a copy. Normalizing 6-D to
-5-D at the registration boundary reuses format 6 with **no** upstream change,
-and it is the same assumption RBLN's own kernels already make.
+Because the two layouts are byte- and stride-identical, the RBLN integration
+could instead `squeeze(3)` *before* handing tensors to LMCache and simply
+declare format 6. That needs no upstream change at all.
 
-The one thing this rests on: axis 3 must always be 1. If a future RBLN geometry
-can make it larger, the normalization is wrong -- but so are the existing
-kernels, which hardcode index `0`.
+It was rejected because it hides the engine's real tensor rank from every
+surface that reports it. `describe_shape()` renders from the enum name, so a
+6-D engine buffer would be described as 5-D in logs, spec geometry and error
+messages, and the "axis 3 is always 1" assumption would live implicitly at an
+integration boundary instead of explicitly in a registered format that
+validates it.
+
+Both designs rest on the same premise: axis 3 must always be 1. If a future
+RBLN geometry makes it larger, format 15's squeeze guard raises -- whereas the
+integration-side squeeze would silently mis-transfer. The existing RBLN kernels
+share the premise, hardcoding index `0`.
