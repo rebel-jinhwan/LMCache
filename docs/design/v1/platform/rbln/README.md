@@ -103,97 +103,65 @@ That makes the native kernel and the head-major engine-driven context a single
 inseparable change. A loader shim landed upstream on its own would be called by
 nothing.
 
-## The KV format
+## The KV layout
 
 RBLN's per-layer KV cache is 6-D `[2, NB, NH, 1, BS, HS]`. The closest
 registered format, `NL_X_TWO_NB_NH_BS_HS` (6), is 5-D `[2, NB, NH, BS, HS]` --
-identical bytes, one axis short.
+identical bytes and strides, one axis short.
 
-`NL_X_TWO_NB_NH_ONE_BS_HS` (15) is registered for it, **Python-side only**.
-The engine's real rank stays visible everywhere it matters, and only the
-transfer kernel collapses it:
+**No new `EngineKVFormat` member is registered.** `VLLMPagedMemRBLNConnectorV2`
+squeezes axis 3 at registration and discovers the format from the resulting 5-D
+views, which resolve to `NL_X_TWO_NB_NH_BS_HS`. The squeeze is a view onto the
+same storage, and it raises `ValueError` if axis 3 is not 1 rather than
+transferring the wrong slots.
 
-| Surface | Rank |
-|---|---|
-| `EngineKVFormat` member, `describe_shape()` | 6-D |
-| `NL_X_TWO_NB_NH_ONE_BS_HS_Spec` accessors | 6-D (`block_size` reads `shape[4]`) |
-| `torch_ops._per_layer_paged_shape()` | 6-D `(2, nb, nh, 1, bs, hs)` |
-| `torch_ops._transfer_per_layer_hnd()` | squeezed to 5-D on entry |
+This follows `VLLMPagedMemHPUConnectorV2`, which already builds a proxy tensor
+list so its `List[Tuple[Tensor, Tensor]]` caches survive format discovery. The
+connector is the device-scoped extension point; normalising there keeps the
+detector, the format enum, the spec registry and `torch_ops` untouched.
 
-### Why the transfer path squeezes
+### Why not a new format
 
-`_squeeze_singleton_axis()` is about kernel reuse, not about the layout. The
-existing HND kernel is written against a 4-D per-K/V tensor:
-
-```python
-scratch = torch.empty(n_valid, nh0, block_size, hs0, ...)   # 4-D
-torch.index_select(k_t, 0, eff_idx, out=scratch)
-```
-
-With a 6-D layer, `k_t` is `[NB, NH, 1, BS, HS]` and `index_select` yields
-`[n_valid, NH, 1, BS, HS]`, which does not fit `scratch` -- and the singleton
-has to come off anyway before the `permute` into `[n_valid, BS, NH, HS]`. So
-the axis is dropped either once at the function's entry or three or four times
-inline. Once at entry is less code and less risk. The squeeze is a view over
-identical bytes, returns a new list (callers' tensors are untouched), and
-raises `ValueError` if axis 3 is not 1 rather than transferring the wrong
-slots.
-
-The equivalence is pinned by a round-trip test: the same data gathered through
-format 15 and format 6 must produce byte-identical staging chunks, and must
-restore identically.
-
-### A Python-only member works, if the spec imports the enum directly
-
-`EngineKVFormat` is dual-defined -- `lmcache/v1/platform/ops_types.py` and
-`csrc/engine_kv_format.h` -- and `lmcache.c_ops` is a PEP 562 shim installed by
-`lmcache/__init__.py` that forwards to `resolve_device_ops(torch_device_type)`,
-the **detected** device's ops singleton. `DeviceOps.bind_native()` replaces
-`EngineKVFormat` wholesale with the compiled module's type, and
-`csrc/pybind.cpp` does export it.
-
-So the enum a caller sees depends on the device:
+A `NL_X_TWO_NB_NH_ONE_BS_HS` member was prototyped and dropped. It is
+reachable without touching C++ -- but only if its spec imports `EngineKVFormat`
+from `lmcache.v1.platform.ops_types` directly, because `lmcache.c_ops` is a PEP
+562 shim forwarding to `resolve_device_ops(torch_device_type)`, and
+`DeviceOps.bind_native()` replaces the enum wholesale with the compiled
+module's type:
 
 | device | `ensure_native()` | `lmc_ops.EngineKVFormat` |
 |---|---|---|
-| RBLN (`RblnDeviceOps`) | no-op | Python enum -- new member visible |
-| CUDA with the built extension | binds `lmcache.c_ops` | C++ enum -- new member absent |
+| RBLN (`RblnDeviceOps`) | no-op | Python enum -- member visible |
+| CUDA with the built extension | binds `lmcache.c_ops` | C++ enum -- member absent |
 
-The trap is that `kv_format/specs/registry.py::_discover_specs()` imports
-**every** spec module unconditionally, on every device. A spec written the
-conventional way -- `import lmcache.c_ops as lmc_ops`, then
-`engine_kv_format = lmc_ops.EngineKVFormat.<NEW>` in the class body -- raises
-`AttributeError` at import on a CUDA build, breaking CUDA users.
+Since `kv_format/specs/registry.py` imports **every** spec module on every
+device, a spec written the conventional way (`import lmcache.c_ops as lmc_ops`)
+raises `AttributeError` at import on a CUDA build.
 
-Importing the Python enum directly avoids this entirely:
+Even done correctly it costs an enum member, a spec file, and per-format
+branches in `torch_ops` (`is_layer_list`, `_is_hnd_format`,
+`_per_layer_paged_shape`, the HND transfer kernel, and the `multi_layer_kv_transfer`
+guard) -- to describe a layout indistinguishable in memory from one already
+registered. The connector-side squeeze achieves the same with none of it.
 
-```python
-from lmcache.v1.platform.ops_types import EngineKVFormat
+### What the connector must handle itself
 
+HND puts the head axis *between* blocks and block tokens, so tokens are not
+contiguous within a layer. The flat `view(num_blocks * block_size, hidden_dim)`
+reshape the NHD connectors use would address the wrong slots, and a
+`permute(...).reshape(...)` would copy the whole KV cache. The connector
+instead resolves each slot into `(block, offset)` and uses advanced indexing,
+touching only the request's tokens.
 
-class NL_X_TWO_NB_NH_ONE_BS_HS_Spec(KVFormatSpec):
-    engine_kv_format = EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS
-```
+It also passes `layout_hints={"kv_layout": "HND"}` explicitly. The vLLM
+detector defaults to NHD and only forces HND when `torch_device_type == "cpu"`
+-- which is what RBLN was accidentally relying on before `RblnDeviceSpec`
+existed, since detection used to fall back to the CPU stub.
 
-Verified both ways: the registry then imports cleanly with and without a bound
-native enum, and lookups for the existing formats still resolve through their
-native-enum keys. Only `ops_types.py`, the spec file, and per-format shape
-branches in `torch_ops._normalize_paged_layers` would be needed -- no C++.
+## MP mode is not covered by this
 
-### The alternative that was not taken
-
-Because the two layouts are byte- and stride-identical, the RBLN integration
-could instead `squeeze(3)` *before* handing tensors to LMCache and simply
-declare format 6. That needs no upstream change at all.
-
-It was rejected because it hides the engine's real tensor rank from every
-surface that reports it. `describe_shape()` renders from the enum name, so a
-6-D engine buffer would be described as 5-D in logs, spec geometry and error
-messages, and the "axis 3 is always 1" assumption would live implicitly at an
-integration boundary instead of explicitly in a registered format that
-validates it.
-
-Both designs rest on the same premise: axis 3 must always be 1. If a future
-RBLN geometry makes it larger, format 15's squeeze guard raises -- whereas the
-integration-side squeeze would silently mis-transfer. The existing RBLN kernels
-share the premise, hardcoding index `0`.
+`EngineDrivenTransferContext.register()` calls `compute_kv_layout(kv_caches)`
+directly; no connector participates. The 6-D tensors are still rejected there,
+so the multiprocess path needs its own normalisation -- either at the adapter
+that supplies `kv_caches`, or a detector change. That is deliberately out of
+scope here.

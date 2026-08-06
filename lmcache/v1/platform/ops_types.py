@@ -104,20 +104,6 @@ class EngineKVFormat(IntEnum):
     # c_ops only (no pure-torch transfer path)
     NL_X_NB_BSV_BSS = 14
 
-    # used by: RBLN (Rebellions NPU) non-MLA attention (HND layout). Per-layer
-    # physical shape [2, num_blocks, num_heads, 1, block_size, head_size] --
-    # NL_X_TWO_NB_NH_BS_HS with a singleton axis between heads and block
-    # tokens. The two are byte- and stride-identical, so the torch fallback
-    # squeezes that axis and reuses the NL_X_TWO_NB_NH_BS_HS transfer path.
-    # Declared separately so the engine's real tensor rank stays visible to
-    # detection, ``describe_shape()`` and error messages.
-    #
-    # Python-only: absent from the C++ ``EngineKVFormat`` in
-    # csrc/engine_kv_format.h. Anything referencing it must import this enum
-    # directly rather than through ``lmcache.c_ops``, which resolves to the
-    # native enum on builds that bind the compiled extension.
-    NL_X_TWO_NB_NH_ONE_BS_HS = 15
-
 
 # Backward-compat alias
 GPUKVFormat = EngineKVFormat
