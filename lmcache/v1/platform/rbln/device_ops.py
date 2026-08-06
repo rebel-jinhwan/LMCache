@@ -93,8 +93,8 @@ class RblnDeviceOps(DeviceOps):
                 not the validated HND layout, or the direction is unknown.
         """
         del device  # taken from the operands
-        if not _is_tensor_list(paged_buffer_ptrs_tensor) or not _is_tensor_list(
-            lmcache_objects_ptrs
+        if isinstance(paged_buffer_ptrs_tensor, torch.Tensor) or not all(
+            isinstance(obj, torch.Tensor) for obj in lmcache_objects_ptrs
         ):
             raise ValueError(
                 "RBLN block transfer requires tensor operands; the pointer "
@@ -153,12 +153,3 @@ class RblnDeviceOps(DeviceOps):
                     paged_layers, blocks, view, skip_prefix_n_blocks=local_skip
                 )
             consumed += len(blocks)
-
-
-def _is_tensor_list(value: object) -> bool:
-    """Return whether ``value`` is a non-empty flat list of tensors."""
-    return (
-        isinstance(value, list)
-        and len(value) > 0
-        and all(isinstance(item, torch.Tensor) for item in value)
-    )
