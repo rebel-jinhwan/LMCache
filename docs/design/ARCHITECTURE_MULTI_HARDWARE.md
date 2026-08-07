@@ -135,9 +135,10 @@ MP mode, CPU workers use `EngineDrivenTransferContext` (Pickle or SHM
 backend) for KV transfer; there is no GPU-side connector involved.
 
 `normalize_kv_and_discover_format` also hardcodes `kv_layout = "HND"`
-when `torch_device_type == "cpu"`, because vLLM's
-`get_kv_cache_layout()` reports `NHD` for its CPU attention backend
-which is wrong for that backend's actual KV cache layout.
+when `torch_device_type` is `cpu` or `rbln`, because vLLM's
+`get_kv_cache_layout()` reports `NHD` in both cases and is wrong: its CPU
+attention backend misreports its layout, and vllm-rbln never sets one at all
+so the `NHD` default is returned. Both store HND.
 
 ## Adding New Hardware
 

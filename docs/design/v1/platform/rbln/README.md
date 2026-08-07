@@ -41,22 +41,28 @@ LMCache a 5-D (or 4-D / 3-D) per-layer tensor.
 Axis 3 is always 1, so the tensor is byte- and stride-identical to the already
 registered `NL_X_TWO_NB_NH_BS_HS` (6) one axis short. **No new `EngineKVFormat`
 is registered**: squeezing the axis is a free view that yields exactly format 6.
-The rule lives in `kv_layout.py` (`is_rbln_kv_layout` / `squeeze_singleton_axis`).
 
-It is applied in the **vLLM format detector**, not in the connector. That
-placement is load-bearing: `compute_kv_layout`, `gather_paged_kv_to_cpu` and
-`scatter_cpu_to_paged_kv` resolve layouts through
+Nothing about the squeeze is RBLN-specific -- a size-1 axis carries no bytes --
+so it lives in the engine-agnostic
+`lmcache/v1/gpu_connector/kv_format/singleton_axis.py`
+(`has_singleton_kv_axis` / `squeeze_singleton_kv_axis`), alongside the other
+metadata-only preprocessing. The vLLM detector applies it on any device and
+then **falls through to the ordinary rank-5 classification**; it does not pick
+a format itself. What is RBLN-specific is only which layout that rank-5 branch
+resolves to, and that is handled by the hint table described below.
+
+The detector is the load-bearing placement: `compute_kv_layout`,
+`gather_paged_kv_to_cpu` and `scatter_cpu_to_paged_kv` resolve layouts through
 `normalize_kv_and_discover_format` and never touch a connector, so normalizing
 in the connector alone left the multiprocess path raising
 `ValueError: unsupported kv_caches structure` on the native tensors.
 
-| path | reaches the layout through | normalized by |
+| path | reaches the layout through | squeezed by |
 |---|---|---|
-| in-process | `VLLMPagedMemRBLNConnectorV2` | detector (plus its own 5-D views for slot indexing) |
-| multiprocess | `compute_kv_layout` / gather / scatter | detector |
+| in-process | `VLLMPagedMemRBLNConnectorV2` | the connector, which needs the 5-D views for slot indexing anyway and hands those to discovery -- so the detector only ever sees rank 5 here |
+| multiprocess | `compute_kv_layout` / gather / scatter | the detector |
 
-The detector branch is gated on `tensor_ndim == 6 and torch_device_type ==
-"rbln"`, so no other accelerator's 6-D layout can be silently reinterpreted.
+Both call the same helper, so the two paths cannot drift.
 
 Two consequences for callers:
 
@@ -65,9 +71,21 @@ Two consequences for callers:
   addresses the wrong slots, and `permute(...).reshape(...)` copies the whole
   cache. `VLLMPagedMemRBLNConnectorV2` resolves slots into `(block, offset)`
   and uses advanced indexing instead.
-- **The detector cannot infer HND from the shape.** `[2, NB, X, Y, HS]` is
-  ambiguous between NH/BS and BS/NH, so the connector passes
-  `layout_hints={"kv_layout": "HND"}` explicitly.
+- **HND cannot be inferred from the shape, and vLLM-RBLN does not report it.**
+  `[2, NB, X, Y, HS]` is ambiguous between NH/BS and BS/NH, and vllm-rbln never
+  sets vLLM's KV cache layout, so `get_kv_cache_layout()` returns the NHD
+  default -- which would classify the cache as `NL_X_TWO_NB_BS_NH_HS`, the
+  wrong axis order for every transfer. The detector therefore forces HND on
+  `rbln`, one entry in the same device table that already forces it for vLLM's
+  CPU attention backend (which misreports its layout for the same reason):
+
+  ```python
+  if torch_device_type in ("cpu", "rbln"):
+      kv_layout = "HND"
+  ```
+
+  Should vllm-rbln ever start reporting HND, this entry can be dropped and the
+  hint honoured like any other device's.
 
 ## Ops
 

@@ -15,6 +15,10 @@ from lmcache.v1.gpu_connector.kv_format.detectors.base import (
     EngineDetector,
     measure_list_depth_until_tensor,
 )
+from lmcache.v1.gpu_connector.kv_format.singleton_axis import (
+    has_singleton_kv_axis,
+    squeeze_singleton_kv_axis,
+)
 from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache, LayoutHints
 import lmcache.c_ops as lmc_ops
 
@@ -25,10 +29,11 @@ class VLLM_Detector(EngineDetector):
     def discover(
         self, kv_caches: DiscoverableKVCache, layout_hints: LayoutHints
     ) -> "tuple[Optional[lmc_ops.EngineKVFormat], DiscoverableKVCache]":
-        # vLLM's CPU attention backend stores KV in HND but misreports it, so
-        # force HND there; otherwise honor the hint, defaulting to NHD.
+        # vLLM's CPU attention backend stores KV in HND but misreports it, and
+        # vLLM-RBLN never reports a layout at all though it stores HND too, so
+        # force HND on both; otherwise honor the hint, defaulting to NHD.
         kv_layout = layout_hints.get("kv_layout")
-        if torch_device_type == "cpu":
+        if torch_device_type in ("cpu", "rbln"):
             kv_layout = "HND"
         elif kv_layout is None:
             kv_layout = "NHD"
@@ -59,28 +64,24 @@ class VLLM_Detector(EngineDetector):
         if (
             list_depth == 1
             and tensor_ndim == 6
-            and torch_device_type == "rbln"
             and isinstance(kv_caches, list)
+            and has_singleton_kv_axis(cast("torch.Tensor", first_tensor))
         ):
-            # vLLM-RBLN adds a singleton axis between heads and block tokens.
-            # It is always 1, so squeezing it is a free view onto identical
-            # bytes and yields exactly NL_X_TWO_NB_NH_BS_HS. Normalizing here
-            # (rather than in the connector alone) is what lets the
-            # multiprocess path work: its register / gather / scatter helpers
-            # resolve layouts through this function, never through a connector.
-            # First Party
-            from lmcache.v1.platform.rbln.kv_layout import (
-                is_rbln_kv_layout,
-                squeeze_singleton_axis,
-            )
-
+            # Some backends insert a degenerate axis between the head and
+            # block-token axes (vLLM-RBLN does). It is always 1, so squeezing
+            # it is a free view onto identical bytes that leaves an ordinary
+            # 5-D per-layer cache for the rank-5 branch below to classify --
+            # including its HND/NHD resolution, which the squeeze does not
+            # affect. Normalizing here (rather than in a connector) is what
+            # lets the multiprocess path work: its register / gather / scatter
+            # helpers resolve layouts through this function, never through a
+            # connector.
+            #
             # ``list_depth == 1`` already established a flat list of tensors.
-            layers = cast("list[torch.Tensor]", kv_caches)
-            if is_rbln_kv_layout(cast("torch.Tensor", first_tensor)):
-                return (
-                    lmc_ops.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
-                    cast(DiscoverableKVCache, squeeze_singleton_axis(layers)),
-                )
+            layers = squeeze_singleton_kv_axis(cast("list[torch.Tensor]", kv_caches))
+            kv_caches = cast(DiscoverableKVCache, layers)
+            first_tensor = layers[0]
+            tensor_ndim = layers[0].ndim
         if list_depth == 1 and tensor_ndim == 5:
             if first_tensor.shape[0] == 2:  # K/V axis first
                 if is_hnd:

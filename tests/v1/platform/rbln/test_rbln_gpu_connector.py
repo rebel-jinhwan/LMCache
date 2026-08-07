@@ -2,9 +2,10 @@
 """Tests for the RBLN vLLM paged-memory connector.
 
 The connector's job is to make vLLM-RBLN's native 6-D KV cache
-``[2, NB, NH, 1, BS, HS]`` usable by upstream LMCache without teaching the
-format detector a sixth rank: it squeezes the always-1 axis 3 at registration
-and discovers ``NL_X_TWO_NB_NH_BS_HS`` from the resulting 5-D HND views.
+``[2, NB, NH, 1, BS, HS]`` usable by upstream LMCache without a new
+``EngineKVFormat``: it squeezes the always-1 axis 3 at registration -- it needs
+the 5-D views for slot indexing anyway -- and discovers
+``NL_X_TWO_NB_NH_BS_HS`` from them.
 
 The load-bearing test is the round trip. HND puts the head axis *between*
 blocks and block tokens, so the flat ``view(num_blocks * block_size, ...)``
@@ -20,6 +21,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.v1.gpu_connector.kv_format.singleton_axis import squeeze_singleton_kv_axis
 from lmcache.v1.gpu_connector.rbln_connector import VLLMPagedMemRBLNConnectorV2
 from lmcache.v1.memory_allocators.tensor_memory_allocator import TensorMemoryAllocator
 from lmcache.v1.memory_management import MemoryFormat
@@ -67,7 +69,7 @@ def _connector_with_attributes() -> VLLMPagedMemRBLNConnectorV2:
 def test_squeeze_produces_shared_storage_hnd_views() -> None:
     """The squeeze is a free view, not a copy."""
     native = _native_kv()
-    views = VLLMPagedMemRBLNConnectorV2.squeeze_singleton_axis(native)
+    views = squeeze_singleton_kv_axis(native)
     assert [tuple(v.shape) for v in views] == [
         (2, NUM_BLOCKS, NUM_HEADS, BLOCK_SIZE, HEAD_SIZE)
     ] * NUM_LAYERS
@@ -85,8 +87,8 @@ def test_squeeze_produces_shared_storage_hnd_views() -> None:
 )
 def test_squeeze_rejects_unexpected_layouts(shape: tuple[int, ...]) -> None:
     """A layout that is not 6-D with a singleton fails loudly."""
-    with pytest.raises(ValueError, match=r"\[2, NB, NH, 1, BS, HS\]"):
-        VLLMPagedMemRBLNConnectorV2.squeeze_singleton_axis([torch.zeros(shape)])
+    with pytest.raises(ValueError, match=r"\[2, NB, X, 1, Y, HS\]"):
+        squeeze_singleton_kv_axis([torch.zeros(shape)])
 
 
 # ---------------------------------------------------------------------------

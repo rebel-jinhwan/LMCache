@@ -7,11 +7,16 @@ with a singleton axis between heads and block tokens that the RBLN attention
 backend requires.
 
 Axis 3 is always 1, so squeezing it is a free view onto identical bytes that
-yields exactly ``NL_X_TWO_NB_NH_BS_HS``. The rule lives in
-:mod:`lmcache.v1.platform.rbln.kv_layout` and is applied by the vLLM format
-detector, so the multiprocess path -- which resolves layouts without ever
-touching a connector -- normalizes identically. This connector reuses the same
-helper because it also needs the 5-D views for its own slot indexing.
+leaves an ordinary 5-D per-layer cache, classified as ``NL_X_TWO_NB_NH_BS_HS``.
+The squeeze itself is engine-agnostic and lives in
+:mod:`lmcache.v1.gpu_connector.kv_format.singleton_axis`.
+
+This connector squeezes the caches itself, because it needs the 5-D views for
+its own slot indexing anyway, and hands those views to discovery -- so the
+detector only ever sees rank 5 on this path. The detector applies the same
+squeeze independently for the multiprocess path, which resolves layouts through
+``normalize_kv_and_discover_format`` without ever touching a connector. One
+shared helper is what keeps the two from drifting.
 
 The connector produces and consumes ``KV_2LTD`` memory objects
 (``[2, num_layers, num_tokens, num_heads * head_size]``), the same contract
@@ -54,8 +59,8 @@ from lmcache.v1.gpu_connector.utils import (
     get_num_layers,
     normalize_kv_and_discover_format,
 )
+from lmcache.v1.gpu_connector.kv_format.singleton_axis import squeeze_singleton_kv_axis
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
-from lmcache.v1.platform.rbln.kv_layout import squeeze_singleton_axis
 
 if TYPE_CHECKING:
     # First Party
@@ -63,7 +68,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-#: vLLM-RBLN stores heads before block tokens.
+#: vLLM-RBLN stores heads before block tokens. The detector forces HND on this
+#: device anyway (vllm-rbln reports no layout, so the hint it would otherwise
+#: honor is the wrong NHD default), but passing it here keeps the connector
+#: correct on its own terms if that device entry is ever dropped.
 _RBLN_LAYOUT_HINTS: LayoutHints = {"kv_layout": "HND"}
 
 
@@ -131,16 +139,12 @@ class VLLMPagedMemRBLNConnectorV2(GPUConnectorInterface):
         self.kvcaches = list(kv_caches)
         self._initialize_attributes(self.kvcaches)
 
-    #: Shared with the vLLM format detector so the in-process and multiprocess
-    #: paths normalize the native layout identically.
-    squeeze_singleton_axis = staticmethod(squeeze_singleton_axis)
-
     def _initialize_attributes(self, kv_caches: List[torch.Tensor]) -> None:
         """Discover the KV geometry once, from the squeezed 5-D views."""
         if self._attributes_initialized or not kv_caches:
             return
 
-        views = self.squeeze_singleton_axis(kv_caches)
+        views = squeeze_singleton_kv_axis(kv_caches)
         self.device = views[0].device
 
         self.engine_kv_format, discovered = normalize_kv_and_discover_format(
@@ -213,7 +217,7 @@ class VLLMPagedMemRBLNConnectorV2(GPUConnectorInterface):
             raise ValueError("'slot_mapping' must be a torch.Tensor")
         slices = slot_mapping[start:end].to(dtype=torch.long)
 
-        views = self.squeeze_singleton_axis(self.kvcaches)
+        views = squeeze_singleton_kv_axis(self.kvcaches)
         blocks = torch.div(slices, self.block_size, rounding_mode="floor")
         offsets = slices % self.block_size
         return views, blocks, offsets
