@@ -21,11 +21,11 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.gpu_connector.kv_format.singleton_axis import squeeze_singleton_kv_axis
 from lmcache.v1.gpu_connector.rbln_connector import VLLMPagedMemRBLNConnectorV2
 from lmcache.v1.memory_allocators.tensor_memory_allocator import TensorMemoryAllocator
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.platform.ops_types import EngineKVFormat
+from lmcache.v1.platform.rbln.kv_layout import squeeze_singleton_axis
 
 NUM_LAYERS = 3
 NUM_BLOCKS = 6
@@ -69,7 +69,7 @@ def _connector_with_attributes() -> VLLMPagedMemRBLNConnectorV2:
 def test_squeeze_produces_shared_storage_hnd_views() -> None:
     """The squeeze is a free view, not a copy."""
     native = _native_kv()
-    views = squeeze_singleton_kv_axis(native)
+    views = squeeze_singleton_axis(native)
     assert [tuple(v.shape) for v in views] == [
         (2, NUM_BLOCKS, NUM_HEADS, BLOCK_SIZE, HEAD_SIZE)
     ] * NUM_LAYERS
@@ -87,8 +87,8 @@ def test_squeeze_produces_shared_storage_hnd_views() -> None:
 )
 def test_squeeze_rejects_unexpected_layouts(shape: tuple[int, ...]) -> None:
     """A layout that is not 6-D with a singleton fails loudly."""
-    with pytest.raises(ValueError, match=r"\[2, NB, X, 1, Y, HS\]"):
-        squeeze_singleton_kv_axis([torch.zeros(shape)])
+    with pytest.raises(ValueError, match=r"\[2, NB, NH, 1, BS, HS\]"):
+        squeeze_singleton_axis([torch.zeros(shape)])
 
 
 # ---------------------------------------------------------------------------

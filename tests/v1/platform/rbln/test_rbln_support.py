@@ -9,6 +9,8 @@ These tests cover the device-backend contract documented in
   raises because every NPU is already claimed.
 - The engine-driven-only capability surface (no IPC handle transfer, no event
   IPC backend, no cache context).
+- The ``normalize_kv_caches`` hook: identity on the base spec, and on RBLN
+  tolerant of every structure format discovery hands it.
 
 ``torch`` is replaced with a stub in ``sys.modules`` rather than importing
 ``torch_rbln``, so the suite runs on any platform.
@@ -16,11 +18,12 @@ These tests cover the device-backend contract documented in
 
 # Standard
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 # Third Party
 import pytest
+import torch
 
 # First Party
 from lmcache.v1.platform import resolve_device_ops
@@ -160,3 +163,47 @@ def test_pin_memory_falls_back_to_the_default_backend() -> None:
     """No RBLN pin-memory backend is registered, so the default applies."""
     spec: Any = RblnDeviceSpec()
     assert spec.pin_memory_backend is None
+
+
+# ---------------------------------------------------------------------------
+# KV normalization hook
+# ---------------------------------------------------------------------------
+
+
+def _native_kv() -> list[torch.Tensor]:
+    """Per-layer tensors in the native RBLN 6-D layout."""
+    return [torch.zeros(2, 4, 2, 1, 4, 8) for _ in range(2)]
+
+
+def test_the_base_spec_normalizes_nothing() -> None:
+    """Devices whose engine hands over a known layout need no reshaping."""
+    kv_caches = _native_kv()
+    assert DeviceSpec().normalize_kv_caches(kv_caches) is kv_caches
+
+
+def test_rbln_squeezes_the_native_layout() -> None:
+    """The singleton axis is removed, as a view rather than a copy."""
+    native = _native_kv()
+    views = cast("list[torch.Tensor]", RblnDeviceSpec().normalize_kv_caches(native))
+    assert [tuple(v.shape) for v in views] == [(2, 4, 2, 4, 8)] * 2
+    for view, tensor in zip(views, native, strict=True):
+        assert view.data_ptr() == tensor.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "kv_caches",
+    [
+        [torch.zeros(2, 4, 2, 4, 8)],
+        [torch.zeros(2, 4, 2, 2, 4, 8)],
+        {"layer0": torch.zeros(2, 4, 2, 1, 4, 8)},
+        [],
+    ],
+    ids=["already-squeezed", "non-singleton-axis", "not-a-list", "empty"],
+)
+def test_rbln_passes_through_anything_it_does_not_recognize(kv_caches: Any) -> None:
+    """The hook sees every structure discovery is handed, not just native ones.
+
+    The in-process connector squeezes before discovery, so already-5-D input
+    reaches here routinely and must not raise.
+    """
+    assert RblnDeviceSpec().normalize_kv_caches(kv_caches) is kv_caches

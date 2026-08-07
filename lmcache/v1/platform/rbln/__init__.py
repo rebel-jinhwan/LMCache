@@ -30,6 +30,7 @@ from lmcache.v1.platform.base.device_spec import DeviceSpec
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache
     from lmcache.v1.platform.base.device_ops import DeviceOps
 
 # ---------------------------------------------------------------------------
@@ -77,6 +78,32 @@ class RblnDeviceSpec(DeviceSpec):
             return hasattr(torch, "rbln") and torch.rbln.is_available()
         except Exception:
             return False
+
+    def normalize_kv_caches(
+        self, kv_caches: DiscoverableKVCache
+    ) -> DiscoverableKVCache:
+        """Squeeze vLLM-RBLN's singleton axis so the detectors see a 5-D cache.
+
+        vLLM-RBLN allocates ``[2, NB, NH, 1, BS, HS]`` per layer -- HND with an
+        extra axis the RBLN attention backend requires. Axis 3 is always 1, so
+        removing it is a free view onto identical bytes, and what is left is an
+        ordinary per-layer cache the vLLM detector already classifies.
+
+        This is the multiprocess path's entry point: ``compute_kv_layout``,
+        ``gather_paged_kv_to_cpu`` and ``scatter_cpu_to_paged_kv`` resolve
+        layouts through format discovery and never touch a connector.
+
+        Args:
+            kv_caches: Raw KV cache structure as vLLM-RBLN handed it over.
+
+        Returns:
+            DiscoverableKVCache: 5-D per-layer views when the input was the
+            native 6-D layout, otherwise ``kv_caches`` unchanged.
+        """
+        # First Party
+        from lmcache.v1.platform.rbln.kv_layout import normalize_kv_caches
+
+        return normalize_kv_caches(kv_caches)
 
     def is_handle_transfer_available(self) -> bool:
         """Report that RBLN cannot ship KV tensors as IPC handles.

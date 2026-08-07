@@ -8,14 +8,14 @@ backend requires.
 
 Axis 3 is always 1, so squeezing it is a free view onto identical bytes that
 leaves an ordinary 5-D per-layer cache, classified as ``NL_X_TWO_NB_NH_BS_HS``.
-The squeeze itself is engine-agnostic and lives in
-:mod:`lmcache.v1.gpu_connector.kv_format.singleton_axis`.
+The rule lives in :mod:`lmcache.v1.platform.rbln.kv_layout`.
 
 This connector squeezes the caches itself, because it needs the 5-D views for
-its own slot indexing anyway, and hands those views to discovery -- so the
-detector only ever sees rank 5 on this path. The detector applies the same
-squeeze independently for the multiprocess path, which resolves layouts through
-``normalize_kv_and_discover_format`` without ever touching a connector. One
+its own slot indexing anyway, and hands those views to discovery -- so format
+detection only ever sees rank 5 on this path. The multiprocess path resolves
+layouts through ``normalize_kv_and_discover_format`` without ever touching a
+connector, and reaches the same rule through
+:meth:`~lmcache.v1.platform.rbln.RblnDeviceSpec.normalize_kv_caches`. One
 shared helper is what keeps the two from drifting.
 
 The connector produces and consumes ``KV_2LTD`` memory objects
@@ -45,7 +45,6 @@ from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
-from lmcache.v1.gpu_connector.kv_format.singleton_axis import squeeze_singleton_kv_axis
 from lmcache.v1.gpu_connector.kv_format.types import (
     DiscoverableKVCache,
     LayoutHints,
@@ -61,6 +60,7 @@ from lmcache.v1.gpu_connector.utils import (
     normalize_kv_and_discover_format,
 )
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.platform.rbln.kv_layout import squeeze_singleton_axis
 
 if TYPE_CHECKING:
     # First Party
@@ -144,7 +144,7 @@ class VLLMPagedMemRBLNConnectorV2(GPUConnectorInterface):
         if self._attributes_initialized or not kv_caches:
             return
 
-        views = squeeze_singleton_kv_axis(kv_caches)
+        views = squeeze_singleton_axis(kv_caches)
         self.device = views[0].device
 
         self.engine_kv_format, discovered = normalize_kv_and_discover_format(
@@ -217,7 +217,7 @@ class VLLMPagedMemRBLNConnectorV2(GPUConnectorInterface):
             raise ValueError("'slot_mapping' must be a torch.Tensor")
         slices = slot_mapping[start:end].to(dtype=torch.long)
 
-        views = squeeze_singleton_kv_axis(self.kvcaches)
+        views = squeeze_singleton_axis(self.kvcaches)
         blocks = torch.div(slices, self.block_size, rounding_mode="floor")
         offsets = slices % self.block_size
         return views, blocks, offsets

@@ -34,6 +34,7 @@ from lmcache.v1.platform.base.pin_memory import PinMemoryBackend
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache
     from lmcache.v1.platform.base.cache_context import BaseCacheContext
     from lmcache.v1.platform.base.device_ops import DeviceOps
     from lmcache.v1.platform.base.event_ipc import EventIPCBackend
@@ -125,6 +126,34 @@ class DeviceSpec:
         """Return ``True`` when the device is usable for handle transfer."""
         # TODO(chunxiaozheng): implement on subclasses
         return True
+
+    def normalize_kv_caches(
+        self, kv_caches: DiscoverableKVCache
+    ) -> DiscoverableKVCache:
+        """Reshape this device's KV caches into a structure the detectors read.
+
+        Format discovery calls this before probing the structure, so a device
+        whose attention backend allocates KV in a shape no engine detector
+        knows can present a shape they do -- as long as the change is
+        metadata-only, since callers keep using the returned tensors to move
+        real KV. It must not decide *which* ``EngineKVFormat`` the result is;
+        that stays with the engine's detector.
+
+        The base returns ``kv_caches`` untouched, which is right for every
+        device whose engine already hands over a layout the detectors accept.
+        Overrides must tolerate being handed anything, including structures
+        they do not recognize and ones a caller has already normalized, and
+        pass those through unchanged.  Use a lazy import inside the method
+        body to keep accelerator-specific modules out of the platform base
+        import graph.
+
+        Args:
+            kv_caches: Raw KV cache structure as the engine handed it over.
+
+        Returns:
+            DiscoverableKVCache: The structure to run detection against.
+        """
+        return kv_caches
 
     @property
     def event_ipc_backend(self) -> "EventIPCBackend | None":

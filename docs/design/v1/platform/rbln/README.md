@@ -42,16 +42,22 @@ Axis 3 is always 1, so the tensor is byte- and stride-identical to the already
 registered `NL_X_TWO_NB_NH_BS_HS` (6) one axis short. **No new `EngineKVFormat`
 is registered**: squeezing the axis is a free view that yields exactly format 6.
 
-Nothing about the squeeze is RBLN-specific -- a size-1 axis carries no bytes --
-so it lives in the engine-agnostic
-`lmcache/v1/gpu_connector/kv_format/singleton_axis.py`
-(`has_singleton_kv_axis` / `squeeze_singleton_kv_axis`), alongside the other
-metadata-only preprocessing. The vLLM detector applies it on any device and
-then **falls through to the ordinary rank-5 classification**; it does not pick
-a format itself. What is RBLN-specific is only which layout that rank-5 branch
-resolves to, and that is handled by the hint table described below.
+The rule lives in `kv_layout.py` (`is_rbln_kv_layout` / `squeeze_singleton_axis`
+/ `normalize_kv_caches`), and **the vLLM detector carries no RBLN branch**.
+Instead `DeviceSpec` grows one hook:
 
-The detector is the load-bearing placement: `compute_kv_layout`,
+```python
+def normalize_kv_caches(self, kv_caches: DiscoverableKVCache) -> DiscoverableKVCache:
+    return kv_caches          # base: identity
+```
+
+Format discovery calls it before probing the structure, `RblnDeviceSpec`
+overrides it to squeeze, and what is left falls through to the **ordinary
+rank-5 classification** -- the hook reshapes, it never picks a format. That
+keeps the vendor knowledge in `platform/rbln/` while the generic
+`kv_format/` package stays free of any import from `platform/<device>/`.
+
+Reaching discovery at all is load-bearing: `compute_kv_layout`,
 `gather_paged_kv_to_cpu` and `scatter_cpu_to_paged_kv` resolve layouts through
 `normalize_kv_and_discover_format` and never touch a connector, so normalizing
 in the connector alone left the multiprocess path raising
@@ -59,10 +65,17 @@ in the connector alone left the multiprocess path raising
 
 | path | reaches the layout through | squeezed by |
 |---|---|---|
-| in-process | `VLLMPagedMemRBLNConnectorV2` | the connector, which needs the 5-D views for slot indexing anyway and hands those to discovery -- so the detector only ever sees rank 5 here |
-| multiprocess | `compute_kv_layout` / gather / scatter | the detector |
+| in-process | `VLLMPagedMemRBLNConnectorV2` | the connector, which needs the 5-D views for slot indexing anyway and hands those to discovery -- so discovery only ever sees rank 5 here |
+| multiprocess | `compute_kv_layout` / gather / scatter | `RblnDeviceSpec.normalize_kv_caches`, via discovery |
 
-Both call the same helper, so the two paths cannot drift.
+Both reach the same helper, so the two paths cannot drift. Because the hook
+sees every structure discovery is handed -- including the 5-D views the
+connector already squeezed -- it passes anything it does not recognize through
+unchanged rather than raising; `squeeze_singleton_axis` is the strict variant
+the connector uses when it knows it holds native caches.
+
+A device whose spec does not override the hook cannot have a 6-D cache
+reinterpreted, so no other accelerator's layout is affected by any of this.
 
 Two consequences for callers:
 
