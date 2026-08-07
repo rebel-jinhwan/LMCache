@@ -45,6 +45,7 @@ from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
+from lmcache.v1.gpu_connector.kv_format.singleton_axis import squeeze_singleton_kv_axis
 from lmcache.v1.gpu_connector.kv_format.types import (
     DiscoverableKVCache,
     LayoutHints,
@@ -59,7 +60,6 @@ from lmcache.v1.gpu_connector.utils import (
     get_num_layers,
     normalize_kv_and_discover_format,
 )
-from lmcache.v1.gpu_connector.kv_format.singleton_axis import squeeze_singleton_kv_axis
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 
 if TYPE_CHECKING:
