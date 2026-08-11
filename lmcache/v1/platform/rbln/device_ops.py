@@ -15,6 +15,12 @@ baseline would issue an on-device head<->token permute per store and restore;
 :mod:`lmcache.v1.platform.rbln.kv_ops` fills the same buffer head-major
 instead and never permutes.
 
+Those torch kernels are the reference implementation. When ``lmcache.rbln_ops``
+is built (see :mod:`lmcache.v1.platform.rbln.native_kv_transfer`) the same
+transfer is issued as rebel runtime DMAs instead, which skips building one
+torch view per (block, layer, kv) pair; anything that path cannot address falls
+back to the torch kernels transparently.
+
 **Scope of the head-major chunk.** On RBLN the only caller of this op is the
 multiprocess engine-driven pair, ``gather_paged_kv_to_cpu`` /
 ``scatter_cpu_to_paged_kv``: the in-process connector
@@ -49,6 +55,9 @@ from lmcache.v1.platform.rbln.kv_ops import (
     gather_blocks_head_major,
     head_major_view,
     scatter_head_major_to_blocks,
+)
+from lmcache.v1.platform.rbln.native_kv_transfer import (
+    try_head_major_block_kv_transfer,
 )
 
 logger = init_logger(__name__)
@@ -135,6 +144,16 @@ class RblnDeviceOps(DeviceOps):
         is_d2h = int(direction) == int(TransferDirection.D2H)
         if not is_d2h and int(direction) != int(TransferDirection.H2D):
             raise ValueError(f"Unsupported transfer direction: {direction!r}")
+
+        if try_head_major_block_kv_transfer(
+            paged_layers=paged_layers,
+            chunks=chunks,
+            block_ids=flat_blocks,
+            blocks_per_chunk=blocks_per_chunk,
+            direction=direction,
+            skip_prefix_n_blocks=skip_prefix_n_blocks,
+        ):
+            return
 
         consumed = 0
         for chunk_idx, chunk in enumerate(chunks):

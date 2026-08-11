@@ -84,11 +84,12 @@ Consequences of the format being first-class:
   predicates -- no tolerant pass-through variant, since the detected format has
   already established what the caller holds.
 
-- **No transfer kernel handles format 15.** RBLN has no compiled
-  block-transfer extension in tree, and the CUDA / SYCL kernels never see an
-  RBLN cache, so their `default:` arm rejecting the format is correct rather
-  than a gap. `csrc` therefore carries only the enum value, its `FORMAT_FACTS`
-  row, and the two pybind registrations.
+- **No shared transfer kernel handles format 15.** The CUDA / SYCL kernels
+  never see an RBLN cache, so their `default:` arm rejecting the format is
+  correct rather than a gap. Format 15 is served by `csrc/rbln/` instead (see
+  [The native extension](#the-native-extension) below); what the shared `csrc`
+  carries for it is only the enum value, its `FORMAT_FACTS` row, and the two
+  pybind registrations.
 
 Both paths report the same format for the same cache, and both apply the
 squeeze at the same depth -- where the paged tensors are indexed:
@@ -108,3 +109,40 @@ silently address the wrong slots, and `permute(...).reshape(...)` would copy the
 whole cache. `VLLMPagedMemRBLNConnectorV2` resolves the slot mapping into
 `(block, offset)` pairs and uses advanced indexing, touching only the tokens in
 the request.
+
+## The native extension
+
+`lmcache/v1/platform/rbln/kv_ops.py` is the reference head-major transfer, and
+the only one the unit tests exercise. `csrc/rbln/` is the same contract issued
+as rebel runtime DMAs, built as `lmcache.rbln_ops` by
+`setup_extensions/build_profiles/rbln.py`.
+
+The reason it exists is the operand lists, not the copies. The torch kernels
+have to materialise one tensor view per `(block, layer, kv)` triple to hand
+`torch._foreach_copy_` its arguments; that count grows with blocks per chunk,
+and above roughly a few hundred pairs building the views costs more than the
+transfer they describe. The native kernel computes the same addresses from the
+paged buffer's strides and submits them directly, so a multi-block chunk costs
+the same per-block work as a single-block one. At one block per chunk -- the
+shape serving actually uses -- the two are close, since that case coalesces to
+one DMA per `(kv, layer)` on either path.
+
+**How the two relate.** `native_kv_transfer.try_head_major_block_kv_transfer`
+returns `False` for anything it cannot address, and
+`RblnDeviceOps.multi_layer_block_kv_transfer` then runs the torch kernels. It
+declines when the extension is not built, when
+`LMCACHE_RBLN_NATIVE_KV_TRANSFER=0`, when a paged layer is not a contiguous
+`rbln` tensor, when a chunk is not a contiguous host tensor (the DMA's host end
+must be host memory), or when the block list does not fill every chunk exactly
+-- the kernel derives a chunk index from the flat block position, so a ragged
+tail would land at another chunk's offsets.
+
+**Build inputs.** Headers and library both come from the `rebel-compiler`
+installation on the host: `<site-packages>/rebel/include` and
+`<site-packages>/tvm/librbln.so`. Taking both from one installation is what
+keeps them from drifting -- a vendored header copy that fell behind the loaded
+`librbln.so` would be undefined behaviour rather than a build error.
+`RBLN_RUNTIME_INCLUDE` and `RBLN_RUNTIME_LIB_DIR` override either for builds
+against a runtime source tree. `RblnProfile.detect()` requires both to resolve,
+so a host without a rebel runtime auto-detects some other profile and this
+extension is simply absent.
