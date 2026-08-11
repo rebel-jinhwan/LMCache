@@ -80,9 +80,9 @@ Consequences of the format being first-class:
 - **The squeeze happens where bytes move.** `RblnDeviceOps.multi_layer_block_kv_transfer`
   accepts only format 15 and applies `squeeze_singleton_axis` at entry, so
   `kv_ops.py` keeps indexing a 5-D tensor. `kv_layout.py` therefore exports the
-  strict squeeze plus `is_rbln_kv_layout` / `is_native_kv_structure`
-  predicates -- no tolerant pass-through variant, since the detected format has
-  already established what the caller holds.
+  strict squeeze plus the `is_rbln_kv_layout` predicate -- no tolerant
+  pass-through variant, since the detected format has already established what
+  the caller holds.
 
 - **No shared transfer kernel handles format 15.** The CUDA / SYCL kernels
   never see an RBLN cache, so their `default:` arm rejecting the format is
