@@ -1,0 +1,18 @@
+# Vendor-specific runtime deps baked into install_requires by setup.py when
+# building for RBLN (BUILD_WITH_RBLN=1, or auto-detected from a rebel runtime).
+
+# torch-rbln registers the `rbln` torch backend, which is what makes
+# `torch.rbln` exist -- `RblnDeviceSpec.is_available()` starts with
+# `hasattr(torch, "rbln")`, so the device is undetected without it.
+#
+# It pins `torch==2.11.0+cpu`, a local-version wheel that lives on
+# https://download.pytorch.org/whl/cpu rather than PyPI, so an RBLN build needs
+# that index. torch itself is not listed here: the pin arrives through
+# torch-rbln, and repeating it would conflict with the unpinned torch in
+# requirements/common.txt. requirements/rocm_core.txt omits torch for the same
+# reason.
+#
+# rebel-compiler, which supplies the headers and librbln.so that
+# `lmcache.rbln_ops` links, ships from Rebellions' private index and is what
+# RblnProfile.detect() keys off, so it is deliberately absent.
+torch-rbln

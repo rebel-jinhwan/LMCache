@@ -15,6 +15,12 @@ baseline would issue an on-device head<->token permute per store and restore;
 :mod:`lmcache.v1.platform.rbln.kv_ops` fills the same buffer head-major
 instead and never permutes.
 
+Those torch kernels are the reference implementation and the fallback. When
+``lmcache.rbln_ops`` is built, :meth:`RblnDeviceOps.ensure_native` binds it over
+them exactly as CUDA and XPU bind theirs, and the transfer is issued as rebel
+runtime DMAs instead -- skipping one torch view per (block, layer, kv) pair.
+Operands it cannot address fall back; see :func:`native_can_serve`.
+
 **Scope of the head-major chunk.** On RBLN the only caller of this op is the
 multiprocess engine-driven pair, ``gather_paged_kv_to_cpu`` /
 ``scatter_cpu_to_paged_kv``: the in-process connector
@@ -58,8 +64,60 @@ logger = init_logger(__name__)
 _SUPPORTED_FORMAT = EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS
 
 
+def native_can_serve(
+    paged_layers: "list[torch.Tensor]",
+    chunks: "list[torch.Tensor]",
+    block_ids: "list[int]",
+    blocks_per_chunk: int,
+) -> bool:
+    """Return whether the native kernel can address these operands.
+
+    Each rejection is a case where the kernel would compute an address from
+    geometry that does not hold, so declining keeps a mismatch a slow path
+    rather than silent corruption:
+
+    - It walks both sides by arithmetic on ``data_ptr()``, and its copies are
+      ``rbln_memcpy_{v2h,h2v}_async``, so a paged layer must be a contiguous
+      RBLN tensor and a chunk a contiguous host one.
+    - It derives a chunk index from the flat block position, so a block list
+      that does not fill every chunk would place the tail at another chunk's
+      offsets. The torch path re-strides the short chunk instead.
+    """
+    if not paged_layers or not chunks or blocks_per_chunk <= 0:
+        return False
+    if len(block_ids) != len(chunks) * blocks_per_chunk:
+        return False
+    if not all(
+        layer.device.type == "rbln" and layer.is_contiguous() for layer in paged_layers
+    ):
+        return False
+    return all(chunk.device.type == "cpu" and chunk.is_contiguous() for chunk in chunks)
+
+
 class RblnDeviceOps(DeviceOps):
     device_type: ClassVar[str] = "rbln"
+
+    def ensure_native(self) -> None:
+        """Bind ``lmcache.rbln_ops`` over the torch baseline, if it was built.
+
+        Soft-fail as on CUDA and XPU: the extension links the rebel runtime, so
+        its absence is the ordinary case. It adds
+        ``head_major_block_kv_transfer``, a name no torch method has, which is
+        how :meth:`multi_layer_block_kv_transfer` knows which one it holds.
+        """
+        if self._native_bound:
+            return
+        self._native_bound = True  # set early to prevent repeated attempts
+        try:
+            # First Party
+            import lmcache.rbln_ops as native
+        except ImportError:
+            logger.info(
+                "lmcache.rbln_ops not built; RblnDeviceOps stays on the torch "
+                "kernels in lmcache.v1.platform.rbln.kv_ops."
+            )
+            return
+        self.bind_native(native)
 
     def multi_layer_block_kv_transfer(
         self,
@@ -100,9 +158,10 @@ class RblnDeviceOps(DeviceOps):
             isinstance(obj, torch.Tensor) for obj in lmcache_objects_ptrs
         ):
             raise ValueError(
-                "RBLN block transfer requires tensor operands; the pointer "
-                "form is only produced for compiled backends, and RBLN has "
-                "no compiled block-transfer extension in tree."
+                "RBLN block transfer requires tensor operands. The pointer "
+                "form reconstructs tensors from a packed pointer tensor plus "
+                "shape_desc, which lmcache.rbln_ops does not take -- it "
+                "addresses the tensors it is handed."
             )
         if int(engine_kv_format) != int(_SUPPORTED_FORMAT):
             raise ValueError(
@@ -135,6 +194,19 @@ class RblnDeviceOps(DeviceOps):
         is_d2h = int(direction) == int(TransferDirection.D2H)
         if not is_d2h and int(direction) != int(TransferDirection.H2D):
             raise ValueError(f"Unsupported transfer direction: {direction!r}")
+
+        native = getattr(self, "head_major_block_kv_transfer", None)
+        if native is not None and native_can_serve(
+            paged_layers, chunks, flat_blocks, blocks_per_chunk
+        ):
+            native(
+                paged_layers,
+                chunks,
+                flat_blocks,
+                int(direction),
+                skip_prefix_n_blocks,
+            )
+            return
 
         consumed = 0
         for chunk_idx, chunk in enumerate(chunks):

@@ -84,11 +84,12 @@ Consequences of the format being first-class:
   predicates -- no tolerant pass-through variant, since the detected format has
   already established what the caller holds.
 
-- **No transfer kernel handles format 15.** RBLN has no compiled
-  block-transfer extension in tree, and the CUDA / SYCL kernels never see an
-  RBLN cache, so their `default:` arm rejecting the format is correct rather
-  than a gap. `csrc` therefore carries only the enum value, its `FORMAT_FACTS`
-  row, and the two pybind registrations.
+- **No shared transfer kernel handles format 15.** The CUDA / SYCL kernels
+  never see an RBLN cache, so their `default:` arm rejecting the format is
+  correct rather than a gap. Format 15 is served by `csrc/rbln/` instead (see
+  [The native extension](#the-native-extension) below); what the shared `csrc`
+  carries for it is only the enum value, its `FORMAT_FACTS` row, and the two
+  pybind registrations.
 
 Both paths report the same format for the same cache, and both apply the
 squeeze at the same depth -- where the paged tensors are indexed:
@@ -108,3 +109,75 @@ silently address the wrong slots, and `permute(...).reshape(...)` would copy the
 whole cache. `VLLMPagedMemRBLNConnectorV2` resolves the slot mapping into
 `(block, offset)` pairs and uses advanced indexing, touching only the tokens in
 the request.
+
+## The native extension
+
+`lmcache/v1/platform/rbln/kv_ops.py` is the reference head-major transfer, and
+the only one the unit tests exercise. `csrc/rbln/` is the same contract issued
+as rebel runtime DMAs, built as `lmcache.rbln_ops` by
+`setup_extensions/build_profiles/rbln.py`.
+
+The reason it exists is the operand lists, not the copies. The torch kernels
+have to materialise one tensor view per `(block, layer, kv)` triple to hand
+`torch._foreach_copy_` its arguments; that count grows with blocks per chunk,
+and above roughly a few hundred pairs building the views costs more than the
+transfer they describe. The native kernel computes the same addresses from the
+paged buffer's strides and submits them directly, so a multi-block chunk costs
+the same per-block work as a single-block one. At one block per chunk -- the
+shape serving actually uses -- the two are close, since that case coalesces to
+one DMA per `(kv, layer)` on either path.
+
+**How the two relate.** The same way CUDA and XPU relate to theirs:
+`RblnDeviceOps.ensure_native()` imports the extension and hands it to
+`DeviceOps.bind_native`, which `DeviceSpec.get_ops()` already calls once when it
+builds the ops singleton. A missing extension is a logged soft-fail, not an
+error -- it links the rebel runtime, so its absence is the ordinary case.
+
+What binding adds is `head_major_block_kv_transfer`. There is no torch method of
+that name, so `multi_layer_block_kv_transfer` tests for the attribute to decide
+which implementation it holds, rather than carrying a flag of its own. There is
+no env var and no adapter module: the extension is built only when `RblnProfile`
+found a rebel runtime, so its presence *is* the opt-in.
+
+`native_can_serve` then declines operands the kernel cannot address -- a paged
+layer that is not a contiguous `rbln` tensor, a chunk that is not a contiguous
+host tensor (the DMA's host end must be host memory), or a block list that does
+not fill every chunk exactly, since the kernel derives a chunk index from the
+flat block position and a ragged tail would land at another chunk's offsets.
+
+**Build inputs.** Headers and library both come from the `rebel-compiler`
+installation on the host: `<site-packages>/rebel/include` and
+`<site-packages>/tvm/librbln.so`. Taking both from one installation is what
+keeps them from drifting -- a vendored header copy that fell behind the loaded
+`librbln.so` would be undefined behaviour rather than a build error.
+`RBLN_RUNTIME_INCLUDE` and `RBLN_RUNTIME_LIB_DIR` override either for builds
+against a runtime source tree. `RblnProfile.detect()` requires both to resolve,
+so a host without a rebel runtime auto-detects some other profile and this
+extension is simply absent.
+
+## Dependencies
+
+Nothing under `lmcache/` imports `torch_rbln`, `vllm`, or any Rebellions
+package. `RblnDeviceSpec.is_available()` starts with `hasattr(torch, "rbln")`,
+which is true only because torch-rbln registers the backend through a torch
+entry point.
+
+torch-rbln is therefore what makes the device detectable, and
+`requirements/rbln_core.txt` declares it as a core requirement of an RBLN build:
+
+```bash
+BUILD_WITH_RBLN=1 pip install -e . \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+It pins `torch==2.11.0+cpu`, a local-version wheel that lives on
+`download.pytorch.org` rather than PyPI, which is why that index is needed.
+`setup.py` reads the file only when `RblnProfile` is the resolved profile, so a
+CUDA or CPU wheel never carries the pin. torch itself is deliberately not listed
+-- the pin arrives through torch-rbln, and repeating it would conflict with the
+unpinned `torch` in `requirements/common.txt`. `requirements/rocm_core.txt`
+omits torch for the same reason.
+
+rebel-compiler, which supplies the headers and `librbln.so` the native
+extension links, is declared nowhere: it ships from Rebellions' private index,
+and its presence on the host is exactly what `RblnProfile.detect()` keys off.
