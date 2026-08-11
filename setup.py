@@ -41,12 +41,11 @@ if __name__ == "__main__":
 
     install_requires = _read_requirements(ROOT_DIR / "requirements" / "common.txt")
     extras_require: dict[str, list[str]] = {}
-    if (
-        not BuildProfile.is_gpu_ext_disabled()
-        and req_file is not None
-        and profile is not None
-    ):
-        install_requires += _read_requirements(ROOT_DIR / "requirements" / req_file)
+    if not BuildProfile.is_gpu_ext_disabled() and profile is not None:
+        if req_file is not None:
+            install_requires += _read_requirements(ROOT_DIR / "requirements" / req_file)
+        # Extras are independent of the core requirements file: a profile may
+        # add nothing to install_requires and still expose an opt-in extra.
         for extra_name, extra_req_file in profile.extras_requirements().items():
             extras_require[extra_name] = _read_requirements(
                 ROOT_DIR / "requirements" / extra_req_file

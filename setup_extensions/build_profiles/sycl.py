@@ -87,5 +87,12 @@ class SyclProfile(BuildProfile):
         return ["-D_GLIBCXX_USE_CXX11_ABI=1"]
 
     def requirements_file(self) -> Optional[str]:
-        """SYCL core requirements file."""
-        return "xpu_core.txt"
+        """SYCL adds nothing to ``install_requires``.
+
+        This named ``xpu_core.txt``, which has never existed in
+        ``requirements/``.  ``setup.py`` reads a missing file as an empty list,
+        so the two are equivalent today; ``None`` is what the profile actually
+        means, and it lets ``tests/test_build_profiles.py`` require that every
+        named file resolves.
+        """
+        return None

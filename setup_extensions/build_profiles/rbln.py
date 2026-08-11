@@ -121,3 +121,23 @@ class RblnProfile(BuildProfile):
         ]
         cmdclass = {"build_ext": cpp_extension.BuildExtension}
         return ext_modules, cmdclass
+
+    def requirements_file(self) -> Optional[str]:
+        """RBLN adds nothing to ``install_requires``.
+
+        torch-rbln is exposed as the ``rbln`` extra instead -- see
+        :meth:`extras_requirements` and ``requirements/rbln.txt`` for why it
+        cannot be a core requirement.
+        """
+        return None
+
+    def extras_requirements(self) -> dict[str, str]:
+        """Return the RBLN optional extras.
+
+        Returns:
+            Mapping with the ``"rbln"`` extra (``pip install lmcache[rbln]``),
+            which pulls torch-rbln -- the package that registers the ``rbln``
+            torch backend and therefore the one that makes the device
+            detectable at all.
+        """
+        return {"rbln": "rbln.txt"}

@@ -146,3 +146,27 @@ keeps them from drifting -- a vendored header copy that fell behind the loaded
 against a runtime source tree. `RblnProfile.detect()` requires both to resolve,
 so a host without a rebel runtime auto-detects some other profile and this
 extension is simply absent.
+
+## Dependencies
+
+Nothing under `lmcache/` imports `torch_rbln`, `vllm`, or any Rebellions
+package. `RblnDeviceSpec.is_available()` starts with `hasattr(torch, "rbln")`,
+which is true only because torch-rbln registers the backend through a torch
+entry point.
+
+torch-rbln is therefore what makes the device detectable, and it is declared as
+the **`rbln` extra** rather than a core requirement:
+
+```bash
+pip install "lmcache[rbln]" --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+It pins `torch==2.11.0+cpu`, a local-version wheel that lives on
+`download.pytorch.org` rather than PyPI. In `install_requires` that pin would
+conflict with the unpinned `torch` in `requirements/common.txt` and would make a
+plain `pip install lmcache` unresolvable on every non-RBLN host --
+`requirements/rocm_core.txt` omits torch for the same reason.
+
+rebel-compiler, which supplies the headers and `librbln.so` the native
+extension links, is declared nowhere: it ships from Rebellions' private index,
+and its presence on the host is exactly what `RblnProfile.detect()` keys off.

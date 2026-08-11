@@ -1,0 +1,26 @@
+# Optional Rebellions NPU runtime deps, exposed as the
+# `pip install lmcache[rbln]` extra.
+
+# torch-rbln registers the `rbln` torch backend through a torch entry point,
+# which is what makes `torch.rbln` visible on a bare `import torch` -- LMCache
+# imports it nowhere, and `RblnDeviceSpec.is_available()` starts with
+# `hasattr(torch, "rbln")`, so the RBLN device is simply undetected without it.
+#
+# This is an extra rather than a core requirement because torch-rbln pins
+# `torch==2.11.0+cpu`, a local-version wheel that lives on
+# https://download.pytorch.org/whl/cpu rather than PyPI. Installing it needs
+# that index:
+#
+#   pip install "lmcache[rbln]" \
+#       --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# In install_requires the pin would also conflict with the unpinned `torch` in
+# requirements/common.txt, and would make a plain `pip install lmcache`
+# unresolvable on every non-RBLN host. requirements/rocm_core.txt omits torch
+# for the same reason.
+#
+# The native `lmcache.rbln_ops` extension is a separate concern: it links
+# librbln from the rebel-compiler installation and is not listed here, since
+# rebel-compiler ships from Rebellions' private index and its presence is what
+# RblnProfile.detect() keys off.
+torch-rbln
