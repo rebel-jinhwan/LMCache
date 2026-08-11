@@ -93,3 +93,58 @@ The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
 never touch a connector -- which is why the format must be recognised by
 detection rather than by a connector.
+
+## Direct storage (RDS)
+
+`lmcache/v1/storage_backend/rds_backend.py` writes KV chunks from RBLN device
+memory to NVMe without a host hop, using `rebel.rds`. It is the RBLN analogue of
+`GdsBackend`, and it is enabled per engine:
+
+```
+extra_config:
+  enable_rbln_rds: true
+max_local_disk_size: 64   # GB, per rank
+```
+
+It registers in-process, in `CreateStorageBackends`, alongside the other
+backends — the engine constructs it directly, so a stored chunk never leaves the
+worker's address space and no cache server is involved.
+
+**Why it needs its own address allocator.** GDS writes a file per key and lets
+the filesystem answer "where does this object go". `rebel.rds` exposes a flat,
+fixed-size region with no filesystem, so `NvmeOffsetAllocator` answers it
+explicitly: an `AddressManager` over the chunk's byte-offset space, first-fit
+and coalescing on release, the same structure `GDSL1MemoryManager` uses over its
+slab file.
+
+Ownership is split deliberately. The chunk's *address space* belongs to the
+backend and the staging *areas* belong to the allocator, because their lifetimes
+differ: a staging area is recycled as soon as its write completes, while the
+NVMe range must stay readable until the key is evicted.
+
+**Two constraints come from the runtime, not from LMCache:**
+
+- `rds` transfers a whole vmem *area* and requires the transfer size to equal
+  the area's size, so `RDSMemoryAllocator` hands out one full area per object
+  rather than sub-ranges of a slab.
+- A stream `Chunk.read` DMAs into device vmem without updating the vmem's sync
+  state — only the synchronous read path does that internally. The backend calls
+  `mark_device_updated` after each batched read; without it the restored KV is
+  silently stale rather than wrong-looking.
+
+**RDS has to be the primary allocator**, and this is the one place it differs
+from GDS structurally. `GdsBackend` is an `AllocatorBackendInterface` too, but
+`StorageManager._get_allocator_backend` never selects it: cuFile writes whatever
+buffer it is handed, so GDS allocates only its own read destinations and
+tolerates a `LocalCPUBackend` object on the write path. `rebel.rds` cannot —
+it transfers a bound vmem *area* and requires the transfer size to equal that
+area's size, so a `MemoryObj` RDS did not allocate is not a writable source at
+all.
+
+`_get_allocator_backend` therefore grows one named arm for `RDSBackend`, in the
+same style as the existing `PDBackend` and `MaruBackend` arms. It sits above
+`LocalCPUBackend` rather than below it, because `max_local_cpu_size` defaults to
+5 GB: the ordinary RDS configuration has a host pool registered in front of it,
+and deferring to that pool would hand RDS host tensors on every store. P/D still
+wins when enabled, and nothing changes for a configuration that does not set
+`enable_rbln_rds`.
