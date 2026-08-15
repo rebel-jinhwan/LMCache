@@ -12,12 +12,7 @@ publication, with ordering supplied by the transfer context's
 Block transfer is overridden for the op sequence, not for the layout. Chunks
 keep LMCache's canonical token-major wire layout (``[2, L, T, H*D]``), so a
 chunk written from an RBLN cache is byte-compatible with every other device --
-the case that matters for cross-device KV sharing and PD disaggregation. What
-differs is how the bytes get there:
-:mod:`lmcache.v1.platform.rbln.kv_ops` gathers with ``stack`` / ``cat`` and
-scatters with a single ``torch._foreach_copy_``, rather than the baseline's
-per-layer ``index_select`` / ``index_copy_``, because that is the sequence
-RBLN's v2v kernels are tuned for.
+the case that matters for cross-device KV sharing and PD disaggregation.
 """
 
 # Future

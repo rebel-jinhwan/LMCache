@@ -83,15 +83,6 @@ Consequences of the format being first-class:
   pass-through variant, since the detected format has already established what
   the caller holds.
 
-- **The wire layout is untouched.** `kv_ops.py` overrides the transfer for the
-  torch op sequence RBLN is tuned for -- `stack` / `cat` to gather, one
-  `torch._foreach_copy_` to scatter, instead of the baseline's per-layer
-  `index_select` / `index_copy_` -- but stages chunks in LMCache's canonical
-  token-major `[2, L, T, H*D]`. A chunk written from an RBLN cache is therefore
-  byte-identical to one the shared torch path would write, which is what lets
-  cross-device KV sharing and PD disaggregation read it.
-  `test_chunk_matches_the_canonical_torch_path` pins that equality.
-
 - **No transfer kernel handles format 15.** RBLN has no compiled
   block-transfer extension in tree, and the CUDA / SYCL kernels never see an
   RBLN cache, so their `default:` arm rejecting the format is correct rather
