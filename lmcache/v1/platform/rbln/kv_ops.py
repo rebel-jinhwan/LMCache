@@ -38,13 +38,6 @@ import torch
 
 
 #: Host landing buffers for the device<->host leg, per thread.
-#:
-#: Thread-local rather than module-global on purpose: the multiprocess server
-#: runs blocking handlers on a thread pool, so a store and a retrieve -- or two
-#: stores -- can be in ``multi_layer_block_kv_transfer`` at the same time. A
-#: shared buffer would let one overwrite the other's staged bytes between its
-#: transpose and its copy, corrupting the KV cache with no error anywhere.
-#: The cost is one resident buffer per (thread, chunk geometry).
 _STAGING = threading.local()
 
 
