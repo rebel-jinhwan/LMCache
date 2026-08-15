@@ -89,43 +89,33 @@ def gather_blocks_to_chunk(
     """
     _kv, _nb, num_heads, block_size, head_size = paged_layers[0].shape
     n_blocks = len(block_ids)
-    # One buffer for the whole gather, block-major so that buf[i] is
-    # contiguous: each block's stack writes straight into its slice through
-    # out=, leaving nothing to concatenate afterwards. Stacking into separate
-    # tensors and cat-ing them costs a second chunk-sized allocation plus a
-    # full extra pass over the chunk, which measured ~2x the latency at four
-    # blocks on RBLN. A non-contiguous out= would be worse than either: the
-    # kernels stage it through a temporary and copy again.
-    buf = torch.empty(
-        n_blocks,
-        2,
-        len(paged_layers),
-        num_heads,
-        block_size,
-        head_size,
-        dtype=paged_layers[0].dtype,
-        device=paged_layers[0].device,
-    )
-    # Keeping the K/V axis in the per-layer view means one stack over layers
-    # yields [2, L, H, BS, D] directly -- no separate k/v stacks and no
-    # trailing recombine.
-    for position, block in enumerate(block_ids):
-        torch.stack(
-            [layer[:, block] for layer in paged_layers], dim=1, out=buf[position]
-        )
-    # Handing copy_ a permuted device source makes the H<->T transpose part of
-    # the device->host copy, which splits it into head_size-sized runs; the
-    # descriptors that come out of that are what makes a token-major chunk
-    # expensive to fill from an HND cache. Landing the block-major buffer on
-    # the host as one contiguous copy first, and transposing there, keeps the
-    # device->host leg at full width and pays for the transpose in host memory
-    # bandwidth instead.
+    # Read each block's K and V straight out of the paged cache into the host
+    # buffer, with no device-side gather in between. K and V are addressed
+    # separately because ``layer[:, block]`` spans both halves of a
+    # ``[2, NB, H, BS, D]`` layer and is therefore NOT contiguous, while
+    # ``layer[kv, block]`` is; with the buffer laid out [B, L, 2, H, BS, D],
+    # ``staged[block, layer, kv]`` matches it exactly, so every copy is one
+    # full-width contiguous run.
+    #
+    # The transpose to token-major is deliberately NOT folded into these
+    # copies: a permuted device source would split them into head_size-sized
+    # runs, and that descriptor blow-up is what makes a token-major chunk look
+    # expensive to fill from an HND cache. It happens on the host below,
+    # against host memory bandwidth.
     staged = _host_staging(
         n_blocks,
-        (2, len(paged_layers), num_heads, block_size, head_size),
-        buf.dtype,
+        (len(paged_layers), 2, num_heads, block_size, head_size),
+        paged_layers[0].dtype,
     )
-    staged.copy_(buf)
+    dsts: list[torch.Tensor] = []
+    srcs: list[torch.Tensor] = []
+    for position, block in enumerate(block_ids):
+        for layer_idx, layer in enumerate(paged_layers):
+            dsts.append(staged[position, layer_idx, 0])
+            srcs.append(layer[0, block])
+            dsts.append(staged[position, layer_idx, 1])
+            srcs.append(layer[1, block])
+    torch._foreach_copy_(dsts, srcs)
     # Splitting H*D, splitting the token axis into (block, token-in-block), and
     # transposing H<->T are all views, so copy_ reads transposed rather than
     # materialising a permuted intermediate. reshape() here would not be a
@@ -135,7 +125,8 @@ def gather_blocks_to_chunk(
     by_block = tokens[:, :, : n_blocks * block_size].unflatten(
         2, (n_blocks, block_size)
     )
-    by_block.copy_(staged.permute(1, 2, 0, 4, 3, 5))
+    # staged [B, L, 2, H, BS, D] -> [2, L, B, BS, H, D], matching by_block.
+    by_block.copy_(staged.permute(2, 1, 0, 4, 3, 5))
 
 
 def scatter_chunk_to_blocks(
@@ -169,22 +160,23 @@ def scatter_chunk_to_blocks(
     n_staged = n_blocks - start
     staged = _host_staging(
         n_staged,
-        (2, len(paged_layers), num_heads, block_size, head_size),
+        (len(paged_layers), 2, num_heads, block_size, head_size),
         src.dtype,
     )
     by_block = tokens[:, :, start * block_size : n_blocks * block_size].unflatten(
         2, (n_staged, block_size)
     )
-    staged.permute(1, 2, 0, 4, 3, 5).copy_(by_block)
+    # staged [B, L, 2, H, BS, D] -> [2, L, B, BS, H, D], matching by_block.
+    staged.permute(2, 1, 0, 4, 3, 5).copy_(by_block)
 
     dsts: list[torch.Tensor] = []
     srcs: list[torch.Tensor] = []
     for position in range(start, n_blocks):
         block = block_ids[position]
         for layer_idx, layer in enumerate(paged_layers):
-            # Both sides are contiguous [H, BS, D] now, so each copy is one run.
+            # Both sides are contiguous [H, BS, D], so each copy is one run.
             dsts.append(layer[0, block])
-            srcs.append(staged[position - start, 0, layer_idx])
+            srcs.append(staged[position - start, layer_idx, 0])
             dsts.append(layer[1, block])
-            srcs.append(staged[position - start, 1, layer_idx])
+            srcs.append(staged[position - start, layer_idx, 1])
     torch._foreach_copy_(dsts, srcs)
