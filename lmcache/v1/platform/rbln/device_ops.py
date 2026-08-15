@@ -129,15 +129,13 @@ class RblnDeviceOps(DeviceOps):
             ]
             if not blocks:
                 break
-            # A trailing chunk may hold fewer blocks than it was sized for.
-            region = chunk[:, :, : len(blocks) * block_size]
             if is_d2h:
-                gather_blocks_to_chunk(paged_layers, blocks, region)
+                gather_blocks_to_chunk(paged_layers, blocks, chunk)
             else:
                 # The prefix skip is global across the transfer; translate it
                 # into this chunk's local block offset.
                 local_skip = min(len(blocks), max(0, skip_prefix_n_blocks - consumed))
                 scatter_chunk_to_blocks(
-                    paged_layers, blocks, region, skip_prefix_n_blocks=local_skip
+                    paged_layers, blocks, chunk, skip_prefix_n_blocks=local_skip
                 )
             consumed += len(blocks)

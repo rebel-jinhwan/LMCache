@@ -45,9 +45,12 @@ def gather_blocks_to_chunk(
     Args:
         paged_layers: Per-layer HND KV tensors, each ``[2, NB, NH, BS, HS]``.
         block_ids: Blocks to gather, in chunk-token order.
-        dst: Chunk region shaped ``[2, L, len(block_ids) * BS, H*D]``. May be
-            on device (D2D) or host (D2H); ``copy_`` handles the transfer.
+        dst: Chunk shaped ``[2, L, T, H*D]``. Only its leading
+            ``len(block_ids) * BS`` tokens are written, so a trailing chunk
+            holding fewer blocks than it was sized for is fine. May be on
+            device (D2D) or host (D2H); ``copy_`` handles the transfer.
     """
+    _kv, _nb, num_heads, block_size, head_size = paged_layers[0].shape
     # Keeping the K/V axis in the per-layer view means one stack over layers
     # yields [2, L, H, BS, D] directly -- no separate k/v stacks and no
     # trailing recombine.
@@ -58,8 +61,8 @@ def gather_blocks_to_chunk(
     gathered = torch.cat(pieces, dim=3) if len(pieces) > 1 else pieces[0]
     # Splitting H*D and transposing H<->T are both views, so copy_ reads
     # transposed rather than materialising a permuted intermediate.
-    num_heads, head_size = gathered.shape[2], gathered.shape[4]
-    dst.unflatten(-1, (num_heads, head_size)).copy_(gathered.permute(0, 1, 3, 2, 4))
+    tokens = dst.unflatten(-1, (num_heads, head_size))
+    tokens[:, :, : len(block_ids) * block_size].copy_(gathered.permute(0, 1, 3, 2, 4))
 
 
 def scatter_chunk_to_blocks(
@@ -73,7 +76,9 @@ def scatter_chunk_to_blocks(
     Args:
         paged_layers: Per-layer HND KV tensors, each ``[2, NB, NH, BS, HS]``.
         block_ids: Destination blocks, in chunk-token order.
-        src: Chunk region shaped ``[2, L, len(block_ids) * BS, H*D]``.
+        src: Chunk shaped ``[2, L, T, H*D]``. Only the token windows the
+            blocks map to are read, so a trailing chunk holding fewer blocks
+            than it was sized for is fine.
         skip_prefix_n_blocks: Leading blocks already present in the KV cache;
             neither read from ``src`` nor written.
     """
