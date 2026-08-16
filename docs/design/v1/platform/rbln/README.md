@@ -112,20 +112,25 @@ the request.
 
 ## The native extension
 
-`lmcache/v1/platform/rbln/kv_ops.py` is the reference head-major transfer, and
-the only one the unit tests exercise. `csrc/rbln/` is the same contract issued
-as rebel runtime DMAs, built as `lmcache.rbln_ops` by
-`setup_extensions/build_profiles/rbln.py`.
+`lmcache/v1/platform/rbln/kv_ops.py` is the reference transfer, and the only one
+the unit tests exercise. `csrc/rbln/` produces the same bytes -- the canonical
+token-major chunk -- issued as rebel runtime DMAs, built as `lmcache.rbln_ops`
+by `setup_extensions/build_profiles/rbln.py`.
 
-The reason it exists is the operand lists, not the copies. The torch kernels
-have to materialise one tensor view per `(block, layer, kv)` triple to hand
-`torch._foreach_copy_` its arguments; that count grows with blocks per chunk,
-and above roughly a few hundred pairs building the views costs more than the
-transfer they describe. The native kernel computes the same addresses from the
-paged buffer's strides and submits them directly, so a multi-block chunk costs
-the same per-block work as a single-block one. At one block per chunk -- the
-shape serving actually uses -- the two are close, since that case coalesces to
-one DMA per `(kv, layer)` on either path.
+Both take the same two steps, because the layouts leave no choice: a block is
+contiguous on the device but scattered across token rows in the chunk, so the
+device<->host copy lands blocks in a host staging buffer shaped like the device,
+and the head<->token transpose happens there. What the extension changes is who
+does each step. The copies become rebel runtime DMAs addressed from the paged
+buffer's strides, instead of one materialised tensor view per `(block, layer,
+kv)` triple handed to `torch._foreach_copy_` -- a count that grows with blocks
+per chunk, until building the views costs more than the transfer they describe.
+The transpose becomes a C++ loop over `head_size`-long runs, parallel over
+`(kv, layer)`, instead of a torch strided copy.
+
+At one block per chunk -- the shape serving actually uses -- the two are close,
+and the transpose dominates either way; the native path pulls ahead as blocks
+per chunk grow.
 
 **How the two relate.** The same way CUDA and XPU relate to theirs:
 `RblnDeviceOps.ensure_native()` imports the extension and hands it to
@@ -133,7 +138,7 @@ one DMA per `(kv, layer)` on either path.
 builds the ops singleton. A missing extension is a logged soft-fail, not an
 error -- it links the rebel runtime, so its absence is the ordinary case.
 
-What binding adds is `head_major_block_kv_transfer`. There is no torch method of
+What binding adds is `block_kv_transfer`. There is no torch method of
 that name, so `multi_layer_block_kv_transfer` tests for the attribute to decide
 which implementation it holds, rather than carrying a flag of its own. There is
 no env var and no adapter module: the extension is built only when `RblnProfile`

@@ -20,12 +20,12 @@ PYBIND11_MODULE(rbln_ops, m) {
   m.doc() = "RBLN native ops for LMCache";
 
   m.def(
-      "head_major_block_kv_transfer",
+      "block_kv_transfer",
       [](const std::vector<at::Tensor>& paged_layers,
          const std::vector<at::Tensor>& chunks,
          const std::vector<int64_t>& block_ids, int64_t direction,
          int64_t skip_prefix_n_blocks) {
-        lmcache::rbln::head_major_block_kv_transfer(
+        lmcache::rbln::block_kv_transfer(
             paged_layers, chunks, block_ids,
             static_cast<TransferDirection>(direction), skip_prefix_n_blocks);
       },

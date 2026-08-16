@@ -19,13 +19,13 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.platform.ops_types import (
-    EngineKVFormat,
-    PageBufferShapeDesc,
-    TransferDirection,
-)
+from lmcache.v1.platform.ops_types import PageBufferShapeDesc
 from lmcache.v1.platform.rbln import device_ops as device_ops_module
 from lmcache.v1.platform.rbln.device_ops import RblnDeviceOps, native_can_serve
+import lmcache.lmcache_native as lmcache_native
+
+EngineKVFormat = lmcache_native.EngineKVFormat
+TransferDirection = lmcache_native.TransferDirection
 
 NUM_LAYERS = 2
 NUM_BLOCKS = 4
@@ -72,7 +72,7 @@ class _RecordingOps(RblnDeviceOps):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[dict[str, Any]] = []
-        self.head_major_block_kv_transfer = self._record  # type: ignore[assignment]
+        self.block_kv_transfer = self._record  # type: ignore[assignment]
 
     def _record(
         self,
@@ -122,7 +122,7 @@ def test_missing_extension_leaves_the_torch_kernels_in_place() -> None:
     """No compiled extension is the ordinary case off an RBLN host."""
     ops = RblnDeviceOps()
     ops.ensure_native()
-    assert getattr(ops, "head_major_block_kv_transfer", None) is None
+    assert getattr(ops, "block_kv_transfer", None) is None
 
 
 # ---------------------------------------------------------------------------
