@@ -132,19 +132,29 @@ NVMe range must stay readable until the key is evicted.
   `mark_device_updated` after each batched read; without it the restored KV is
   silently stale rather than wrong-looking.
 
-**RDS has to be the primary allocator**, and this is the one place it differs
-from GDS structurally. `GdsBackend` is an `AllocatorBackendInterface` too, but
+**Foreign objects are staged, not refused.** This is the one place RDS differs
+from GDS. `GdsBackend` is an `AllocatorBackendInterface` too, but
 `StorageManager._get_allocator_backend` never selects it: cuFile writes whatever
 buffer it is handed, so GDS allocates only its own read destinations and
 tolerates a `LocalCPUBackend` object on the write path. `rebel.rds` cannot —
 it transfers a bound vmem *area* and requires the transfer size to equal that
-area's size, so a `MemoryObj` RDS did not allocate is not a writable source at
-all.
+area's size, so a `MemoryObj` RDS did not allocate is not a writable source.
 
-`_get_allocator_backend` therefore grows one named arm for `RDSBackend`, in the
-same style as the existing `PDBackend` and `MaruBackend` arms. It sits above
-`LocalCPUBackend` rather than below it, because `max_local_cpu_size` defaults to
-5 GB: the ordinary RDS configuration has a host pool registered in front of it,
-and deferring to that pool would hand RDS host tensors on every store. P/D still
-wins when enabled, and nothing changes for a configuration that does not set
-`enable_rbln_rds`.
+Rather than claim the allocator slot for the whole engine, the write path
+copies such an object into a staging area first (`_as_write_source`) and
+releases the area once the stream drains. `StorageManager` is left alone, so
+RDS registers like any other tier and the host pool in front of it keeps
+working. The cost is one full-chunk copy per store — the object was allocated
+in host memory, so the KV reaches NVMe as
+`device -> host -> device vmem -> NVMe`.
+
+The copy-free path would be a deployment with no host pool, where the storage
+manager would hand the gather an RDS area directly. That is not reachable
+today for a reason outside this backend: `_get_allocator_backend` ends in an
+unconditional `storage_backends["LocalCPUBackend"]`, so `max_local_cpu_size: 0`
+raises `KeyError` there before RDS is consulted. Making it fall back to the
+first backend that owns an allocator is a shared-code fix, and belongs in its
+own change rather than here.
+
+Reads never stage: `batched_get_blocking` allocates its own destination areas,
+exactly as GDS does.

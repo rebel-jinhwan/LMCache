@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence, TypeVar, Union
+from typing import Any, Callable, List, Optional, Sequence, TypeVar, Union, cast
 import asyncio
 import os
 import threading
@@ -484,14 +484,56 @@ class RDSBackend(AllocatorBackendInterface):
 
         Addresses ``raw_data`` -- the whole vmem area -- rather than ``tensor``,
         which may be a view onto part of it: ``rds`` requires a whole area.
+
+        An object this backend did not allocate is not an area at all, so it
+        cannot be a write source; it is copied into a staging area first. That
+        is the ordinary case whenever a host pool is registered in front, and
+        it costs one full-chunk copy per store.
         """
         chunk = self.memory_allocator.chunk
-        with self.memory_allocator.make_stream() as stream:
-            for mo, entry in zip(objs, entries, strict=True):
-                vaddr = mo.raw_data.data_ptr()
-                # ``Chunk.write`` does not sync host->device; the caller owns it.
-                self.memory_allocator.vmem.sync_to_device(vaddr)
-                self._transfer_area(chunk.write, vaddr, entry.file_offset, stream)
+        staged: List[MemoryObj] = []
+        try:
+            with self.memory_allocator.make_stream() as stream:
+                for mo, entry in zip(objs, entries, strict=True):
+                    source = self._as_write_source(mo, staged)
+                    vaddr = source.raw_data.data_ptr()
+                    # ``Chunk.write`` does not sync host->device; we own it.
+                    self.memory_allocator.vmem.sync_to_device(vaddr)
+                    self._transfer_area(chunk.write, vaddr, entry.file_offset, stream)
+        finally:
+            # The stream is drained on exit, so the areas are free to reuse.
+            for mo in staged:
+                mo.ref_count_down()
+
+    def _as_write_source(self, mo: MemoryObj, staged: List[MemoryObj]) -> MemoryObj:
+        """Return ``mo`` if it is one of our areas, else a staged copy of it.
+
+        Args:
+            mo: The object the storage manager allocated and filled.
+            staged: Collects the areas allocated here, for the caller to
+                release once the writes are drained.
+
+        Returns:
+            MemoryObj: An object whose ``raw_data`` is a bound vmem area.
+
+        Raises:
+            RuntimeError: If the staging pool cannot serve the copy.
+        """
+        if getattr(mo, "parent_allocator", None) is self.memory_allocator:
+            return mo
+        staging = self.memory_allocator.allocate(
+            mo.metadata.shape, cast(torch.dtype, mo.metadata.dtype), mo.metadata.fmt
+        )
+        if staging is None:
+            raise RuntimeError(
+                "RDS write staging pool exhausted while copying a "
+                f"{mo.metadata.phy_size}-byte object this backend did not "
+                "allocate. Increase max_local_disk_size (chunk is currently "
+                f"{self.memory_allocator.chunk_size} bytes)."
+            )
+        staged.append(staging)
+        cast(torch.Tensor, staging.tensor).copy_(cast(torch.Tensor, mo.tensor))
+        return staging
 
     # ------------------------------------------------------------------
     # StorageBackendInterface -- get

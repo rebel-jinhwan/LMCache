@@ -316,11 +316,6 @@ class StorageManager:
     ) -> AllocatorBackendInterface:
         if self.enable_pd:
             allocator_backend = self.storage_backends["PDBackend"]
-        elif "RDSBackend" in self.storage_backends:
-            # Unlike GDS, RDS cannot write a MemoryObj it did not allocate: it
-            # transfers a bound vmem area and requires the transfer size to
-            # equal that area's size.
-            allocator_backend = self.storage_backends["RDSBackend"]
         elif "MaruBackend" in self.storage_backends:
             if "LocalCPUBackend" in self.storage_backends:
                 allocator_backend = self.storage_backends["LocalCPUBackend"]
