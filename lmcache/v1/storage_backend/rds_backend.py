@@ -482,13 +482,14 @@ class RDSBackend(AllocatorBackendInterface):
     ) -> None:
         """Issue every ``chunk.write`` inside a single stream and synchronise.
 
-        Addresses ``raw_data`` -- the whole vmem area -- rather than ``tensor``,
-        which may be a view onto part of it: ``rds`` requires a whole area.
+        Addresses ``raw_data`` -- the vaddr of the whole area -- rather than
+        ``tensor``, which may be a view onto part of it: the DMA moves buffer
+        handles fetched from that vaddr, not an address range.
 
-        An object this backend did not allocate is not an area at all, so it
-        cannot be a write source; it is copied into a staging area first. That
-        is the ordinary case whenever a host pool is registered in front, and
-        it costs one full-chunk copy per store.
+        An object this backend did not allocate has no vmem entry behind it, so
+        it yields no buffers and cannot be a write source; it is copied into a
+        staging area first. That is the ordinary case whenever a host pool is
+        registered in front, and it costs one full-chunk copy per store.
         """
         chunk = self.memory_allocator.chunk
         staged: List[MemoryObj] = []
@@ -514,7 +515,8 @@ class RDSBackend(AllocatorBackendInterface):
                 release once the writes are drained.
 
         Returns:
-            MemoryObj: An object whose ``raw_data`` is a bound vmem area.
+            MemoryObj: An object whose ``raw_data`` is a bound vmem area,
+            so ``get_device_buffers`` can hand out its transfer handles.
 
         Raises:
             RuntimeError: If the staging pool cannot serve the copy.

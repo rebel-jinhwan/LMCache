@@ -3,9 +3,19 @@
 
 Hands out one full RBLN vmem area per :meth:`~RDSMemoryAllocator.allocate`,
 recycled through a per-size free list, and owns the single ``rebel.rds.Chunk``
-those areas are written to. A whole area rather than sub-ranges of one buffer
-because ``rds`` transfers an *area* and requires the transfer size to equal the
-area's size.
+those areas are written to.
+
+One area per object rather than sub-ranges of one big buffer, because ``rds``
+takes neither: ``Chunk.write``/``read`` move a ``rebel._C.vmem.Buffer``, an
+*owning handle* on a device area that only ``vmem.get_device_buffers(vaddr)``
+hands out. There is no constructor for one and its fields are read-only, so a
+handle onto part of an area cannot be made. That is deliberate -- the handle
+keeps the backing allocation alive, which is what stops ``device_addr`` from
+going stale when the vmem entry is rebuilt.
+
+A vaddr is a virtual handle rather than a device address, so there is no
+contiguous device range behind it to slice in the first place: a sharded or
+transformed entry is several areas.
 
 Where inside the chunk an object lands belongs to
 :class:`~lmcache.v1.storage_backend.rds_backend.NvmeOffsetAllocator` instead --
@@ -92,8 +102,9 @@ class RDSMemoryAllocator(MemoryAllocatorInterface):
     """Pool of RBLN vmem staging areas, plus the shared ``rds.Chunk``.
 
     Each :meth:`allocate` hands out one full vmem area sized to the object's
-    4096-aligned physical bytes, so its ``data_ptr()`` starts an area whose size
-    equals the transfer size. :meth:`free` pushes it into a size-keyed pool for
+    4096-aligned physical bytes, so its ``data_ptr()`` is a vaddr the backend
+    can turn into transferable buffer handles. :meth:`free` pushes it into a
+    size-keyed pool for
     reuse, bounding live device memory at *peak concurrent* objects rather than
     at *total* allocations.
     """

@@ -124,9 +124,15 @@ NVMe range must stay readable until the key is evicted.
 
 **Two constraints come from the runtime, not from LMCache:**
 
-- `rds` transfers a whole vmem *area* and requires the transfer size to equal
-  the area's size, so `RDSMemoryAllocator` hands out one full area per object
-  rather than sub-ranges of a slab.
+- The DMA operand is a `rebel._C.vmem.Buffer` — an *owning handle* on one
+  device area, obtained only from `vmem.get_device_buffers(vaddr)`. It has no
+  constructor and read-only fields, so a handle onto part of an area cannot be
+  built, and a vaddr has no contiguous device range behind it to slice anyway
+  (a sharded entry is several areas). `RDSMemoryAllocator` therefore hands out
+  one full area per object rather than sub-ranges of a slab, the way
+  `CuFileMemoryAllocator` can with a registered CUDA buffer. Sizes are free:
+  a chunk holds many buffers at different `file_offset`s, which is how
+  `_transfer_area` writes a multi-area entry.
 - A stream `Chunk.read` DMAs into device vmem without updating the vmem's sync
   state — only the synchronous read path does that internally. The backend calls
   `mark_device_updated` after each batched read; without it the restored KV is
@@ -137,8 +143,9 @@ from GDS. `GdsBackend` is an `AllocatorBackendInterface` too, but
 `StorageManager._get_allocator_backend` never selects it: cuFile writes whatever
 buffer it is handed, so GDS allocates only its own read destinations and
 tolerates a `LocalCPUBackend` object on the write path. `rebel.rds` cannot —
-it transfers a bound vmem *area* and requires the transfer size to equal that
-area's size, so a `MemoryObj` RDS did not allocate is not a writable source.
+`Chunk.write` takes a `rebel._C.vmem.Buffer`, an owning handle on a device area
+that only `vmem.get_device_buffers(vaddr)` hands out, so an object with no vmem
+entry behind it yields no handle and cannot be a source.
 
 Rather than claim the allocator slot for the whole engine, the write path
 copies such an object into a staging area first (`_as_write_source`) and
