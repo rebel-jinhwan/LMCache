@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence, TypeVar, Union, cast
+from typing import Any, Callable, List, Optional, Sequence, Union, cast
 import asyncio
 import os
 import threading
@@ -54,15 +54,12 @@ from lmcache.v1.storage_backend.rds_memory_allocator import (
 
 logger = init_logger(__name__)
 
-# One MemoryObj or a whole batch -- whatever :meth:`RDSBackend._with_eviction`
-# retries.
-_T = TypeVar("_T")
-
 #: NVMe chunk size per rank, in GB, when ``max_local_disk_size`` is unset. Each
 #: rank reserves its own, so this times the rank count must fit the device.
 DEFAULT_CHUNK_SIZE_GB = 64
 
-#: Override for the in-flight write cap K. See :meth:`drain_inflight_writes`.
+#: Override for the in-flight write cap K, the number of store batches that may
+#: hold staging at once. See :meth:`RDSBackend.batched_submit_put_task`.
 ENV_MAX_INFLIGHT_WRITES = "LMCACHE_RBLN_RDS_MAX_INFLIGHT_WRITES"
 
 
@@ -182,22 +179,9 @@ class RDSBackend(AllocatorBackendInterface):
 
         override = os.environ.get(ENV_MAX_INFLIGHT_WRITES)
         k = max(1, int(override)) if override is not None else 0
-        self._write_slots_k = k or store_inflight_writes(metadata) or 1
-        self._write_slots = threading.BoundedSemaphore(self._write_slots_k)
-
-    def drain_inflight_writes(self) -> None:
-        """Block until every in-flight async write has completed.
-
-        Writes are fired on the event loop and run in parallel up to K in
-        flight, so taking all K slots blocks until nothing is in flight.
-        Draining once per batch rather than per chunk keeps the writes parallel
-        while still keeping the next forward pass off the NVMe write-back on a
-        shared PCIe bus.
-        """
-        for _ in range(self._write_slots_k):
-            self._write_slots.acquire()
-        for _ in range(self._write_slots_k):
-            self._write_slots.release()
+        self._write_slots = threading.BoundedSemaphore(
+            k or store_inflight_writes(metadata) or 1
+        )
 
     # ------------------------------------------------------------------
     # AllocatorBackendInterface
@@ -245,9 +229,7 @@ class RDSBackend(AllocatorBackendInterface):
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[MemoryObj]:
-        return self._with_eviction(
-            lambda: self._allocate_for_store(shapes, dtypes, fmt), eviction
-        )
+        return self._allocate_for_store(shapes, dtypes, fmt, eviction)
 
     def batched_allocate(
         self,
@@ -258,63 +240,52 @@ class RDSBackend(AllocatorBackendInterface):
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[list[MemoryObj]]:
-        return self._with_eviction(
-            lambda: self._batched_allocate_for_store(shapes, dtypes, batch_size, fmt),
-            eviction,
-        )
+        """All-or-nothing :meth:`_allocate_for_store` for ``batch_size`` objects.
 
-    def _with_eviction(
-        self, attempt: Callable[[], Optional[_T]], eviction: bool
-    ) -> Optional[_T]:
-        """Retry ``attempt`` after each LRU eviction until it succeeds.
-
-        The NVMe chunk is the scarce resource, so a miss discards LRU chunks to
-        reclaim their offsets. Gives up once there is nothing left to evict.
+        Each object evicts for itself, so a batch that needs N evictions costs
+        one pass rather than N re-runs of the whole batch.
         """
-        got = attempt()
-        while got is None and eviction and self._evict_one_lru():
-            got = attempt()
-        return got
-
-    def _allocate_for_store(
-        self,
-        shapes: Union[torch.Size, list[torch.Size]],
-        dtypes: Union[torch.dtype, list[torch.dtype]],
-        fmt: MemoryFormat,
-    ) -> Optional[MemoryObj]:
-        """A staging buffer plus the NVMe range its contents will be written to.
-
-        Buffer first, offset second: an offset reserved before a staging failure
-        would be leaked, whereas a buffer whose reservation fails is handed back
-        to the pool.
-        """
-        mo = self.memory_allocator.allocate(shapes, dtypes, fmt)
-        if mo is None:
-            return None
-        file_offset = self.nvme_offsets.reserve(mo.get_physical_size())
-        if file_offset is None:
-            mo.ref_count_down()  # -> memory_allocator.free, back into the pool
-            return None
-        mo.metadata.address = file_offset
-        return mo
-
-    def _batched_allocate_for_store(
-        self,
-        shapes: Union[torch.Size, list[torch.Size]],
-        dtypes: Union[torch.dtype, list[torch.dtype]],
-        batch_size: int,
-        fmt: MemoryFormat,
-    ) -> Optional[list[MemoryObj]]:
-        """All-or-nothing :meth:`_allocate_for_store` for ``batch_size`` objects."""
         objs: list[MemoryObj] = []
         for _ in range(batch_size):
-            mo = self._allocate_for_store(shapes, dtypes, fmt)
+            mo = self._allocate_for_store(shapes, dtypes, fmt, eviction)
             if mo is None:
                 for allocated in objs:
                     self._free_for_store(allocated)
                 return None
             objs.append(mo)
         return objs
+
+    def _allocate_for_store(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        fmt: MemoryFormat,
+        eviction: bool,
+    ) -> Optional[MemoryObj]:
+        """A staging buffer plus the NVMe range its contents will be written to.
+
+        Buffer first, offset second: an offset reserved before a staging failure
+        would be leaked, whereas a buffer whose reservation fails is handed back
+        to the pool.
+
+        The NVMe chunk is the scarce resource, so a full chunk discards LRU
+        entries to reclaim their offsets and retries, giving up once there is
+        nothing left to evict. The retry sits on ``reserve`` rather than around
+        the whole allocation because that is the only failure eviction can
+        undo: eviction frees NVMe ranges, never staging areas.
+        """
+        mo = self.memory_allocator.allocate(shapes, dtypes, fmt)
+        if mo is None:
+            return None
+        nbytes = mo.get_physical_size()
+        file_offset = self.nvme_offsets.reserve(nbytes)
+        while file_offset is None and eviction and self._evict_one_lru():
+            file_offset = self.nvme_offsets.reserve(nbytes)
+        if file_offset is None:
+            mo.ref_count_down()  # -> memory_allocator.free, back into the pool
+            return None
+        mo.metadata.address = file_offset
+        return mo
 
     def _free_for_store(self, memory_obj: MemoryObj) -> None:
         """Undo :meth:`_allocate_for_store` -- release the range, then the buffer.
@@ -402,7 +373,17 @@ class RDSBackend(AllocatorBackendInterface):
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
     ) -> None:
         try:
-            entries = [self._snapshot_entry(mo) for mo in objs]
+            maybe_entries = [self._snapshot_entry(mo) for mo in objs]
+            if any(entry is None for entry in maybe_entries):
+                # The chunk cannot hold this batch. Give back what the entries
+                # that did fit reserved, so a full chunk costs a skipped store
+                # rather than a leak.
+                logger.warning("RDS chunk full: dropping a batch of %d keys", len(keys))
+                for entry in maybe_entries:
+                    if entry is not None:
+                        self.nvme_offsets.release(entry.file_offset, entry.size)
+                return
+            entries = cast(List[_RdsEntry], maybe_entries)
             try:
                 await asyncio.to_thread(self._sync_batched_write, objs, entries)
             except Exception:
@@ -445,12 +426,36 @@ class RDSBackend(AllocatorBackendInterface):
             # reflects live writes.
             self._write_slots.release()
 
-    @staticmethod
-    def _snapshot_entry(memory_obj: MemoryObj) -> _RdsEntry:
+    def _snapshot_entry(self, memory_obj: MemoryObj) -> Optional[_RdsEntry]:
+        """Pin down where this object goes on NVMe, and what shape comes back.
+
+        An object from :meth:`_allocate_for_store` already carries its range in
+        ``metadata.address``, stamped when it was allocated. An object from
+        another allocator carries *that* allocator's address, which means
+        nothing here, so its range is reserved now -- evicting LRU entries to
+        make room, exactly as the allocate path does.
+
+        Args:
+            memory_obj: The object about to be written.
+
+        Returns:
+            The entry to store it under, or ``None`` when the chunk is full and
+            there is nothing left to evict.
+        """
         meta = memory_obj.metadata
+        nbytes = memory_obj.get_physical_size()
+        if getattr(memory_obj, "parent_allocator", None) is self.memory_allocator:
+            file_offset = meta.address
+        else:
+            reserved = self.nvme_offsets.reserve(nbytes)
+            while reserved is None and self._evict_one_lru():
+                reserved = self.nvme_offsets.reserve(nbytes)
+            if reserved is None:
+                return None
+            file_offset = reserved
         return _RdsEntry(
-            file_offset=meta.address,
-            size=memory_obj.get_physical_size(),
+            file_offset=file_offset,
+            size=nbytes,
             shape=meta.shape,
             dtype=meta.dtype,
             fmt=meta.fmt,

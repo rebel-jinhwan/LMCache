@@ -450,7 +450,16 @@ class StorageManager:
             memory_obj = backend.get_blocking(key)
             if memory_obj:
                 if (
-                    backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
+                    backend_name
+                    not in [
+                        "LocalCPUBackend",
+                        "PDBackend",
+                        "MaruBackend",
+                        # Hands back device memory from its own pool; writing
+                        # that to the host tier is the copy this backend
+                        # exists to avoid.
+                        "RDSBackend",
+                    ]
                     and "LocalCPUBackend" in self.storage_backends
                 ):
                     local_cpu_backend = self.storage_backends["LocalCPUBackend"]
@@ -494,7 +503,16 @@ class StorageManager:
                 # Align with single-key `get()` logic:
                 # auto-write remote data to local CPU cache
                 if (
-                    backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
+                    backend_name
+                    not in [
+                        "LocalCPUBackend",
+                        "PDBackend",
+                        "MaruBackend",
+                        # Hands back device memory from its own pool; writing
+                        # that to the host tier is the copy this backend
+                        # exists to avoid.
+                        "RDSBackend",
+                    ]
                     and "LocalCPUBackend" in self.storage_backends
                     and None not in memory_objs
                 ):

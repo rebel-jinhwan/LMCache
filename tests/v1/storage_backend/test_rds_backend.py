@@ -279,6 +279,41 @@ def test_store_stages_an_object_this_backend_did_not_allocate(
     got.ref_count_down()
 
 
+def test_foreign_objects_reserve_their_nvme_range(
+    backend: Any, runtime: _FakeRuntime
+) -> None:
+    """A foreign store must reserve its range, not borrow ``metadata.address``.
+
+    That address is an offset into *another* allocator's space and means
+    nothing on NVMe. Taking it for a file offset wrote to a range the chunk
+    never handed out: it can overlap a reserved one, and evicting the key
+    releases a range that was never taken.
+    """
+    host_allocator = TensorMemoryAllocator(
+        torch.zeros(4 * 1024 * 1024, dtype=torch.uint8)
+    )
+    mo = host_allocator.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD)
+    assert mo is not None
+    mo.tensor.fill_(2.5)
+    before = backend.nvme_offsets.bytes_in_use
+
+    futures = backend.batched_submit_put_task([_key("foreign")], [mo])
+    assert futures is not None
+    for future in futures:
+        future.result(timeout=10)
+
+    assert backend.nvme_offsets.bytes_in_use == before + mo.get_physical_size()
+    mo.ref_count_down()
+
+    got = backend.get_blocking(_key("foreign"))
+    assert got is not None
+    assert torch.equal(got.tensor, torch.full(KV_SHAPE, 2.5, dtype=KV_DTYPE))
+    got.ref_count_down()
+
+    backend.remove(_key("foreign"))
+    assert backend.nvme_offsets.bytes_in_use == before
+
+
 def test_staging_areas_are_returned_to_the_pool(
     backend: Any, runtime: _FakeRuntime
 ) -> None:
