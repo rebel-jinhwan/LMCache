@@ -138,30 +138,26 @@ NVMe range must stay readable until the key is evicted.
   `mark_device_updated` after each batched read; without it the restored KV is
   silently stale rather than wrong-looking.
 
-**Foreign objects are staged, not refused.** This is the one place RDS differs
-from GDS. `GdsBackend` is an `AllocatorBackendInterface` too, but
-`StorageManager._get_allocator_backend` never selects it: cuFile writes whatever
-buffer it is handed, so GDS allocates only its own read destinations and
-tolerates a `LocalCPUBackend` object on the write path. `rebel.rds` cannot —
-`Chunk.write` takes a `rebel._C.vmem.Buffer`, an owning handle on a device area
-that only `vmem.get_device_buffers(vaddr)` hands out, so an object with no vmem
-entry behind it yields no handle and cannot be a source.
+**The intended deployment has no host pool.** `RDSBackend` allocates the
+objects it writes, so `max_local_cpu_size: 0` leaves it as the only tier that
+owns an allocator and `StorageManager` picks it. The connector then gathers KV
+straight into the vmem area that goes to NVMe, and a read hands back an area of
+the same pool: `device -> NVMe` and back, with no host hop in either direction
+and no branch naming this backend anywhere.
 
-Rather than claim the allocator slot for the whole engine, the write path
-copies such an object into a staging area first (`_as_write_source`) and
-releases the area once the stream drains. `StorageManager` is left alone, so
-RDS registers like any other tier and the host pool in front of it keeps
-working. The cost is one full-chunk copy per store — the object was allocated
-in host memory, so the KV reaches NVMe as
-`device -> host -> device vmem -> NVMe`.
+That shape needs one thing from shared code, and it is not RBLN-specific:
+`_get_allocator_backend` used to end in an unconditional
+`storage_backends["LocalCPUBackend"]`, which made "no host pool" a `KeyError`
+for *any* tier that allocates its own objects, GDS included. It now falls back
+to the first backend that owns an allocator.
 
-The copy-free path would be a deployment with no host pool, where the storage
-manager would hand the gather an RDS area directly. That is not reachable
-today for a reason outside this backend: `_get_allocator_backend` ends in an
-unconditional `storage_backends["LocalCPUBackend"]`, so `max_local_cpu_size: 0`
-raises `KeyError` there before RDS is consulted. Making it fall back to the
-first backend that owns an allocator is a shared-code fix, and belongs in its
-own change rather than here.
+**A host pool in front still works, at one copy.** `rebel.rds` cannot write a
+`MemoryObj` it did not allocate -- `Chunk.write` takes an owning `Buffer`
+handle, and an object with no vmem entry behind it yields none -- so such an
+object is copied into a staging area first (`_as_write_source`) and its NVMe
+range is reserved at write time rather than read off `metadata.address`, which
+belongs to the other allocator. This is the P/D configuration, where
+`PDBackend` owns allocation; it costs `device -> host -> device vmem -> NVMe`.
 
 Reads never stage: `batched_get_blocking` allocates its own destination areas,
 exactly as GDS does.

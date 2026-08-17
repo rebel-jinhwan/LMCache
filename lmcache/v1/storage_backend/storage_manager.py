@@ -321,8 +321,28 @@ class StorageManager:
                 allocator_backend = self.storage_backends["LocalCPUBackend"]
             else:
                 allocator_backend = self.storage_backends["MaruBackend"]
-        else:
+        elif "LocalCPUBackend" in self.storage_backends:
             allocator_backend = self.storage_backends["LocalCPUBackend"]
+        else:
+            # A deployment can leave the host pool out (max_local_cpu_size: 0)
+            # when its storage tier allocates the memory objects itself -- GDS
+            # and RDS both do. Fall back to the first backend that owns an
+            # allocator instead of raising KeyError on a pool that was never
+            # meant to exist.
+            allocator_backend = next(
+                (
+                    backend
+                    for backend in self.storage_backends.values()
+                    if isinstance(backend, AllocatorBackendInterface)
+                ),
+                None,
+            )  # type: ignore[assignment]
+            if allocator_backend is None:
+                raise RuntimeError(
+                    "No storage backend owns a memory allocator. Configure one "
+                    "(a host pool via max_local_cpu_size, or a tier that "
+                    "allocates its own objects) before storing."
+                )
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend
 
@@ -450,16 +470,7 @@ class StorageManager:
             memory_obj = backend.get_blocking(key)
             if memory_obj:
                 if (
-                    backend_name
-                    not in [
-                        "LocalCPUBackend",
-                        "PDBackend",
-                        "MaruBackend",
-                        # Hands back device memory from its own pool; writing
-                        # that to the host tier is the copy this backend
-                        # exists to avoid.
-                        "RDSBackend",
-                    ]
+                    backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
                     and "LocalCPUBackend" in self.storage_backends
                 ):
                     local_cpu_backend = self.storage_backends["LocalCPUBackend"]
@@ -503,16 +514,7 @@ class StorageManager:
                 # Align with single-key `get()` logic:
                 # auto-write remote data to local CPU cache
                 if (
-                    backend_name
-                    not in [
-                        "LocalCPUBackend",
-                        "PDBackend",
-                        "MaruBackend",
-                        # Hands back device memory from its own pool; writing
-                        # that to the host tier is the copy this backend
-                        # exists to avoid.
-                        "RDSBackend",
-                    ]
+                    backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
                     and "LocalCPUBackend" in self.storage_backends
                     and None not in memory_objs
                 ):
