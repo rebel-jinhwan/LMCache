@@ -153,11 +153,12 @@ to the first backend that owns an allocator.
 
 **A host pool in front still works, at one copy.** `rebel.rds` cannot write a
 `MemoryObj` it did not allocate -- `Chunk.write` takes an owning `Buffer`
-handle, and an object with no vmem entry behind it yields none -- so such an
-object is copied into a staging area first (`_as_write_source`) and its NVMe
-range is reserved at write time rather than read off `metadata.address`, which
-belongs to the other allocator. This is the P/D configuration, where
-`PDBackend` owns allocation; it costs `device -> host -> device vmem -> NVMe`.
+handle, and an object with no vmem entry behind it yields none. Nothing here
+has to enforce that: `StorageManager.batched_put` re-allocates each batch
+through the destination's own `get_allocator_backend()`, which for this backend
+is itself, and copies the source objects in. So with a host pool the KV travels
+`device -> host -> device vmem -> NVMe`, and the copy is upstream's, in the one
+place every tier's is.
 
 Reads never stage: `batched_get_blocking` allocates its own destination areas,
 exactly as GDS does.

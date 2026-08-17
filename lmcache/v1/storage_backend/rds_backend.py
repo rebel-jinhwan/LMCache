@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence, Union, cast
+from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
 import os
 import threading
@@ -373,17 +373,7 @@ class RDSBackend(AllocatorBackendInterface):
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
     ) -> None:
         try:
-            maybe_entries = [self._snapshot_entry(mo) for mo in objs]
-            if any(entry is None for entry in maybe_entries):
-                # The chunk cannot hold this batch. Give back what the entries
-                # that did fit reserved, so a full chunk costs a skipped store
-                # rather than a leak.
-                logger.warning("RDS chunk full: dropping a batch of %d keys", len(keys))
-                for entry in maybe_entries:
-                    if entry is not None:
-                        self.nvme_offsets.release(entry.file_offset, entry.size)
-                return
-            entries = cast(List[_RdsEntry], maybe_entries)
+            entries = [self._snapshot_entry(mo) for mo in objs]
             try:
                 await asyncio.to_thread(self._sync_batched_write, objs, entries)
             except Exception:
@@ -426,36 +416,20 @@ class RDSBackend(AllocatorBackendInterface):
             # reflects live writes.
             self._write_slots.release()
 
-    def _snapshot_entry(self, memory_obj: MemoryObj) -> Optional[_RdsEntry]:
-        """Pin down where this object goes on NVMe, and what shape comes back.
+    @staticmethod
+    def _snapshot_entry(memory_obj: MemoryObj) -> _RdsEntry:
+        """Where this object goes on NVMe, and what shape comes back.
 
-        An object from :meth:`_allocate_for_store` already carries its range in
-        ``metadata.address``, stamped when it was allocated. An object from
-        another allocator carries *that* allocator's address, which means
-        nothing here, so its range is reserved now -- evicting LRU entries to
-        make room, exactly as the allocate path does.
-
-        Args:
-            memory_obj: The object about to be written.
-
-        Returns:
-            The entry to store it under, or ``None`` when the chunk is full and
-            there is nothing left to evict.
+        The range was reserved and stamped onto ``metadata.address`` when the
+        object was allocated -- see :meth:`_allocate_for_store`. That holds for
+        everything reaching this path: ``StorageManager`` re-allocates each
+        batch through the destination's own ``get_allocator_backend()`` before
+        handing it over, so an object from another tier's pool never arrives.
         """
         meta = memory_obj.metadata
-        nbytes = memory_obj.get_physical_size()
-        if getattr(memory_obj, "parent_allocator", None) is self.memory_allocator:
-            file_offset = meta.address
-        else:
-            reserved = self.nvme_offsets.reserve(nbytes)
-            while reserved is None and self._evict_one_lru():
-                reserved = self.nvme_offsets.reserve(nbytes)
-            if reserved is None:
-                return None
-            file_offset = reserved
         return _RdsEntry(
-            file_offset=file_offset,
-            size=nbytes,
+            file_offset=meta.address,
+            size=memory_obj.get_physical_size(),
             shape=meta.shape,
             dtype=meta.dtype,
             fmt=meta.fmt,
@@ -497,50 +471,12 @@ class RDSBackend(AllocatorBackendInterface):
         registered in front, and it costs one full-chunk copy per store.
         """
         chunk = self.memory_allocator.chunk
-        staged: List[MemoryObj] = []
-        try:
-            with self.memory_allocator.make_stream() as stream:
-                for mo, entry in zip(objs, entries, strict=True):
-                    source = self._as_write_source(mo, staged)
-                    vaddr = source.raw_data.data_ptr()
-                    # ``Chunk.write`` does not sync host->device; we own it.
-                    self.memory_allocator.vmem.sync_to_device(vaddr)
-                    self._transfer_area(chunk.write, vaddr, entry.file_offset, stream)
-        finally:
-            # The stream is drained on exit, so the areas are free to reuse.
-            for mo in staged:
-                mo.ref_count_down()
-
-    def _as_write_source(self, mo: MemoryObj, staged: List[MemoryObj]) -> MemoryObj:
-        """Return ``mo`` if it is one of our areas, else a staged copy of it.
-
-        Args:
-            mo: The object the storage manager allocated and filled.
-            staged: Collects the areas allocated here, for the caller to
-                release once the writes are drained.
-
-        Returns:
-            MemoryObj: An object whose ``raw_data`` is a bound vmem area,
-            so ``get_device_buffers`` can hand out its transfer handles.
-
-        Raises:
-            RuntimeError: If the staging pool cannot serve the copy.
-        """
-        if getattr(mo, "parent_allocator", None) is self.memory_allocator:
-            return mo
-        staging = self.memory_allocator.allocate(
-            mo.metadata.shape, cast(torch.dtype, mo.metadata.dtype), mo.metadata.fmt
-        )
-        if staging is None:
-            raise RuntimeError(
-                "RDS write staging pool exhausted while copying a "
-                f"{mo.metadata.phy_size}-byte object this backend did not "
-                "allocate. Increase max_local_disk_size (chunk is currently "
-                f"{self.memory_allocator.chunk_size} bytes)."
-            )
-        staged.append(staging)
-        cast(torch.Tensor, staging.tensor).copy_(cast(torch.Tensor, mo.tensor))
-        return staging
+        with self.memory_allocator.make_stream() as stream:
+            for mo, entry in zip(objs, entries, strict=True):
+                vaddr = mo.raw_data.data_ptr()
+                # ``Chunk.write`` does not sync host->device; the caller owns it.
+                self.memory_allocator.vmem.sync_to_device(vaddr)
+                self._transfer_area(chunk.write, vaddr, entry.file_offset, stream)
 
     # ------------------------------------------------------------------
     # StorageBackendInterface -- get

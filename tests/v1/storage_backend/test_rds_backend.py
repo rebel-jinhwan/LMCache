@@ -23,9 +23,6 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_allocators.tensor_memory_allocator import (
-    TensorMemoryAllocator,
-)
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.storage_backend import rds_backend as rds_backend_module
 from lmcache.v1.storage_backend import rds_memory_allocator as allocator_module
@@ -255,84 +252,23 @@ def test_store_then_read_returns_the_stored_bytes(
     got.ref_count_down()
 
 
-def test_store_stages_an_object_this_backend_did_not_allocate(
-    backend: Any, runtime: _FakeRuntime
-) -> None:
-    """A host object is copied into an area, since rds writes areas only."""
-    key = _key("foreign")
-    host_allocator = TensorMemoryAllocator(
-        torch.zeros(4 * 1024 * 1024, dtype=torch.uint8)
-    )
-    mo = host_allocator.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD)
-    assert mo is not None and mo.parent_allocator is not backend.memory_allocator
-    mo.tensor.fill_(2.5)
+def test_the_backend_allocates_for_its_own_writes(backend: Any) -> None:
+    """``rds`` writes areas it bound, so the manager must allocate from here.
 
-    futures = backend.batched_submit_put_task([key], [mo])
-    assert futures is not None
-    for future in futures:
-        future.result(timeout=10)
-    mo.ref_count_down()
-
-    got = backend.get_blocking(key)
-    assert got is not None
-    assert torch.equal(got.tensor, torch.full(KV_SHAPE, 2.5, dtype=KV_DTYPE))
-    got.ref_count_down()
-
-
-def test_foreign_objects_reserve_their_nvme_range(
-    backend: Any, runtime: _FakeRuntime
-) -> None:
-    """A foreign store must reserve its range, not borrow ``metadata.address``.
-
-    That address is an offset into *another* allocator's space and means
-    nothing on NVMe. Taking it for a file offset wrote to a range the chunk
-    never handed out: it can overlap a reserved one, and evicting the key
-    releases a range that was never taken.
+    ``StorageManager.batched_put`` re-allocates each batch through the
+    destination's ``get_allocator_backend()``, so reporting itself is what
+    keeps a foreign ``MemoryObj`` -- which has no vmem entry, hence no
+    transferable buffer -- from ever reaching the write path.
     """
-    host_allocator = TensorMemoryAllocator(
-        torch.zeros(4 * 1024 * 1024, dtype=torch.uint8)
-    )
-    mo = host_allocator.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD)
+    assert backend.get_allocator_backend() is backend
+    mo = backend.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD)
     assert mo is not None
-    mo.tensor.fill_(2.5)
-    before = backend.nvme_offsets.bytes_in_use
-
-    futures = backend.batched_submit_put_task([_key("foreign")], [mo])
-    assert futures is not None
-    for future in futures:
-        future.result(timeout=10)
-
-    assert backend.nvme_offsets.bytes_in_use == before + mo.get_physical_size()
+    assert mo.parent_allocator is backend.memory_allocator
+    # The NVMe range is reserved and stamped at allocation, which is where the
+    # write path reads it from.
+    assert mo.metadata.address is not None
+    assert backend.nvme_offsets.bytes_in_use == mo.get_physical_size()
     mo.ref_count_down()
-
-    got = backend.get_blocking(_key("foreign"))
-    assert got is not None
-    assert torch.equal(got.tensor, torch.full(KV_SHAPE, 2.5, dtype=KV_DTYPE))
-    got.ref_count_down()
-
-    backend.remove(_key("foreign"))
-    assert backend.nvme_offsets.bytes_in_use == before
-
-
-def test_staging_areas_are_returned_to_the_pool(
-    backend: Any, runtime: _FakeRuntime
-) -> None:
-    """Staging is per-write; a run of foreign stores must not grow the pool."""
-    host_allocator = TensorMemoryAllocator(
-        torch.zeros(4 * 1024 * 1024, dtype=torch.uint8)
-    )
-    areas_after = []
-    for i in range(3):
-        mo = host_allocator.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD)
-        assert mo is not None
-        mo.tensor.fill_(float(i))
-        futures = backend.batched_submit_put_task([_key(f"k{i}")], [mo])
-        assert futures is not None
-        for future in futures:
-            future.result(timeout=10)
-        mo.ref_count_down()
-        areas_after.append(len(runtime.areas))
-    assert areas_after[1] == areas_after[2]
 
 
 def test_two_keys_do_not_overlap_on_nvme(backend: Any) -> None:
