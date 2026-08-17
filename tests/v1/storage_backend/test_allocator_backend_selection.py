@@ -7,6 +7,7 @@ used to hardcode ``LocalCPUBackend`` and raised ``KeyError`` for that shape.
 """
 
 # Standard
+from collections import OrderedDict
 from unittest.mock import MagicMock
 
 # Third Party
@@ -25,9 +26,9 @@ def _backend(owns_allocator: bool) -> MagicMock:
 def _manager(names: list[str], enable_pd: bool = False) -> StorageManager:
     manager = StorageManager.__new__(StorageManager)
     manager.enable_pd = enable_pd
-    manager.storage_backends = {
-        name: _backend(name != "PlainBackend") for name in names
-    }
+    manager.storage_backends = OrderedDict(
+        (name, _backend(name != "PlainBackend")) for name in names
+    )
     return manager
 
 
