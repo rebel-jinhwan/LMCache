@@ -464,6 +464,49 @@ def test_a_recycled_area_is_handed_out_at_the_cap(
         allocator.close()
 
 
+def test_a_restore_past_the_cap_reports_a_miss_rather_than_raising(
+    runtime: _FakeRuntime, loop: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller truncates its hit prefix at ``None``; a raise kills the request.
+
+    ``GdsBackend`` reports the same miss when its slab cannot hold another read
+    destination, and ``_process_tokens_internal`` already recomputes from there.
+    """
+    backend = RDSBackend(_config(), _metadata(), loop)
+    try:
+        first, second = _key("first"), _key("second")
+        _store(backend, first, 1.0)
+        _store(backend, second, 2.0)
+
+        # Room for exactly one destination, with two keys asked for.
+        monkeypatch.setattr(
+            backend.memory_allocator,
+            "allocate",
+            _exhausting_after(backend.memory_allocator.allocate, 1),
+        )
+        got = backend.batched_get_blocking([first, second])
+        assert got[0] is not None
+        assert got[1] is None
+        assert torch.allclose(got[0].tensor, torch.ones_like(got[0].tensor))
+        got[0].ref_count_down()
+    finally:
+        backend.close()
+
+
+def _exhausting_after(real: Any, budget: int) -> Any:
+    """Wrap ``real`` so it returns ``None`` after ``budget`` successful calls."""
+    served = 0
+
+    def limited(*args: Any, **kwargs: Any) -> Any:
+        nonlocal served
+        if served >= budget:
+            return None
+        served += 1
+        return real(*args, **kwargs)
+
+    return limited
+
+
 def test_allocate_waits_for_the_pool_before_reporting_it_full(
     runtime: _FakeRuntime, loop: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -160,6 +160,17 @@ that is merely busy drains instead of truncating. Free areas count against the
 cap, so a workload that changes chunk size strands the retired size class;
 unbinding across size classes is the fix if that ever shows up.
 
+Restores hit the same ceiling from the other side, because a restore asks for
+every matched chunk's destination at once: `batched_get_blocking` reports
+`None` for the keys past the cap rather than raising, so
+`_process_tokens_internal` truncates the hit prefix there and the tail is
+recomputed. Again this is what GDS already does. Retrying would not help — the
+pool is full of that same restore's destinations, and nothing but the caller
+can release those — so a prompt whose whole KV cannot fit the cap at once
+trades tail hits for a bounded pool. Raising the cap is the knob; grouping the
+restore into rounds of `cap` chunks is the fix that keeps every hit, and it
+belongs in `_process_tokens_internal`, not here.
+
 **It needs a host pool in front.** `rebel.rds` cannot write a `MemoryObj` it did
 not allocate -- `Chunk.write` takes an owning `Buffer` handle, and an object with
 no vmem entry behind it yields none. So `RDSBackend` is its own

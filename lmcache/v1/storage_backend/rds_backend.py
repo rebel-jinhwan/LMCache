@@ -48,6 +48,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.platform.rbln import rds_runtime
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.rds_memory_allocator import (
+    ENV_STAGING_CAP_MB,
     RDS_ALIGN,
     RDSMemoryAllocator,
     store_inflight_writes,
@@ -592,15 +593,24 @@ class RDSBackend(AllocatorBackendInterface):
             # stored entry's own offset and never writes it back.
             mo = self.memory_allocator.allocate(entry.shape, entry.dtype, entry.fmt)
             if mo is None:
-                # The cache promised these entries, so surface the failure
-                # here rather than returning ``None`` for some keys and
-                # corrupting the model output downstream.
-                raise RuntimeError(
-                    f"RDS batched_get_blocking: staging pool exhausted while "
-                    f"serving key={keys[idx].to_string()} ({idx + 1}/"
-                    f"{len(keys)}). Increase max_local_disk_size (chunk is "
-                    f"currently {self.memory_allocator.chunk_size} bytes)."
+                # A restore asks for every matched chunk at once, so a long
+                # enough prompt wants more destinations than the capped pool
+                # holds. Report a miss rather than raising: the caller
+                # truncates its hit prefix at the first ``None`` and recomputes
+                # the tail, which is what ``GdsBackend`` does when its slab runs
+                # out. Not worth retrying -- the pool is full of this same
+                # batch's destinations, and waiting cannot free those.
+                logger.warning(
+                    "RDS staging pool full serving key=%s (%d/%d); reporting a "
+                    "miss so the caller recomputes from here. Raise %s to keep "
+                    "longer prefixes.",
+                    keys[idx].to_string(),
+                    idx + 1,
+                    len(keys),
+                    ENV_STAGING_CAP_MB,
                 )
+                results.append(None)
+                continue
             results.append(mo)
             ops.append((mo, entry, idx))
 
