@@ -105,6 +105,7 @@ registers whenever the engine asks for a disk tier at all:
 ```
 max_local_disk_size: 64   # GB, per rank -- enables RDS on an RBLN device
 max_local_cpu_size: 5     # GB, required -- see below
+local_cpu: false          # allocator pool only, no host hot cache -- see below
 ```
 
 It registers in-process, in `CreateStorageBackends`, alongside the other
@@ -151,4 +152,15 @@ missing allocator tier at the first store.
 
 A store therefore travels `device -> host -> device vmem -> NVMe`. Reads never
 stage: `batched_get_blocking` allocates its own destination areas, exactly as
-GDS does, so a hit is `NVMe -> device vmem` with no host hop.
+GDS does, so a hit is `NVMe -> device vmem` and the connector scatters from
+there device-to-device. The extra copy is on the store path, which is off the
+prefill critical path; the one it saves is on the read path, which is not.
+
+**...but `local_cpu: false` with it.** That leaves `LocalCPUBackend` as the
+allocator pool without a host hot cache, which is what this backend wants from
+it. With `local_cpu: true`, `StorageManager.batched_get` writes every RDS hit
+back into that hot cache -- and `submit_put_task` does not copy, it ref-counts
+the object in. The write-back would therefore pin an RDS *device* vmem area for
+as long as the host cache keeps the key, draining the pool every transfer
+allocates from. `use_hot` gates the batched path
+(`local_cpu_backend.py:202`), so turning the hot cache off is enough.
