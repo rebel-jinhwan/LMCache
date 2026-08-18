@@ -97,13 +97,14 @@ detection rather than by a connector.
 ## Direct storage (RDS)
 
 `lmcache/v1/storage_backend/rds_backend.py` writes KV chunks from RBLN device
-memory to NVMe without a host hop, using `rebel.rds`. It is the RBLN analogue of
-`GdsBackend`, and it is enabled per engine:
+memory to NVMe using `rebel.rds`. It is the RBLN analogue of `GdsBackend`, and
+it is enabled per engine:
 
 ```
 extra_config:
   enable_rbln_rds: true
 max_local_disk_size: 64   # GB, per rank
+max_local_cpu_size: 5     # GB, required -- see below
 ```
 
 It registers in-process, in `CreateStorageBackends`, alongside the other
@@ -138,27 +139,16 @@ NVMe range must stay readable until the key is evicted.
   `mark_device_updated` after each batched read; without it the restored KV is
   silently stale rather than wrong-looking.
 
-**The intended deployment has no host pool.** `RDSBackend` allocates the
-objects it writes, so `max_local_cpu_size: 0` leaves it as the only tier that
-owns an allocator and `StorageManager` picks it. The connector then gathers KV
-straight into the vmem area that goes to NVMe, and a read hands back an area of
-the same pool: `device -> NVMe` and back, with no host hop in either direction
-and no branch naming this backend anywhere.
+**It needs a host pool in front.** `rebel.rds` cannot write a `MemoryObj` it did
+not allocate -- `Chunk.write` takes an owning `Buffer` handle, and an object with
+no vmem entry behind it yields none. So `RDSBackend` is its own
+`get_allocator_backend()`, and `StorageManager.batched_put` re-allocates each
+batch through it and copies the source objects in. That is upstream's copy, in
+the one place every tier's is, but it means the host pool that feeds it must
+exist: `CreateStorageBackends` refuses `enable_rbln_rds` with
+`max_local_cpu_size: 0`, rather than letting the manager `KeyError` on the
+missing allocator tier at the first store.
 
-That shape needs one thing from shared code, and it is not RBLN-specific:
-`_get_allocator_backend` used to end in an unconditional
-`storage_backends["LocalCPUBackend"]`, which made "no host pool" a `KeyError`
-for *any* tier that allocates its own objects, GDS included. It now falls back
-to the first backend that owns an allocator.
-
-**A host pool in front still works, at one copy.** `rebel.rds` cannot write a
-`MemoryObj` it did not allocate -- `Chunk.write` takes an owning `Buffer`
-handle, and an object with no vmem entry behind it yields none. Nothing here
-has to enforce that: `StorageManager.batched_put` re-allocates each batch
-through the destination's own `get_allocator_backend()`, which for this backend
-is itself, and copies the source objects in. So with a host pool the KV travels
-`device -> host -> device vmem -> NVMe`, and the copy is upstream's, in the one
-place every tier's is.
-
-Reads never stage: `batched_get_blocking` allocates its own destination areas,
-exactly as GDS does.
+A store therefore travels `device -> host -> device vmem -> NVMe`. Reads never
+stage: `batched_get_blocking` allocates its own destination areas, exactly as
+GDS does, so a hit is `NVMe -> device vmem` with no host hop.

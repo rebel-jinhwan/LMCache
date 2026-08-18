@@ -321,28 +321,8 @@ class StorageManager:
                 allocator_backend = self.storage_backends["LocalCPUBackend"]
             else:
                 allocator_backend = self.storage_backends["MaruBackend"]
-        elif "LocalCPUBackend" in self.storage_backends:
-            allocator_backend = self.storage_backends["LocalCPUBackend"]
         else:
-            # A deployment can leave the host pool out (max_local_cpu_size: 0)
-            # when its storage tier allocates the memory objects itself -- GDS
-            # and RDS both do. Fall back to the first backend that owns an
-            # allocator instead of raising KeyError on a pool that was never
-            # meant to exist.
-            allocator_backend = next(
-                (
-                    backend
-                    for backend in self.storage_backends.values()
-                    if isinstance(backend, AllocatorBackendInterface)
-                ),
-                None,
-            )  # type: ignore[assignment]
-            if allocator_backend is None:
-                raise RuntimeError(
-                    "No storage backend owns a memory allocator. Configure one "
-                    "(a host pool via max_local_cpu_size, or a tier that "
-                    "allocates its own objects) before storing."
-                )
+            allocator_backend = self.storage_backends["LocalCPUBackend"]
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend
 

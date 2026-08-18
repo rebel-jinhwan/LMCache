@@ -253,6 +253,12 @@ def CreateStorageBackends(
                 "direct-storage API could not be imported. RDSBackend needs "
                 "rebel.rds, which ships with rebel-compiler on an RBLN host."
             )
+        if local_cpu_backend is None:
+            raise ValueError(
+                "RDSBackend requires the local CPU backend as the allocator "
+                "tier. Please turn on local cpu backend with "
+                "max_local_cpu_size > 0"
+            )
         rds_backend = RDSBackend(config, metadata, loop, dst_device)
         storage_backends[str(rds_backend)] = rds_backend
 
