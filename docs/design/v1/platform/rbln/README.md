@@ -140,6 +140,26 @@ NVMe range must stay readable until the key is evicted.
   `mark_device_updated` after each batched read; without it the restored KV is
   silently stale rather than wrong-looking.
 
+**The staging pool needs an explicit cap, and that is the same constraint
+again.** `CuFileMemoryAllocator` registers one slab up front, so "the pool is
+full" is a fact of its own arithmetic: it hands back `None`, and every caller
+already truncates on that — `store()` stores fewer chunks, `_write_slots` is
+never reached. Binding one area per object has no such ceiling, and the
+allocation loops run *per sequence*, ahead of any write: a 192k-token prompt
+asks for ~192 areas before the first `chunk.write` is submitted, so the
+in-flight write semaphore — which gates `batched_submit_put_task` — is
+downstream of the whole problem and cannot bound it.
+
+So `RDSMemoryAllocator` counts the vmem it has bound and refuses to bind past
+`LMCACHE_RBLN_RDS_STAGING_CAP_MB` (2 GB default, `<= 0` to disable), returning
+`None` into the same truncation paths GDS uses. Recycling a pooled area is
+never refused: the cap is on device memory *held*, not objects outstanding.
+On top of it `RDSBackend.allocate` retries with `max_alloc_attempts` /
+`allocation_attempt_delay_secs` — GDS's knobs and GDS's defaults — so a pool
+that is merely busy drains instead of truncating. Free areas count against the
+cap, so a workload that changes chunk size strands the retired size class;
+unbinding across size classes is the fix if that ever shows up.
+
 **It needs a host pool in front.** `rebel.rds` cannot write a `MemoryObj` it did
 not allocate -- `Chunk.write` takes an owning `Buffer` handle, and an object with
 no vmem entry behind it yields none. So `RDSBackend` is its own

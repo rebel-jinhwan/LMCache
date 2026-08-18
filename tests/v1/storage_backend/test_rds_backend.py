@@ -412,3 +412,97 @@ def test_inflight_write_cap_is_half_the_staging_budget(
 def test_inflight_write_cap_is_zero_without_geometry() -> None:
     """An unknown chunk size disables the derivation; the caller picks a floor."""
     assert store_inflight_writes(None) == 0
+
+
+# ---------------------------------------------------------------------------
+# The staging cap
+# ---------------------------------------------------------------------------
+
+
+def test_staging_pool_refuses_to_grow_past_its_cap(
+    runtime: _FakeRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Binding on demand has no ceiling of its own, so the cap has to be it.
+
+    ``CuFileMemoryAllocator`` gets this for free: it sub-allocates a slab it
+    registered once, so a caller that asks for more than fits is told ``None``.
+    Here every miss binds a fresh area, and a long prompt's allocation loop
+    runs once per chunk before a single write is submitted -- the in-flight
+    write semaphore is downstream of all of it and cannot bound this.
+    """
+    monkeypatch.setattr(allocator_module, "staging_cap_bytes", lambda: 2 * RDS_ALIGN)
+    allocator = RDSMemoryAllocator(chunk_size=CHUNK_SIZE)
+    try:
+        first = allocator.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD)
+        second = allocator.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD)
+        assert first is not None
+        assert second is not None
+        assert allocator.bound_bytes == 2 * RDS_ALIGN
+
+        assert allocator.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD) is None
+        assert allocator.bound_bytes == 2 * RDS_ALIGN
+    finally:
+        allocator.close()
+
+
+def test_a_recycled_area_is_handed_out_at_the_cap(
+    runtime: _FakeRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cap counts device memory held, not objects outstanding."""
+    monkeypatch.setattr(allocator_module, "staging_cap_bytes", lambda: RDS_ALIGN)
+    allocator = RDSMemoryAllocator(chunk_size=CHUNK_SIZE)
+    try:
+        first = allocator.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD)
+        assert first is not None
+        assert allocator.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD) is None
+
+        first.ref_count_down()  # -> free, area back in the pool
+        recycled = allocator.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD)
+        assert recycled is not None
+        assert allocator.bound_bytes == RDS_ALIGN
+    finally:
+        allocator.close()
+
+
+def test_allocate_waits_for_the_pool_before_reporting_it_full(
+    runtime: _FakeRuntime, loop: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full pool is a wait, not an instant truncation -- as GDS treats its slab.
+
+    ``busy_loop=False`` opts out, because ``allocate_and_copy_objects`` runs the
+    whole batch on the caller's thread and would otherwise stall it.
+    """
+    monkeypatch.setattr(allocator_module, "staging_cap_bytes", lambda: RDS_ALIGN)
+    config = _config()
+    config.extra_config = {
+        "max_alloc_attempts": 3,
+        "allocation_attempt_delay_secs": 0,
+    }
+    backend = RDSBackend(config, _metadata(), loop)
+    held = None
+    try:
+        held = backend.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD)
+        assert held is not None
+
+        attempts = []
+        pool_allocate = backend.memory_allocator.allocate
+
+        def counting(*args: Any, **kwargs: Any) -> Any:
+            attempts.append(1)
+            return pool_allocate(*args, **kwargs)
+
+        monkeypatch.setattr(backend.memory_allocator, "allocate", counting)
+
+        assert backend.allocate(KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD) is None
+        assert len(attempts) == 3
+
+        attempts.clear()
+        no_wait = backend.allocate(
+            KV_SHAPE, KV_DTYPE, MemoryFormat.KV_2LTD, busy_loop=False
+        )
+        assert no_wait is None
+        assert len(attempts) == 1
+    finally:
+        if held is not None:
+            held.ref_count_down()
+        backend.close()

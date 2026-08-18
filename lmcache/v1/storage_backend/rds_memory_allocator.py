@@ -149,6 +149,13 @@ class RDSMemoryAllocator(MemoryAllocatorInterface):
         # references, so torch never reclaims them.
         self._tensor_pool: dict[int, list[torch.Tensor]] = {}
 
+        # Ceiling on device vmem this pool may hold, and what it holds now.
+        # ``CuFileMemoryAllocator`` gets the same ceiling for free by
+        # sub-allocating a slab it registered once; binding areas on demand has
+        # no such limit, so it is enforced here instead.
+        self._cap_bytes: int = staging_cap_bytes()
+        self._bound_bytes: int = 0
+
         # Bound here so a missing runtime fails at construction, not mid-transfer.
         self._vmem = rds_runtime.vmem()
         # Freed in ``close``: a wrapped tensor does not own its region.
@@ -210,6 +217,23 @@ class RDSMemoryAllocator(MemoryAllocatorInterface):
                 return sum(len(v) for v in self._tensor_pool.values())
             return len(self._tensor_pool.get(phy_nbytes, []))
 
+    @property
+    def bound_bytes(self) -> int:
+        """Device vmem this pool holds, live objects plus free areas.
+
+        Free areas count because they stay bound for reuse. A workload whose
+        chunk size changes therefore strands the retired size class against the
+        cap; unbinding across size classes would fix that and is not worth its
+        code until a deployment actually mixes sizes.
+        """
+        with self._lock:
+            return self._bound_bytes
+
+    @property
+    def cap_bytes(self) -> int:
+        """Ceiling :attr:`bound_bytes` is held under; ``<= 0`` means uncapped."""
+        return self._cap_bytes
+
     def make_stream(self) -> Any:
         """Create an RDS stream bound to this allocator's device and node."""
         return rds_runtime.rds_stream(
@@ -232,6 +256,13 @@ class RDSMemoryAllocator(MemoryAllocatorInterface):
         ``metadata.address`` stays 0; the backend's ``NvmeOffsetAllocator``
         stamps the store path's ``file_offset`` onto it, and read destinations
         keep the 0.
+
+        Returns:
+            The object, or ``None`` when handing one out would take the pool
+            past its staging cap. Callers treat that the same way they treat a
+            full ``CuFileMemoryAllocator`` slab: stop asking, store fewer
+            chunks. Recycling a pooled area is never refused -- the cap is on
+            device memory held, not on objects outstanding.
         """
         shapes_l, dtypes_l = self._adapt_shapes_and_dtypes(shapes, dtypes)
         logical_nbytes = get_size_bytes(shapes_l, dtypes_l)
@@ -241,23 +272,36 @@ class RDSMemoryAllocator(MemoryAllocatorInterface):
             bucket = self._tensor_pool.get(phy_nbytes)
             raw_data = bucket.pop() if bucket else None
 
-        if raw_data is None:
-            # A bound vmem region wrapped as a tensor satisfies both
-            # ``MemoryObj.tensor`` and ``Chunk.write``/``read``, with no
-            # process-wide eager-malloc mode.
-            vaddr = self._vmem.debug.allocate_and_bind_single_device(
-                self._torch_device_id, phy_nbytes, self._NODE_ID
-            )
-            self._vaddrs.append(vaddr)
-            raw_data = rds_runtime.create_device_tensor_from_ptr(
-                vaddr, [phy_nbytes], torch.uint8
-            )
-        else:
-            # The connector's gather writes through a reshaped view and does
-            # not touch every byte of the area -- alignment padding survives it.
-            # Fresh areas hold zeros there; recycled ones hold the previous
-            # chunk's KV, which would ride along into the write.
-            raw_data.zero_()
+            if raw_data is None:
+                if 0 < self._cap_bytes < self._bound_bytes + phy_nbytes:
+                    logger.warning(
+                        "RDS staging cap reached: %d bytes bound, %d more "
+                        "requested, cap %d. Set %s to raise it.",
+                        self._bound_bytes,
+                        phy_nbytes,
+                        self._cap_bytes,
+                        ENV_STAGING_CAP_MB,
+                    )
+                    return None
+                # A bound vmem region wrapped as a tensor satisfies both
+                # ``MemoryObj.tensor`` and ``Chunk.write``/``read``, with no
+                # process-wide eager-malloc mode. Bound under the lock so the
+                # accounting above cannot be overtaken by a concurrent bind.
+                vaddr = self._vmem.debug.allocate_and_bind_single_device(
+                    self._torch_device_id, phy_nbytes, self._NODE_ID
+                )
+                self._vaddrs.append(vaddr)
+                self._bound_bytes += phy_nbytes
+                raw_data = rds_runtime.create_device_tensor_from_ptr(
+                    vaddr, [phy_nbytes], torch.uint8
+                )
+            else:
+                # The connector's gather writes through a reshaped view and
+                # does not touch every byte of the area -- alignment padding
+                # survives it. Fresh areas hold zeros there; recycled ones hold
+                # the previous chunk's KV, which would ride along into the
+                # write.
+                raw_data.zero_()
 
         meta = MemoryObjMetadata(
             shape=shapes_l[0],

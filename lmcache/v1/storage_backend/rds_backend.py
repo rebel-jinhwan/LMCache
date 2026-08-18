@@ -25,10 +25,11 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence, Union
+from typing import Any, Callable, List, Optional, Sequence, TypeVar, Union
 import asyncio
 import os
 import threading
+import time
 
 # Third Party
 import torch
@@ -53,6 +54,9 @@ from lmcache.v1.storage_backend.rds_memory_allocator import (
 )
 
 logger = init_logger(__name__)
+
+#: Return type of one allocation attempt: a ``MemoryObj`` or a list of them.
+T = TypeVar("T")
 
 #: NVMe chunk size per rank, in GB, when ``max_local_disk_size`` is unset. Each
 #: rank reserves its own, so this times the rank count must fit the device.
@@ -183,6 +187,15 @@ class RDSBackend(AllocatorBackendInterface):
             k or store_inflight_writes(metadata) or 1
         )
 
+        # Same knobs, same defaults as GdsBackend: how long an allocation
+        # waits for the staging pool to drain before giving the caller a
+        # ``None`` to truncate on.
+        extra_config = config.extra_config or {}
+        self._max_alloc_attempts: int = extra_config.get("max_alloc_attempts", 10)
+        self._alloc_attempt_delay_secs: float = extra_config.get(
+            "allocation_attempt_delay_secs", 0.1
+        )
+
     # ------------------------------------------------------------------
     # AllocatorBackendInterface
     # ------------------------------------------------------------------
@@ -229,7 +242,58 @@ class RDSBackend(AllocatorBackendInterface):
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[MemoryObj]:
-        return self._allocate_for_store(shapes, dtypes, fmt, eviction)
+        """One staging area plus its NVMe range, waiting out a full pool.
+
+        Args:
+            shapes: Logical tensor shape or shapes to allocate.
+            dtypes: Logical tensor dtype or dtypes to allocate.
+            fmt: Memory format stamped onto the returned object's metadata.
+            eviction: Whether a full NVMe chunk may discard LRU entries.
+            busy_loop: Whether to retry while the staging pool is at its cap.
+
+        Returns:
+            The object, or ``None`` if the pool stayed full for every attempt.
+        """
+        return self._retry_alloc(
+            lambda: self._allocate_for_store(shapes, dtypes, fmt, eviction),
+            busy_loop,
+        )
+
+    def _retry_alloc(
+        self,
+        attempt: Callable[[], Optional[T]],
+        busy_loop: bool,
+    ) -> Optional[T]:
+        """Re-run ``attempt`` while it reports the staging pool full.
+
+        The pool is capped, so a batch that asks for more staging than the cap
+        allows gets ``None`` rather than binding vmem until the NPU is out.
+        Retrying gives in-flight writes time to complete and push their areas
+        back, which is the difference between a slow store and a truncated one.
+        ``GdsBackend.allocate`` waits on its slab the same way.
+
+        Args:
+            attempt: The allocation to run; ``None`` means "pool full".
+            busy_loop: Whether to retry at all, or give up after one attempt.
+
+        Returns:
+            The first non-``None`` result, or ``None`` once attempts run out.
+        """
+        max_attempts = self._max_alloc_attempts if busy_loop else 1
+        for num_attempts in range(1, max_attempts + 1):
+            result = attempt()
+            if result is not None:
+                return result
+            if num_attempts < max_attempts and self._alloc_attempt_delay_secs > 0:
+                time.sleep(self._alloc_attempt_delay_secs)
+        logger.warning(
+            "RDS allocation failed after %d attempt(s): staging pool holds "
+            "%d of %d bytes. Returning None.",
+            max_attempts,
+            self.memory_allocator.bound_bytes,
+            self.memory_allocator.cap_bytes,
+        )
+        return None
 
     def batched_allocate(
         self,
@@ -243,17 +307,35 @@ class RDSBackend(AllocatorBackendInterface):
         """All-or-nothing :meth:`_allocate_for_store` for ``batch_size`` objects.
 
         Each object evicts for itself, so a batch that needs N evictions costs
-        one pass rather than N re-runs of the whole batch.
+        one pass rather than N re-runs of the whole batch. The retry wraps the
+        whole batch rather than each object: a batch that cannot fit under the
+        staging cap will not start fitting one object at a time, and releasing
+        the partial batch first is what gives the retry room to work.
+
+        Args:
+            shapes: Logical tensor shape or shapes to allocate.
+            dtypes: Logical tensor dtype or dtypes to allocate.
+            batch_size: How many objects to hand out.
+            fmt: Memory format stamped onto each object's metadata.
+            eviction: Whether a full NVMe chunk may discard LRU entries.
+            busy_loop: Whether to retry while the staging pool is at its cap.
+
+        Returns:
+            Every object, or ``None`` if any attempt left the batch short.
         """
-        objs: list[MemoryObj] = []
-        for _ in range(batch_size):
-            mo = self._allocate_for_store(shapes, dtypes, fmt, eviction)
-            if mo is None:
-                for allocated in objs:
-                    self._free_for_store(allocated)
-                return None
-            objs.append(mo)
-        return objs
+
+        def attempt() -> Optional[list[MemoryObj]]:
+            objs: list[MemoryObj] = []
+            for _ in range(batch_size):
+                mo = self._allocate_for_store(shapes, dtypes, fmt, eviction)
+                if mo is None:
+                    for allocated in objs:
+                        self._free_for_store(allocated)
+                    return None
+                objs.append(mo)
+            return objs
+
+        return self._retry_alloc(attempt, busy_loop)
 
     def _allocate_for_store(
         self,
