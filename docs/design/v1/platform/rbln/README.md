@@ -98,12 +98,12 @@ detection rather than by a connector.
 
 `lmcache/v1/storage_backend/rds_backend.py` writes KV chunks from RBLN device
 memory to NVMe using `rebel.rds`. It is the RBLN analogue of `GdsBackend`, and
-it is enabled per engine:
+it takes the disk tier's capacity knob rather than a flag of its own -- on an
+RBLN device there is no second thing `max_local_disk_size` could mean -- so it
+registers whenever the engine asks for a disk tier at all:
 
 ```
-extra_config:
-  enable_rbln_rds: true
-max_local_disk_size: 64   # GB, per rank
+max_local_disk_size: 64   # GB, per rank -- enables RDS on an RBLN device
 max_local_cpu_size: 5     # GB, required -- see below
 ```
 
@@ -145,7 +145,7 @@ no vmem entry behind it yields none. So `RDSBackend` is its own
 `get_allocator_backend()`, and `StorageManager.batched_put` re-allocates each
 batch through it and copies the source objects in. That is upstream's copy, in
 the one place every tier's is, but it means the host pool that feeds it must
-exist: `CreateStorageBackends` refuses `enable_rbln_rds` with
+exist: `CreateStorageBackends` refuses to construct the backend under
 `max_local_cpu_size: 0`, rather than letting the manager `KeyError` on the
 missing allocator tier at the first store.
 

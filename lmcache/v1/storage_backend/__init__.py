@@ -241,17 +241,24 @@ def CreateStorageBackends(
         )
         storage_backends[str(gds_backend)] = gds_backend
 
-    enable_rbln_rds = extra_config is not None and extra_config.get("enable_rbln_rds")
-    if enable_rbln_rds and "RDSBackend" not in _skip:
+    # RDS is the RBLN disk tier, so it takes the disk tier's capacity knob
+    # rather than a flag of its own -- there is no second thing that
+    # ``max_local_disk_size`` could mean on this device.
+    if (
+        torch_device_type == "rbln"
+        and config.max_local_disk_size > 0
+        and "RDSBackend" not in _skip
+    ):
         # First Party
         from lmcache.v1.platform.rbln import rds_runtime
         from lmcache.v1.storage_backend.rds_backend import RDSBackend
 
         if not rds_runtime.is_available():
             raise ImportError(
-                "extra_config.enable_rbln_rds is set but the rebel runtime's "
-                "direct-storage API could not be imported. RDSBackend needs "
-                "rebel.rds, which ships with rebel-compiler on an RBLN host."
+                "max_local_disk_size is set on an RBLN device but the rebel "
+                "runtime's direct-storage API could not be imported. "
+                "RDSBackend needs rebel.rds, which ships with rebel-compiler "
+                "on an RBLN host."
             )
         if local_cpu_backend is None:
             raise ValueError(
