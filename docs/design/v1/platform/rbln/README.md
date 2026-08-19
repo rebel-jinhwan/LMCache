@@ -93,3 +93,114 @@ The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
 never touch a connector -- which is why the format must be recognised by
 detection rather than by a connector.
+
+## Direct storage (RDS)
+
+`lmcache/v1/storage_backend/rds_backend.py` writes KV chunks from RBLN device
+memory to NVMe using `rebel.rds`. It is the RBLN analogue of `GdsBackend`, and
+it takes the disk tier's capacity knob rather than a flag of its own -- on an
+RBLN device there is no second thing `max_local_disk_size` could mean -- so it
+registers whenever the engine asks for a disk tier at all:
+
+```
+max_local_disk_size: 64   # GB, per rank -- enables RDS on an RBLN device
+max_local_cpu_size: 5     # GB, required -- see below
+local_cpu: false          # allocator pool only, no host hot cache -- see below
+```
+
+It registers in-process, in `CreateStorageBackends`, alongside the other
+backends — the engine constructs it directly, so a stored chunk never leaves the
+worker's address space and no cache server is involved.
+
+**Why it needs its own address allocator.** GDS writes a file per key and lets
+the filesystem answer "where does this object go". `rebel.rds` exposes a flat,
+fixed-size region with no filesystem, so `NvmeOffsetAllocator` answers it
+explicitly: an `AddressManager` over the chunk's byte-offset space, first-fit
+and coalescing on release, the same structure `GDSL1MemoryManager` uses over its
+slab file.
+
+Ownership is split deliberately. The chunk's *address space* belongs to the
+backend and the staging *areas* belong to the allocator, because their lifetimes
+differ: a staging area is recycled as soon as its write completes, while the
+NVMe range must stay readable until the key is evicted.
+
+**Two constraints come from the runtime, not from LMCache:**
+
+- The DMA operand is a `rebel._C.vmem.Buffer` — an *owning handle* on one
+  device area, obtained only from `vmem.get_device_buffers(vaddr)`. It has no
+  constructor and read-only fields, so a handle onto part of an area cannot be
+  built, and a vaddr has no contiguous device range behind it to slice anyway
+  (a sharded entry is several areas). `RDSMemoryAllocator` therefore hands out
+  one full area per object rather than sub-ranges of a slab, the way
+  `CuFileMemoryAllocator` can with a registered CUDA buffer. Sizes are free:
+  a chunk holds many buffers at different `file_offset`s, which is how
+  `_transfer_area` writes a multi-area entry.
+- A stream `Chunk.read` DMAs into device vmem without updating the vmem's sync
+  state — only the synchronous read path does that internally. The backend calls
+  `mark_device_updated` after each batched read; without it the restored KV is
+  silently stale rather than wrong-looking.
+
+**The staging pool needs an explicit cap, and that is the same constraint
+again.** `CuFileMemoryAllocator` registers one slab up front, so "the pool is
+full" is a fact of its own arithmetic: it hands back `None`, and every caller
+already truncates on that — `store()` simply stores fewer chunks. Binding one
+area per object has no such ceiling, and the allocation loops run *per
+sequence*, ahead of any write: a 192k-token prompt asks for ~192 areas before
+the first `chunk.write` is submitted, so anything that gates
+`batched_submit_put_task` is downstream of the whole problem and cannot bound
+it. This is why the cap belongs on the allocator and not on the writes.
+
+So `RDSMemoryAllocator` counts the vmem it has bound and refuses to bind past
+`LMCACHE_RBLN_RDS_STAGING_CAP_MB` (4 GB default, `<= 0` to disable), returning
+`None` into the same truncation paths GDS uses. Recycling a pooled area is
+never refused: the cap is on device memory *held*, not objects outstanding.
+On top of it `RDSBackend.allocate` retries with `max_alloc_attempts` /
+`allocation_attempt_delay_secs` — GDS's knobs and GDS's defaults — so a pool
+that is merely busy drains instead of truncating. Free areas count against the
+cap, so a workload that changes chunk size strands the retired size class;
+unbinding across size classes is the fix if that ever shows up.
+
+**The ceiling is one chiplet's free vmem, not the device's**, because
+`allocate_and_bind_single_device` binds a single chiplet. R100 is 140 GiB across
+4 chiplets, so 35 GiB each, and at `--gpu-memory-utilization 0.8` roughly 7 GiB
+of that is left after vLLM — hence the 4 GB default. Raise the utilization or
+the KV pool and it has to come down. This also bounds what the cap can ever
+hold: at 1024-token chunks (~248 MiB each on a 70B-class model) 4 GB is ~16
+chunks, well short of a 40k-token prompt, so truncation is the normal case on
+this hardware rather than an edge one.
+
+Restores hit the same ceiling from the other side, because a restore asks for
+every matched chunk's destination at once: `batched_get_blocking` reports
+`None` for the keys past the cap rather than raising, so
+`_process_tokens_internal` truncates the hit prefix there and the tail is
+recomputed. Again this is what GDS already does. Retrying would not help — the
+pool is full of that same restore's destinations, and nothing but the caller
+can release those — so a prompt whose whole KV cannot fit the cap at once
+trades tail hits for a bounded pool. Raising the cap is the knob; grouping the
+restore into rounds of `cap` chunks is the fix that keeps every hit, and it
+belongs in `_process_tokens_internal`, not here.
+
+**It needs a host pool in front.** `rebel.rds` cannot write a `MemoryObj` it did
+not allocate -- `Chunk.write` takes an owning `Buffer` handle, and an object with
+no vmem entry behind it yields none. So `RDSBackend` is its own
+`get_allocator_backend()`, and `StorageManager.batched_put` re-allocates each
+batch through it and copies the source objects in. That is upstream's copy, in
+the one place every tier's is, but it means the host pool that feeds it must
+exist: `CreateStorageBackends` refuses to construct the backend under
+`max_local_cpu_size: 0`, rather than letting the manager `KeyError` on the
+missing allocator tier at the first store.
+
+A store therefore travels `device -> host -> device vmem -> NVMe`. Reads never
+stage: `batched_get_blocking` allocates its own destination areas, exactly as
+GDS does, so a hit is `NVMe -> device vmem` and the connector scatters from
+there device-to-device. The extra copy is on the store path, which is off the
+prefill critical path; the one it saves is on the read path, which is not.
+
+**...but `local_cpu: false` with it.** That leaves `LocalCPUBackend` as the
+allocator pool without a host hot cache, which is what this backend wants from
+it. With `local_cpu: true`, `StorageManager.batched_get` writes every RDS hit
+back into that hot cache -- and `submit_put_task` does not copy, it ref-counts
+the object in. The write-back would therefore pin an RDS *device* vmem area for
+as long as the host cache keeps the key, draining the pool every transfer
+allocates from. `use_hot` gates the batched path
+(`local_cpu_backend.py:202`), so turning the hot cache off is enough.
