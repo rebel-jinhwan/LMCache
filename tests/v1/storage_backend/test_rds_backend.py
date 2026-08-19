@@ -449,10 +449,13 @@ def test_a_restore_past_the_cap_reports_a_miss_rather_than_raising(
             _exhausting_after(backend.memory_allocator.allocate, 1),
         )
         got = backend.batched_get_blocking([first, second])
-        assert got[0] is not None
+        restored = got[0]
+        assert restored is not None
         assert got[1] is None
-        assert torch.allclose(got[0].tensor, torch.ones_like(got[0].tensor))
-        got[0].ref_count_down()
+        tensor = restored.tensor
+        assert tensor is not None
+        assert torch.allclose(tensor, torch.ones_like(tensor))
+        restored.ref_count_down()
     finally:
         backend.close()
 

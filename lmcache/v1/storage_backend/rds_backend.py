@@ -402,6 +402,13 @@ class RDSBackend(AllocatorBackendInterface):
         batch through ``get_allocator_backend()``, which is this backend.
         """
         meta = memory_obj.metadata
+        if meta.dtype is None:
+            # A restore rebuilds the tensor from this dtype. Defaulting it would
+            # hand back float32-shaped garbage instead of failing.
+            raise ValueError(
+                "MemoryObj reached the RDS write path without a dtype; only "
+                "objects from this backend's allocator can be stored"
+            )
         return _RdsEntry(
             file_offset=meta.address,
             size=memory_obj.get_physical_size(),
