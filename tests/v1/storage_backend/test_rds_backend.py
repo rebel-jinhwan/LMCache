@@ -364,12 +364,18 @@ def test_chunk_size_comes_from_max_local_disk_size() -> None:
     assert RDSBackend._chunk_size_bytes(_config(max_local_disk_size=2)) == 2 * 1024**3
 
 
-def test_chunk_size_is_aligned_and_defaulted() -> None:
+def test_chunk_size_is_aligned_with_no_default() -> None:
+    """A fractional GB rounds down to the alignment, and 0 stays 0.
+
+    There is deliberately no fallback size: ``CreateStorageBackends`` only
+    builds this backend when ``max_local_disk_size`` is positive, so a zero
+    here means the backend should never have been constructed.
+    """
     fractional = RDSBackend._chunk_size_bytes(_config(max_local_disk_size=0.5001))
     assert fractional % RDS_ALIGN == 0
+    assert fractional > 0
 
-    default = RDSBackend._chunk_size_bytes(_config(max_local_disk_size=0))
-    assert default == rds_backend_module.DEFAULT_CHUNK_SIZE_GB * 1024**3
+    assert RDSBackend._chunk_size_bytes(_config(max_local_disk_size=0)) == 0
 
 
 # ---------------------------------------------------------------------------
