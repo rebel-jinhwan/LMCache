@@ -143,15 +143,15 @@ NVMe range must stay readable until the key is evicted.
 **The staging pool needs an explicit cap, and that is the same constraint
 again.** `CuFileMemoryAllocator` registers one slab up front, so "the pool is
 full" is a fact of its own arithmetic: it hands back `None`, and every caller
-already truncates on that — `store()` stores fewer chunks, `_write_slots` is
-never reached. Binding one area per object has no such ceiling, and the
-allocation loops run *per sequence*, ahead of any write: a 192k-token prompt
-asks for ~192 areas before the first `chunk.write` is submitted, so the
-in-flight write semaphore — which gates `batched_submit_put_task` — is
-downstream of the whole problem and cannot bound it.
+already truncates on that — `store()` simply stores fewer chunks. Binding one
+area per object has no such ceiling, and the allocation loops run *per
+sequence*, ahead of any write: a 192k-token prompt asks for ~192 areas before
+the first `chunk.write` is submitted, so anything that gates
+`batched_submit_put_task` is downstream of the whole problem and cannot bound
+it. This is why the cap belongs on the allocator and not on the writes.
 
 So `RDSMemoryAllocator` counts the vmem it has bound and refuses to bind past
-`LMCACHE_RBLN_RDS_STAGING_CAP_MB` (2 GB default, `<= 0` to disable), returning
+`LMCACHE_RBLN_RDS_STAGING_CAP_MB` (4 GB default, `<= 0` to disable), returning
 `None` into the same truncation paths GDS uses. Recycling a pooled area is
 never refused: the cap is on device memory *held*, not objects outstanding.
 On top of it `RDSBackend.allocate` retries with `max_alloc_attempts` /
@@ -159,6 +159,15 @@ On top of it `RDSBackend.allocate` retries with `max_alloc_attempts` /
 that is merely busy drains instead of truncating. Free areas count against the
 cap, so a workload that changes chunk size strands the retired size class;
 unbinding across size classes is the fix if that ever shows up.
+
+**The ceiling is one chiplet's free vmem, not the device's**, because
+`allocate_and_bind_single_device` binds a single chiplet. R100 is 140 GiB across
+4 chiplets, so 35 GiB each, and at `--gpu-memory-utilization 0.8` roughly 7 GiB
+of that is left after vLLM — hence the 4 GB default. Raise the utilization or
+the KV pool and it has to come down. This also bounds what the cap can ever
+hold: at 1024-token chunks (~248 MiB each on a 70B-class model) 4 GB is ~16
+chunks, well short of a 40k-token prompt, so truncation is the normal case on
+this hardware rather than an edge one.
 
 Restores hit the same ceiling from the other side, because a restore asks for
 every matched chunk's destination at once: `batched_get_blocking` reports

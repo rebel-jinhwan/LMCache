@@ -1,21 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """RBLN Direct Storage (RDS) backend: device vmem straight to NVMe.
 
-The RBLN analogue of
-:class:`~lmcache.v1.storage_backend.gds_backend.GdsBackend`: both skip host RAM,
-because the KV chunk is already in device memory and routing it through a CPU
-buffer costs a copy in each direction the storage path does not need.
+The RBLN analogue of ``GdsBackend``. GDS writes a file per key and lets the
+filesystem place it; ``rebel.rds`` exposes a flat region with no filesystem, so
+an ``AddressManager`` over the chunk's byte offsets places it here.
 
-What differs is who answers "where does this object go". GDS writes a file per
-key and lets the filesystem answer it; ``rebel.rds`` exposes a flat, fixed-size
-region with no filesystem, so :class:`NvmeOffsetAllocator` answers it here.
-
-Scope:
-
-- one fixed-size ``rebel.rds.Chunk`` per rank, sized from ``max_local_disk_size``
-- in-memory metadata only, so a restart starts cold
-- discard-only eviction: a full chunk drops the LRU entry and reuses its range,
-  and ``pin`` / ``unpin`` are no-ops
+One fixed-size ``rebel.rds.Chunk`` per rank, in-memory metadata only (a restart
+starts cold), discard-only eviction, ``pin`` / ``unpin`` are no-ops.
 """
 
 # Future
@@ -25,9 +16,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence, TypeVar, Union
+from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
-import os
 import threading
 import time
 
@@ -51,74 +41,9 @@ from lmcache.v1.storage_backend.rds_memory_allocator import (
     ENV_STAGING_CAP_MB,
     RDS_ALIGN,
     RDSMemoryAllocator,
-    store_inflight_writes,
 )
 
 logger = init_logger(__name__)
-
-#: Return type of one allocation attempt: a ``MemoryObj`` or a list of them.
-T = TypeVar("T")
-
-#: NVMe chunk size per rank, in GB, when ``max_local_disk_size`` is unset. Each
-#: rank reserves its own, so this times the rank count must fit the device.
-DEFAULT_CHUNK_SIZE_GB = 64
-
-#: Override for the in-flight write cap K, the number of store batches that may
-#: hold staging at once. See :meth:`RDSBackend.batched_submit_put_task`.
-ENV_MAX_INFLIGHT_WRITES = "LMCACHE_RBLN_RDS_MAX_INFLIGHT_WRITES"
-
-
-class NvmeOffsetAllocator:
-    """Allocates byte ranges inside the backing ``rds.Chunk``.
-
-    An :class:`AddressManager` over the chunk's byte-offset space, the same
-    structure ``GDSL1MemoryManager`` uses over its slab file. Its default 4096
-    alignment is exactly what ``rds`` requires of an area size and file offset.
-
-    Owned by :class:`RDSBackend` rather than by the memory allocator: a range
-    lives for exactly as long as its cache entry, so both the reservation and
-    the release are driven by cache policy, which lives on the backend.
-    """
-
-    def __init__(
-        self, chunk_size: int, align_bytes: int = AddressManager.ALIGN_BYTES
-    ) -> None:
-        self._chunk_size = chunk_size
-        self._address_manager = AddressManager(chunk_size, align_bytes)
-
-    def reserve(self, nbytes: int) -> Optional[int]:
-        """Reserve ``nbytes`` and return its ``file_offset``, or None if full.
-
-        A ``None`` is not fatal: the backend turns it into an LRU eviction and
-        retries.
-        """
-        try:
-            file_offset, _ = self._address_manager.allocate(nbytes)
-        except RuntimeError:
-            logger.warning(
-                "RDS chunk full: need %d bytes, %d of %d free",
-                nbytes,
-                self._address_manager.get_free_size(),
-                self._chunk_size,
-            )
-            return None
-        return file_offset
-
-    def release(self, file_offset: int, nbytes: int) -> None:
-        """Return a range to the free space.
-
-        Only for offsets of entries already popped from the cache, so a range is
-        released exactly once.
-        """
-        self._address_manager.free(file_offset, nbytes)
-
-    @property
-    def chunk_size(self) -> int:
-        return self._chunk_size
-
-    @property
-    def bytes_in_use(self) -> int:
-        return self._address_manager.total_allocated_size
 
 
 @dataclass(frozen=True)
@@ -157,8 +82,9 @@ class RDSBackend(AllocatorBackendInterface):
         Args:
             config: Cache engine config; ``max_local_disk_size`` sizes the chunk.
             metadata: Engine metadata; supplies the worker index the staging
-                vmem is pinned to and the KV geometry the write cap derives from.
-            loop: Event loop the async writes are scheduled on.
+                vmem is pinned to.
+            loop: Accepted for interface parity and ignored -- writes are
+                synchronous, see :meth:`batched_submit_put_task`.
             dst_device: Accepted for interface parity and ignored -- staging
                 always lands in RBLN vmem on this worker's own NPU.
             local_cpu_backend: Accepted and ignored: RDS writes device vmem
@@ -167,14 +93,14 @@ class RDSBackend(AllocatorBackendInterface):
         super().__init__(dst_device=dst_device)
         self.config = config
         self.metadata = metadata
-        self.loop = loop
 
         self.memory_allocator: RDSMemoryAllocator = self.initialize_allocator(
             config, metadata
         )
-        # Sized from the allocator's own chunk, so the two cannot disagree
-        # about where it ends.
-        self.nvme_offsets = NvmeOffsetAllocator(self.memory_allocator.chunk_size)
+        # A range outlives its MemoryObj and dies with its cache entry, so the
+        # offset space lives here with the cache rather than on the allocator.
+        # AddressManager's 4096 alignment is what rds requires of both.
+        self.nvme_offsets = AddressManager(self.memory_allocator.chunk_size)
 
         self.hot_lock = threading.Lock()
         self.hot_cache: OrderedDict[CacheEngineKey, _RdsEntry] = OrderedDict()
@@ -182,15 +108,7 @@ class RDSBackend(AllocatorBackendInterface):
         self.put_lock = threading.Lock()
         self.put_tasks: set[CacheEngineKey] = set()
 
-        override = os.environ.get(ENV_MAX_INFLIGHT_WRITES)
-        k = max(1, int(override)) if override is not None else 0
-        self._write_slots = threading.BoundedSemaphore(
-            k or store_inflight_writes(metadata) or 1
-        )
-
-        # Same knobs, same defaults as GdsBackend: how long an allocation
-        # waits for the staging pool to drain before giving the caller a
-        # ``None`` to truncate on.
+        # GdsBackend's knobs and defaults.
         extra_config = config.extra_config or {}
         self._max_alloc_attempts: int = extra_config.get("max_alloc_attempts", 10)
         self._alloc_attempt_delay_secs: float = extra_config.get(
@@ -222,12 +140,11 @@ class RDSBackend(AllocatorBackendInterface):
 
         RDS is this platform's disk tier, so it takes the same capacity knob
         ``LocalDiskBackend`` uses. Per rank, like the chunk it sizes.
+        ``CreateStorageBackends`` only builds this backend when the knob is
+        positive, so there is no default to fall back to.
         """
-        size_gb = float(getattr(config, "max_local_disk_size", 0) or 0)
-        if size_gb <= 0:
-            size_gb = DEFAULT_CHUNK_SIZE_GB
         # A fractional GB would miss the 4096 multiple rds requires.
-        return int(size_gb * 1024**3) // RDS_ALIGN * RDS_ALIGN
+        return int(config.max_local_disk_size * 1024**3) // RDS_ALIGN * RDS_ALIGN
 
     def get_memory_allocator(self) -> MemoryAllocatorInterface:
         return self.memory_allocator
@@ -255,40 +172,27 @@ class RDSBackend(AllocatorBackendInterface):
         Returns:
             The object, or ``None`` if the pool stayed full for every attempt.
         """
-        return self._retry_alloc(
-            lambda: self._allocate_for_store(shapes, dtypes, fmt, eviction),
-            busy_loop,
-        )
+        return self._allocate_for_store(shapes, dtypes, fmt, eviction, busy_loop)
 
-    def _retry_alloc(
+    def _allocate_staging(
         self,
-        attempt: Callable[[], Optional[T]],
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        fmt: MemoryFormat,
         busy_loop: bool,
-    ) -> Optional[T]:
-        """Re-run ``attempt`` while it reports the staging pool full.
-
-        The pool is capped, so a batch that asks for more staging than the cap
-        allows gets ``None`` rather than binding vmem until the NPU is out.
-        Retrying gives in-flight writes time to complete and push their areas
-        back, which is the difference between a slow store and a truncated one.
-        ``GdsBackend.allocate`` waits on its slab the same way.
-
-        Args:
-            attempt: The allocation to run; ``None`` means "pool full".
-            busy_loop: Whether to retry at all, or give up after one attempt.
-
-        Returns:
-            The first non-``None`` result, or ``None`` once attempts run out.
+    ) -> Optional[MemoryObj]:
+        """Take one area from the pool, waiting for in-flight writes to return
+        one if the cap is reached. ``GdsBackend.allocate`` waits the same way.
         """
         max_attempts = self._max_alloc_attempts if busy_loop else 1
         for num_attempts in range(1, max_attempts + 1):
-            result = attempt()
-            if result is not None:
-                return result
+            mo = self.memory_allocator.allocate(shapes, dtypes, fmt)
+            if mo is not None:
+                return mo
             if num_attempts < max_attempts and self._alloc_attempt_delay_secs > 0:
                 time.sleep(self._alloc_attempt_delay_secs)
         logger.warning(
-            "RDS allocation failed after %d attempt(s): staging pool holds "
+            "RDS staging allocation failed after %d attempt(s): pool holds "
             "%d of %d bytes. Returning None.",
             max_attempts,
             self.memory_allocator.bound_bytes,
@@ -305,13 +209,7 @@ class RDSBackend(AllocatorBackendInterface):
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[list[MemoryObj]]:
-        """All-or-nothing :meth:`_allocate_for_store` for ``batch_size`` objects.
-
-        Each object evicts for itself, so a batch that needs N evictions costs
-        one pass rather than N re-runs of the whole batch. The retry wraps the
-        whole batch rather than each object: a batch that cannot fit under the
-        staging cap will not start fitting one object at a time, and releasing
-        the partial batch first is what gives the retry room to work.
+        """All-or-nothing allocation of ``batch_size`` objects.
 
         Args:
             shapes: Logical tensor shape or shapes to allocate.
@@ -319,24 +217,20 @@ class RDSBackend(AllocatorBackendInterface):
             batch_size: How many objects to hand out.
             fmt: Memory format stamped onto each object's metadata.
             eviction: Whether a full NVMe chunk may discard LRU entries.
-            busy_loop: Whether to retry while the staging pool is at its cap.
+            busy_loop: Whether to wait on a staging pool at its cap.
 
         Returns:
-            Every object, or ``None`` if any attempt left the batch short.
+            Every object, or ``None`` if any one of them could not be had.
         """
-
-        def attempt() -> Optional[list[MemoryObj]]:
-            objs: list[MemoryObj] = []
-            for _ in range(batch_size):
-                mo = self._allocate_for_store(shapes, dtypes, fmt, eviction)
-                if mo is None:
-                    for allocated in objs:
-                        self._free_for_store(allocated)
-                    return None
-                objs.append(mo)
-            return objs
-
-        return self._retry_alloc(attempt, busy_loop)
+        objs: list[MemoryObj] = []
+        for _ in range(batch_size):
+            mo = self._allocate_for_store(shapes, dtypes, fmt, eviction, busy_loop)
+            if mo is None:
+                for allocated in objs:
+                    self._free_for_store(allocated)
+                return None
+            objs.append(mo)
+        return objs
 
     def _allocate_for_store(
         self,
@@ -344,31 +238,46 @@ class RDSBackend(AllocatorBackendInterface):
         dtypes: Union[torch.dtype, list[torch.dtype]],
         fmt: MemoryFormat,
         eviction: bool,
+        busy_loop: bool = True,
     ) -> Optional[MemoryObj]:
         """A staging buffer plus the NVMe range its contents will be written to.
 
         Buffer first, offset second: an offset reserved before a staging failure
-        would be leaked, whereas a buffer whose reservation fails is handed back
-        to the pool.
+        would be leaked, since nothing would reference it.
 
-        The NVMe chunk is the scarce resource, so a full chunk discards LRU
-        entries to reclaim their offsets and retries, giving up once there is
-        nothing left to evict. The retry sits on ``reserve`` rather than around
-        the whole allocation because that is the only failure eviction can
-        undo: eviction frees NVMe ranges, never staging areas.
+        The two shortages fail differently: a full pool is waited on, a full
+        chunk evicts and retries, then gives up -- waiting cannot conjure a
+        range eviction just failed to find.
         """
-        mo = self.memory_allocator.allocate(shapes, dtypes, fmt)
+        mo = self._allocate_staging(shapes, dtypes, fmt, busy_loop)
         if mo is None:
             return None
         nbytes = mo.get_physical_size()
-        file_offset = self.nvme_offsets.reserve(nbytes)
+        file_offset = self._reserve_offset(nbytes)
         while file_offset is None and eviction and self._evict_one_lru():
-            file_offset = self.nvme_offsets.reserve(nbytes)
+            file_offset = self._reserve_offset(nbytes)
         if file_offset is None:
             mo.ref_count_down()  # -> memory_allocator.free, back into the pool
             return None
         mo.metadata.address = file_offset
         return mo
+
+    def _reserve_offset(self, nbytes: int) -> Optional[int]:
+        """Reserve ``nbytes`` of the chunk, or ``None`` when it is full.
+
+        ``AddressManager`` raises on a full space; the caller wants that as a
+        value, because a full chunk is an eviction to try, not an error.
+        """
+        try:
+            file_offset, _ = self.nvme_offsets.allocate(nbytes)
+        except RuntimeError:
+            logger.warning(
+                "RDS chunk full: need %d bytes, %d free",
+                nbytes,
+                self.nvme_offsets.get_free_size(),
+            )
+            return None
+        return file_offset
 
     def _free_for_store(self, memory_obj: MemoryObj) -> None:
         """Undo :meth:`_allocate_for_store` -- release the range, then the buffer.
@@ -376,28 +285,22 @@ class RDSBackend(AllocatorBackendInterface):
         Only for objects whose contents never reached NVMe. Once a write lands,
         the range outlives the MemoryObj and eviction releases it instead.
         """
-        self.nvme_offsets.release(
+        self.nvme_offsets.free(
             memory_obj.metadata.address, memory_obj.get_physical_size()
         )
         memory_obj.ref_count_down()
 
     def _evict_one_lru(self) -> bool:
-        """Discard the LRU stored chunk to free its NVMe range.
-
-        The evicted key becomes a miss and is recomputed; there is no
-        write-back. :meth:`get_blocking` moves a hit to MRU so a key with an
-        in-flight read is not the LRU, and a key mid-store is not in the cache
-        yet, so neither is evicted here.
-
-        Returns:
-            ``False`` when there is nothing left to evict.
+        """Discard the LRU stored chunk to free its NVMe range, or return
+        ``False`` when there is nothing left to evict. The key becomes a miss
+        and is recomputed; there is no write-back tier below this one.
         """
         with self.hot_lock:
             try:
                 key, entry = self.hot_cache.popitem(last=False)  # oldest = LRU
             except KeyError:
                 return False
-        self.nvme_offsets.release(entry.file_offset, entry.size)
+        self.nvme_offsets.free(entry.file_offset, entry.size)
         logger.info(
             "RDS eviction: discarded LRU key=%s (freed offset=%d size=%d)",
             key.to_string(),
@@ -429,6 +332,20 @@ class RDSBackend(AllocatorBackendInterface):
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> Union[List[Future], None]:
+        """Write every object to NVMe, then record the keys. Blocking.
+
+        Deliberately synchronous. The DMA shares the node's PCIe with the
+        expert all-to-all, so a write that outlives this call lands on top of
+        the next forward's CCL traffic and inflates prefill. Returning only
+        once ``chunk.write`` has drained removes that overlap by construction,
+        with no barrier to place and nothing in flight to bound. Nothing is
+        lost by waiting: ``StorageManager.batched_put`` discards the futures,
+        and the batch's writes are already parallel inside one ``rds.Stream``.
+
+        No ``ref_count_up`` here on purpose: ``batched_put`` holds its own
+        reference across this call and drops it only after we return. The async
+        version needed one because that reference could fall away mid-write.
+        """
         if len(keys) != len(objs):
             raise ValueError(
                 f"keys ({len(keys)}) and objs ({len(objs)}) length mismatch"
@@ -436,52 +353,33 @@ class RDSBackend(AllocatorBackendInterface):
         if not keys:
             return []
         keys_list = list(keys)
-        for mo in objs:
-            mo.ref_count_up()
         with self.put_lock:
             self.put_tasks.update(keys_list)
-        # Backpressure: acquired on the worker thread so an over-limit submit
-        # blocks here instead of piling up staging.
-        self._write_slots.acquire()
-        future = asyncio.run_coroutine_threadsafe(
-            self._async_batched_write(keys_list, objs, on_complete_callback),
-            self.loop,
-        )
-        return [future]
-
-    async def _async_batched_write(
-        self,
-        keys: List[CacheEngineKey],
-        objs: List[MemoryObj],
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
-    ) -> None:
         try:
             entries = [self._snapshot_entry(mo) for mo in objs]
             try:
-                await asyncio.to_thread(self._sync_batched_write, objs, entries)
+                self._sync_batched_write(objs, entries)
             except Exception:
                 logger.error(
                     "RDS batched write failed for %d keys", len(keys), exc_info=True
                 )
-                # Nothing will ever evict a range that never reached the
-                # cache, so release it here or it is lost.
+                # No eviction can reach a range that never entered hot_cache.
                 for entry in entries:
-                    self.nvme_offsets.release(entry.file_offset, entry.size)
-                return
-            # A re-store displaces the previous entry, whose range would
-            # otherwise be stranded. Released outside ``hot_lock``, as
-            # ``_evict_one_lru`` does.
+                    self.nvme_offsets.free(entry.file_offset, entry.size)
+                return []
+            # A re-store strands the displaced entry's range. Freed outside
+            # ``hot_lock``, as ``_evict_one_lru`` does.
             displaced: List[_RdsEntry] = []
             with self.hot_lock:
-                for key, entry in zip(keys, entries, strict=True):
+                for key, entry in zip(keys_list, entries, strict=True):
                     previous = self.hot_cache.get(key)
                     if previous is not None:
                         displaced.append(previous)
                     self.hot_cache[key] = entry
             for previous in displaced:
-                self.nvme_offsets.release(previous.file_offset, previous.size)
+                self.nvme_offsets.free(previous.file_offset, previous.size)
             if on_complete_callback is not None:
-                for key in keys:
+                for key in keys_list:
                     try:
                         on_complete_callback(key)
                     except Exception:
@@ -491,23 +389,17 @@ class RDSBackend(AllocatorBackendInterface):
                             exc_info=True,
                         )
         finally:
-            for mo in objs:
-                mo.ref_count_down()
             with self.put_lock:
-                self.put_tasks.difference_update(keys)
-            # Released only after the staging above was freed, so the cap
-            # reflects live writes.
-            self._write_slots.release()
+                self.put_tasks.difference_update(keys_list)
+        return []
 
     @staticmethod
     def _snapshot_entry(memory_obj: MemoryObj) -> _RdsEntry:
         """Where this object goes on NVMe, and what shape comes back.
 
-        The range was reserved and stamped onto ``metadata.address`` when the
-        object was allocated -- see :meth:`_allocate_for_store`. That holds for
-        everything reaching this path: ``StorageManager`` re-allocates each
-        batch through the destination's own ``get_allocator_backend()`` before
-        handing it over, so an object from another tier's pool never arrives.
+        ``metadata.address`` carries the range ``_allocate_for_store`` reserved.
+        Every object reaching here has one: ``StorageManager`` re-allocates each
+        batch through ``get_allocator_backend()``, which is this backend.
         """
         meta = memory_obj.metadata
         return _RdsEntry(
@@ -544,14 +436,9 @@ class RDSBackend(AllocatorBackendInterface):
     ) -> None:
         """Issue every ``chunk.write`` inside a single stream and synchronise.
 
-        Addresses ``raw_data`` -- the vaddr of the whole area -- rather than
-        ``tensor``, which may be a view onto part of it: the DMA moves buffer
-        handles fetched from that vaddr, not an address range.
-
-        An object this backend did not allocate has no vmem entry behind it, so
-        it yields no buffers and cannot be a write source; it is copied into a
-        staging area first. That is the ordinary case whenever a host pool is
-        registered in front, and it costs one full-chunk copy per store.
+        Addresses ``raw_data`` -- the whole area's vaddr -- not ``tensor``,
+        which may be a view onto part of it: the DMA moves buffer handles
+        fetched from that vaddr, not an address range.
         """
         chunk = self.memory_allocator.chunk
         with self.memory_allocator.make_stream() as stream:
@@ -593,13 +480,11 @@ class RDSBackend(AllocatorBackendInterface):
             # stored entry's own offset and never writes it back.
             mo = self.memory_allocator.allocate(entry.shape, entry.dtype, entry.fmt)
             if mo is None:
-                # A restore asks for every matched chunk at once, so a long
-                # enough prompt wants more destinations than the capped pool
-                # holds. Report a miss rather than raising: the caller
-                # truncates its hit prefix at the first ``None`` and recomputes
-                # the tail, which is what ``GdsBackend`` does when its slab runs
-                # out. Not worth retrying -- the pool is full of this same
-                # batch's destinations, and waiting cannot free those.
+                # A restore wants every matched chunk's destination at once, so
+                # a long prompt can outgrow the cap. Report a miss, as GDS does
+                # on a full slab: the caller truncates its hit prefix here.
+                # Retrying is pointless -- the pool holds this batch's own
+                # destinations, which only the caller can release.
                 logger.warning(
                     "RDS staging pool full serving key=%s (%d/%d); reporting a "
                     "miss so the caller recomputes from here. Raise %s to keep "
@@ -663,7 +548,7 @@ class RDSBackend(AllocatorBackendInterface):
             entry = self.hot_cache.pop(key, None)
         if entry is None:
             return False
-        self.nvme_offsets.release(entry.file_offset, entry.size)
+        self.nvme_offsets.free(entry.file_offset, entry.size)
         return True
 
     # ------------------------------------------------------------------

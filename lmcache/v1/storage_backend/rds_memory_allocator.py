@@ -1,32 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Staging allocator for the RBLN RDS backend.
 
-Hands out one full RBLN vmem area per :meth:`~RDSMemoryAllocator.allocate`,
-recycled through a per-size free list, and owns the single ``rebel.rds.Chunk``
-those areas are written to.
+Hands out one full RBLN vmem area per allocation, recycled through a per-size
+free list, and owns the single ``rebel.rds.Chunk`` those areas are written to.
+``RDSBackend`` owns where inside that chunk an object lands.
 
-One area per object rather than sub-ranges of one big buffer, because ``rds``
-takes neither: ``Chunk.write``/``read`` move a ``rebel._C.vmem.Buffer``, an
-*owning handle* on a device area that only ``vmem.get_device_buffers(vaddr)``
-hands out. There is no constructor for one and its fields are read-only, so a
-handle onto part of an area cannot be made. That is deliberate -- the handle
-keeps the backing allocation alive, which is what stops ``device_addr`` from
-going stale when the vmem entry is rebuilt.
-
-A vaddr is a virtual handle rather than a device address, so there is no
-contiguous device range behind it to slice in the first place: a sharded or
-transformed entry is several areas.
-
-Where inside the chunk an object lands belongs to
-:class:`~lmcache.v1.storage_backend.rds_backend.NvmeOffsetAllocator` instead --
-see that class for why the two are split.
+One area per object rather than sub-ranges of a slab, because ``rds`` takes
+neither: ``Chunk.write``/``read`` move a ``rebel._C.vmem.Buffer``, an owning
+handle on a whole area that only ``vmem.get_device_buffers(vaddr)`` hands out --
+no constructor, read-only fields. Nor is there anything to slice: a vaddr is a
+virtual handle, and a sharded entry sits behind several areas.
 """
 
 # Future
 from __future__ import annotations
 
 # Standard
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import Any, List, Optional, Union
 import os
 import threading
 
@@ -45,21 +35,22 @@ from lmcache.v1.memory_management import (
 )
 from lmcache.v1.platform.rbln import rds_runtime
 
-if TYPE_CHECKING:
-    # First Party
-    from lmcache.v1.metadata import LMCacheMetadata
-
 logger = init_logger(__name__)
 
 #: ``rds`` validates that an area's size and a chunk's file offset are both
 #: multiples of this, so every staging buffer is rounded up to it.
 RDS_ALIGN = 4096
 
-#: Device vmem, in MiB, that RDS staging may hold at once. Both the in-flight
-#: write cap and the read destinations come out of this one budget.
+#: Device vmem, in MiB, that RDS staging may hold at once -- stores and read
+#: destinations alike, since both come out of this one pool.
 ENV_STAGING_CAP_MB = "LMCACHE_RBLN_RDS_STAGING_CAP_MB"
 
-_DEFAULT_STAGING_CAP_MB = 2048
+#: The ceiling is one *chiplet's* free vmem, not the device's --
+#: ``allocate_and_bind_single_device`` binds a single chiplet. R100 is 140 GiB
+#: across 4 chiplets, so 35 GiB each, and at ``--gpu-memory-utilization 0.8``
+#: roughly 7 GiB of that is left after vLLM: 4 GiB fits with margin. Raise the
+#: utilization or the KV pool and this has to come down.
+_DEFAULT_STAGING_CAP_MB = 4096
 
 
 def _align_up(n: int, align: int) -> int:
@@ -71,42 +62,13 @@ def staging_cap_bytes() -> int:
     return int(os.environ.get(ENV_STAGING_CAP_MB, _DEFAULT_STAGING_CAP_MB)) * 1024**2
 
 
-def kv_chunk_bytes(metadata: "Optional[LMCacheMetadata]") -> int:
-    """Bytes of one KV chunk's staging buffer, from the engine metadata.
-
-    Returns 0 when the geometry is unknown, which callers read as "do not cap".
-    """
-    if metadata is None:
-        return 0
-    try:
-        return int(get_size_bytes([torch.Size(metadata.kv_shape)], [metadata.kv_dtype]))
-    except Exception:  # noqa: BLE001 — unknown geometry -> disable capping
-        return 0
-
-
-def store_inflight_writes(metadata: "Optional[LMCacheMetadata]") -> int:
-    """Concurrent in-flight store writes (K) the staging budget allows.
-
-    Each in-flight write holds one chunk of staging, so K takes **half** the
-    budget: reads allocate destinations from the same pool and can run during a
-    store. Returns 0 when the budget or geometry is unknown.
-    """
-    cap_bytes = staging_cap_bytes()
-    chunk_bytes = kv_chunk_bytes(metadata)
-    if cap_bytes <= 0 or chunk_bytes <= 0:
-        return 0
-    return max(1, cap_bytes // chunk_bytes // 2)
-
-
 class RDSMemoryAllocator(MemoryAllocatorInterface):
     """Pool of RBLN vmem staging areas, plus the shared ``rds.Chunk``.
 
-    Each :meth:`allocate` hands out one full vmem area sized to the object's
-    4096-aligned physical bytes, so its ``data_ptr()`` is a vaddr the backend
-    can turn into transferable buffer handles. :meth:`free` pushes it into a
-    size-keyed pool for
-    reuse, bounding live device memory at *peak concurrent* objects rather than
-    at *total* allocations.
+    :meth:`allocate` hands out one full 4096-aligned area, whose ``data_ptr()``
+    is a vaddr the backend turns into buffer handles; :meth:`free` returns it to
+    a size-keyed pool. Live device memory therefore tracks *peak concurrent*
+    objects, under the cap in :func:`staging_cap_bytes`.
     """
 
     #: Not configurable: the node does not isolate the NVMe destination -- a
@@ -149,10 +111,8 @@ class RDSMemoryAllocator(MemoryAllocatorInterface):
         # references, so torch never reclaims them.
         self._tensor_pool: dict[int, list[torch.Tensor]] = {}
 
-        # Ceiling on device vmem this pool may hold, and what it holds now.
-        # ``CuFileMemoryAllocator`` gets the same ceiling for free by
-        # sub-allocating a slab it registered once; binding areas on demand has
-        # no such limit, so it is enforced here instead.
+        # ``CuFileMemoryAllocator`` gets this ceiling for free from its fixed
+        # slab; binding on demand has none, so count and enforce it.
         self._cap_bytes: int = staging_cap_bytes()
         self._bound_bytes: int = 0
 
@@ -221,10 +181,9 @@ class RDSMemoryAllocator(MemoryAllocatorInterface):
     def bound_bytes(self) -> int:
         """Device vmem this pool holds, live objects plus free areas.
 
-        Free areas count because they stay bound for reuse. A workload whose
-        chunk size changes therefore strands the retired size class against the
-        cap; unbinding across size classes would fix that and is not worth its
-        code until a deployment actually mixes sizes.
+        Free areas count -- they stay bound for reuse -- so a workload that
+        changes chunk size strands the retired size class against the cap.
+        Unbinding across size classes is the fix, if a deployment ever mixes.
         """
         with self._lock:
             return self._bound_bytes
@@ -253,16 +212,13 @@ class RDSMemoryAllocator(MemoryAllocatorInterface):
     ) -> Optional[MemoryObj]:
         """Hand out a vmem staging buffer, reused from the pool when possible.
 
-        ``metadata.address`` stays 0; the backend's ``NvmeOffsetAllocator``
-        stamps the store path's ``file_offset`` onto it, and read destinations
-        keep the 0.
+        ``metadata.address`` stays 0; the backend stamps a store's
+        ``file_offset`` onto it, and read destinations keep the 0.
 
         Returns:
-            The object, or ``None`` when handing one out would take the pool
-            past its staging cap. Callers treat that the same way they treat a
-            full ``CuFileMemoryAllocator`` slab: stop asking, store fewer
-            chunks. Recycling a pooled area is never refused -- the cap is on
-            device memory held, not on objects outstanding.
+            The object, or ``None`` when a fresh bind would pass the cap --
+            the same answer a full ``CuFileMemoryAllocator`` slab gives, and
+            callers already truncate on it. Recycling is never refused.
         """
         shapes_l, dtypes_l = self._adapt_shapes_and_dtypes(shapes, dtypes)
         logical_nbytes = get_size_bytes(shapes_l, dtypes_l)
@@ -285,8 +241,8 @@ class RDSMemoryAllocator(MemoryAllocatorInterface):
                     return None
                 # A bound vmem region wrapped as a tensor satisfies both
                 # ``MemoryObj.tensor`` and ``Chunk.write``/``read``, with no
-                # process-wide eager-malloc mode. Bound under the lock so the
-                # accounting above cannot be overtaken by a concurrent bind.
+                # process-wide eager-malloc mode. Under the lock, so a
+                # concurrent bind cannot overtake the accounting above.
                 vaddr = self._vmem.debug.allocate_and_bind_single_device(
                     self._torch_device_id, phy_nbytes, self._NODE_ID
                 )

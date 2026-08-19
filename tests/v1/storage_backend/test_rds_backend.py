@@ -26,12 +26,10 @@ from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.storage_backend import rds_backend as rds_backend_module
 from lmcache.v1.storage_backend import rds_memory_allocator as allocator_module
-from lmcache.v1.storage_backend.rds_backend import NvmeOffsetAllocator, RDSBackend
+from lmcache.v1.storage_backend.rds_backend import RDSBackend
 from lmcache.v1.storage_backend.rds_memory_allocator import (
     RDS_ALIGN,
     RDSMemoryAllocator,
-    kv_chunk_bytes,
-    store_inflight_writes,
 )
 
 CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB of "NVMe"
@@ -208,31 +206,6 @@ def _store(backend: Any, key: CacheEngineKey, fill: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The NVMe address space, on its own
-# ---------------------------------------------------------------------------
-
-
-def test_offsets_are_distinct_and_returned_on_release() -> None:
-    allocator = NvmeOffsetAllocator(4 * RDS_ALIGN)
-    first = allocator.reserve(RDS_ALIGN)
-    second = allocator.reserve(RDS_ALIGN)
-    assert first is not None and second is not None
-    assert first != second
-    assert allocator.bytes_in_use == 2 * RDS_ALIGN
-
-    allocator.release(first, RDS_ALIGN)
-    assert allocator.bytes_in_use == RDS_ALIGN
-    assert allocator.reserve(RDS_ALIGN) is not None
-
-
-def test_reserve_returns_none_when_full_rather_than_raising() -> None:
-    """A full chunk is the backend's cue to evict, not an error."""
-    allocator = NvmeOffsetAllocator(2 * RDS_ALIGN)
-    assert allocator.reserve(2 * RDS_ALIGN) is not None
-    assert allocator.reserve(RDS_ALIGN) is None
-
-
-# ---------------------------------------------------------------------------
 # Round trip
 # ---------------------------------------------------------------------------
 
@@ -397,21 +370,6 @@ def test_chunk_size_is_aligned_and_defaulted() -> None:
 
     default = RDSBackend._chunk_size_bytes(_config(max_local_disk_size=0))
     assert default == rds_backend_module.DEFAULT_CHUNK_SIZE_GB * 1024**3
-
-
-def test_inflight_write_cap_is_half_the_staging_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reads allocate from the same pool, so writes may not spend all of it."""
-    monkeypatch.setenv(allocator_module.ENV_STAGING_CAP_MB, "1")
-    metadata = _metadata()
-    chunk_bytes = kv_chunk_bytes(metadata)
-    assert store_inflight_writes(metadata) == 1024**2 // chunk_bytes // 2
-
-
-def test_inflight_write_cap_is_zero_without_geometry() -> None:
-    """An unknown chunk size disables the derivation; the caller picks a floor."""
-    assert store_inflight_writes(None) == 0
 
 
 # ---------------------------------------------------------------------------
