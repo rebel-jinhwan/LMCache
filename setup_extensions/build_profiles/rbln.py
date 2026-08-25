@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """RBLN (Rebellions NPU) backend profile.
 
-Builds the ``lmcache.rbln_ops`` extension: the head-major block KV transfer
-that drives the rebel runtime's async DMA queue directly (see ``csrc/rbln/``).
+Builds the ``lmcache.rbln_ops`` extension: the MLA block KV transfer that
+drives the rebel runtime's async DMA queue directly (see ``csrc/rbln/``).
 The extension compiles against the rebel runtime headers and links
 ``librbln.so``; both ship inside the ``rebel-compiler`` wheel
 (``rebel/include`` and ``tvm/librbln.so``), so a single installed wheel keeps

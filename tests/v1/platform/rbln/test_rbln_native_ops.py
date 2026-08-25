@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the RBLN-native head-major block transfer (``lmcache.rbln_ops``).
+"""Tests for the RBLN-native MLA block transfer (``lmcache.rbln_ops``).
 
 Two layers of coverage:
 
 - Binding: :meth:`RblnDeviceOps.ensure_native` layers the extension over the
   torch baseline and degrades to "symbol absent" when it is not built. These
   run everywhere, with the extension stubbed.
-- Kernel: ``block_kv_transfer_head_major`` moves bytes between a real RBLN
-  KV cache and head-major host chunks. The reference is computed with plain
-  torch indexing on the host, so the test pins the layout contract rather
-  than round-tripping through the kernel twice. Needs the extension and an
-  NPU; skipped otherwise.
+- Kernel: ``block_kv_transfer_mla`` moves bytes between a real RBLN MLA cache
+  (``[NB, BS, HS]``) and canonical ``[L, T, HS]`` host chunks. The reference is
+  computed with plain torch indexing on the host, so the test pins the layout
+  contract rather than round-tripping through the kernel twice. Needs the
+  extension and an NPU; skipped otherwise.
 """
 
 # Standard
@@ -29,7 +29,6 @@ TransferDirection = lmcache_native.TransferDirection
 
 NUM_LAYERS = 2
 NUM_BLOCKS = 8
-NUM_HEADS = 2
 BLOCK_SIZE = 4
 HEAD_SIZE = 8
 DTYPE = torch.float32
@@ -50,14 +49,14 @@ def test_ensure_native_binds_extension_symbols(
         calls.append(args)
 
     stub = ModuleType("lmcache.rbln_ops")
-    stub.block_kv_transfer_head_major = fake_kernel  # type: ignore[attr-defined]
+    stub.block_kv_transfer_mla = fake_kernel  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "lmcache.rbln_ops", stub)
 
     ops = RblnDeviceOps()
-    assert not hasattr(ops, "block_kv_transfer_head_major")
+    assert not hasattr(ops, "block_kv_transfer_mla")
 
     ops.ensure_native()
-    ops.block_kv_transfer_head_major([], [], [], TransferDirection.D2H, 0)
+    ops.block_kv_transfer_mla([], [], [], TransferDirection.D2H, 0)
 
     assert calls == [([], [], [], TransferDirection.D2H, 0)]
     # The torch-baseline override is untouched by the bind.
@@ -77,7 +76,7 @@ def test_ensure_native_without_extension_leaves_symbol_unbound(
     ops.ensure_native()
     ops.ensure_native()  # idempotent
 
-    assert not hasattr(ops, "block_kv_transfer_head_major")
+    assert not hasattr(ops, "block_kv_transfer_mla")
 
 
 # ---------------------------------------------------------------------------
@@ -106,41 +105,37 @@ def native_ops() -> RblnDeviceOps:
     return ops
 
 
-def _paged_layers(device: torch.device, fill_random: bool) -> list[torch.Tensor]:
-    """Per-layer KV in the native 6-D layout, materialised on ``device``."""
+def _mla_layers(device: torch.device, fill_random: bool) -> list[torch.Tensor]:
+    """Per-layer MLA latent planes ``[NB, BS, HS]``, materialised on ``device``."""
     torch.manual_seed(7)
-    shape = (2, NUM_BLOCKS, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE)
+    shape = (NUM_BLOCKS, BLOCK_SIZE, HEAD_SIZE)
     factory = torch.randn if fill_random else torch.zeros
     return [factory(shape, dtype=DTYPE).to(device) for _ in range(NUM_LAYERS)]
 
 
 def _reference_chunk(paged_cpu: list[torch.Tensor], blocks: list[int]) -> torch.Tensor:
-    """Head-major ``[2, L, H, T, D]`` chunk built with plain torch indexing."""
+    """Canonical ``[L, T, HS]`` MLA chunk built with plain torch indexing."""
     chunk_tokens = len(blocks) * BLOCK_SIZE
-    out = torch.empty((2, NUM_LAYERS, NUM_HEADS, chunk_tokens, HEAD_SIZE), dtype=DTYPE)
+    out = torch.empty((NUM_LAYERS, chunk_tokens, HEAD_SIZE), dtype=DTYPE)
     for layer, kv in enumerate(paged_cpu):
-        squeezed = kv.squeeze(3)  # [2, NB, NH, BS, HS]
         for i, b in enumerate(blocks):
-            tok = slice(i * BLOCK_SIZE, (i + 1) * BLOCK_SIZE)
-            out[:, layer, :, tok, :] = squeezed[:, b]
+            out[layer, i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE] = kv[b]
     return out
 
 
 @requires_npu
-@pytest.mark.parametrize("blocks_per_chunk", [1, 2], ids=["coalesced", "per-head"])
+@pytest.mark.parametrize("blocks_per_chunk", [1, 2])
 def test_d2h_matches_torch_reference(
     native_ops: RblnDeviceOps, blocks_per_chunk: int
 ) -> None:
-    """Store: the device blocks land in the head-major chunk byte-for-byte."""
+    """Store: the device blocks land in the ``[L, T, HS]`` chunk byte-for-byte."""
     device = torch.device("rbln")
-    paged = _paged_layers(device, fill_random=True)
+    paged = _mla_layers(device, fill_random=True)
     block_ids = [5, 2, 7, 0][: 2 * blocks_per_chunk]
-    chunk_numel = 2 * NUM_LAYERS * NUM_HEADS * blocks_per_chunk * BLOCK_SIZE * HEAD_SIZE
+    chunk_numel = NUM_LAYERS * blocks_per_chunk * BLOCK_SIZE * HEAD_SIZE
     chunks = [torch.zeros(chunk_numel, dtype=DTYPE) for _ in range(2)]
 
-    native_ops.block_kv_transfer_head_major(
-        paged, chunks, block_ids, TransferDirection.D2H, 0
-    )
+    native_ops.block_kv_transfer_mla(paged, chunks, block_ids, TransferDirection.D2H, 0)
 
     paged_cpu = [kv.cpu() for kv in paged]
     for chunk_idx, chunk in enumerate(chunks):
@@ -155,33 +150,33 @@ def test_d2h_matches_torch_reference(
 def test_h2d_scatters_and_honours_prefix_skip(native_ops: RblnDeviceOps) -> None:
     """Retrieve: chunk bytes land in the addressed blocks; skipped ones stay 0."""
     device = torch.device("rbln")
-    paged = _paged_layers(device, fill_random=False)
+    paged = _mla_layers(device, fill_random=False)
     blocks_per_chunk = 2
     block_ids = [1, 4, 6, 3]
     skip = 1
     torch.manual_seed(3)
-    chunk_shape = (2, NUM_LAYERS, NUM_HEADS, blocks_per_chunk * BLOCK_SIZE, HEAD_SIZE)
+    chunk_shape = (NUM_LAYERS, blocks_per_chunk * BLOCK_SIZE, HEAD_SIZE)
     chunks = [torch.randn(chunk_shape, dtype=DTYPE).contiguous() for _ in range(2)]
 
-    native_ops.block_kv_transfer_head_major(
+    native_ops.block_kv_transfer_mla(
         paged, chunks, block_ids, TransferDirection.H2D, skip
     )
 
-    paged_cpu = [kv.cpu().squeeze(3) for kv in paged]
+    paged_cpu = [kv.cpu() for kv in paged]
     for flat, b in enumerate(block_ids):
         chunk = chunks[flat // blocks_per_chunk]
         i = flat % blocks_per_chunk
         tok = slice(i * BLOCK_SIZE, (i + 1) * BLOCK_SIZE)
         for layer, kv in enumerate(paged_cpu):
-            got = kv[:, b]  # [2, NH, BS, HS]
+            got = kv[b]  # [BS, HS]
             if flat < skip:
                 assert torch.count_nonzero(got) == 0
             else:
-                assert torch.equal(got, chunk[:, layer, :, tok, :])
+                assert torch.equal(got, chunk[layer, tok])
     # Blocks never addressed are untouched.
     untouched = sorted(set(range(NUM_BLOCKS)) - set(block_ids))
     for kv in paged_cpu:
-        assert torch.count_nonzero(kv[:, untouched]) == 0
+        assert torch.count_nonzero(kv[untouched]) == 0
 
 
 @requires_npu
@@ -190,24 +185,26 @@ def test_geometry_errors_are_raised_before_any_dma(
 ) -> None:
     """Malformed operands fail with a clear error instead of an OOB copy."""
     device = torch.device("rbln")
-    paged = _paged_layers(device, fill_random=False)
-    good_chunk = torch.zeros(
-        2 * NUM_LAYERS * NUM_HEADS * BLOCK_SIZE * HEAD_SIZE, dtype=DTYPE
-    )
+    paged = _mla_layers(device, fill_random=False)
+    good_chunk = torch.zeros(NUM_LAYERS * BLOCK_SIZE * HEAD_SIZE, dtype=DTYPE)
 
     with pytest.raises(RuntimeError, match="divisible"):
-        native_ops.block_kv_transfer_head_major(
+        native_ops.block_kv_transfer_mla(
             paged, [good_chunk, good_chunk], [0, 1, 2], TransferDirection.D2H, 0
         )
     with pytest.raises(RuntimeError, match="smaller than"):
-        native_ops.block_kv_transfer_head_major(
+        native_ops.block_kv_transfer_mla(
             paged, [good_chunk[:-1]], [0], TransferDirection.D2H, 0
         )
     with pytest.raises(RuntimeError, match="out of range"):
-        native_ops.block_kv_transfer_head_major(
+        native_ops.block_kv_transfer_mla(
             paged, [good_chunk], [NUM_BLOCKS], TransferDirection.D2H, 0
         )
-    with pytest.raises(RuntimeError, match="6-D"):
-        native_ops.block_kv_transfer_head_major(
-            [kv.squeeze(3) for kv in paged], [good_chunk], [0], TransferDirection.D2H, 0
+    with pytest.raises(RuntimeError, match="3-D"):
+        native_ops.block_kv_transfer_mla(
+            [kv.unsqueeze(0) for kv in paged],
+            [good_chunk],
+            [0],
+            TransferDirection.D2H,
+            0,
         )

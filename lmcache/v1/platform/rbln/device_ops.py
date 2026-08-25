@@ -16,12 +16,12 @@ the case that matters for cross-device KV sharing and PD disaggregation.
 
 The compiled ``lmcache.rbln_ops`` extension (``csrc/rbln/``) adds one
 native-only symbol on top of that baseline, bound by :meth:`ensure_native`:
-``block_kv_transfer_head_major``, which moves whole blocks between the 6-D
-RBLN cache and a head-major ``[2, L, H, T, D]`` chunk over the rebel runtime's
-DMA queue without any host-side permute. It has no torch fallback -- callers
-feature-detect it with ``hasattr`` -- and it does not replace
-:meth:`RblnDeviceOps.multi_layer_block_kv_transfer`, whose token-major
-contract it deliberately does not implement.
+``block_kv_transfer_mla``, which moves whole blocks between the 3-D RBLN MLA
+cache (``[NB, BS, HS]``, ``EngineKVFormat.NL_X_NB_BS_HS``) and the canonical
+``[L, T, HS]`` chunk over the rebel runtime's DMA queue, one DMA per
+(layer, block). It has no torch fallback -- callers feature-detect it with
+``hasattr`` -- and this module does not yet route
+:meth:`RblnDeviceOps.multi_layer_block_kv_transfer` to it.
 """
 
 # Future
@@ -62,7 +62,7 @@ class RblnDeviceOps(DeviceOps):
         ``librbln.so`` are present at install time (see
         ``setup_extensions/build_profiles/rbln.py``). When it is missing the
         instance keeps every op on the torch baseline and
-        ``block_kv_transfer_head_major`` stays unbound, so ``hasattr`` on it
+        ``block_kv_transfer_mla`` stays unbound, so ``hasattr`` on it
         reports the feature as unavailable.
         """
         if self._native_bound:
@@ -73,7 +73,7 @@ class RblnDeviceOps(DeviceOps):
         except ImportError:
             logger.warning(
                 "lmcache.rbln_ops not built; RblnDeviceOps stays on the torch "
-                "baseline and exposes no native head-major block transfer."
+                "baseline and exposes no native MLA block transfer."
             )
             return
         self.bind_native(rbln_ops)

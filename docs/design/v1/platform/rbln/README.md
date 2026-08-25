@@ -83,12 +83,12 @@ Consequences of the format being first-class:
   pass-through variant, since the detected format has already established what
   the caller holds.
 
-- **No shared transfer kernel handles format 15.** The CUDA / SYCL kernels
-  never see an RBLN cache, so their `default:` arm rejecting the format is
-  correct rather than a gap. The shared `csrc` therefore carries only the enum
-  value, its `is_layer_list` classification, and the two pybind registrations;
-  the one RBLN kernel lives in `csrc/rbln/` and addresses the 6-D tensor
-  directly (below).
+- **No transfer kernel handles format 15.** RBLN has no compiled kernel for
+  the HND attention layout, and the CUDA / SYCL kernels never see an RBLN
+  cache, so their `default:` arm rejecting the format is correct rather than a
+  gap. `csrc` therefore carries only the enum value, its `is_layer_list`
+  classification, and the two pybind registrations. (The one compiled RBLN
+  kernel, below, is for the MLA layout, which is the pre-existing format 3.)
 
 The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
@@ -99,36 +99,43 @@ detection rather than by a connector.
 
 `csrc/rbln/` builds `lmcache.rbln_ops`, which `RblnDeviceOps.ensure_native`
 layers over the torch baseline through `DeviceOps.bind_native`. It exports a
-single **native-only** op:
+single **native-only** op for the MLA layout:
 
 ```
-block_kv_transfer_head_major(kv_caches, lmcache_chunks, block_ids,
-                             direction, skip_prefix_n_blocks=0)
+block_kv_transfer_mla(kv_caches, lmcache_chunks, block_ids,
+                      direction, skip_prefix_n_blocks=0)
 ```
 
-- `kv_caches` are the per-layer 6-D tensors as vllm-rbln allocated them (no
-  squeeze: the kernel computes strides from the 6-D shape).
-- `lmcache_chunks` are contiguous host tensors holding a **head-major**
-  `[2, L, H, T, D]` view, `T = blocks_per_chunk * block_size`.
+- `kv_caches` are the per-layer 3-D tensors vllm-rbln's MLA attention backend
+  allocates, `[num_blocks, block_size, head_size]` -- a single latent plane,
+  no K/V split and no head axis. The vLLM detector classifies this as the
+  pre-existing `EngineKVFormat.NL_X_NB_BS_HS` (3).
+- `lmcache_chunks` are contiguous host tensors holding LMCache's canonical MLA
+  chunk `[L, T, HS]`, `T = blocks_per_chunk * block_size` -- the same bytes
+  the shared torch path (`_transfer_per_layer_mla`) reads and writes, so a
+  chunk produced by this kernel is interchangeable with one from any other
+  device.
 - `direction` is the shared `lmcache_native.TransferDirection`; the extension
   registers no enum of its own, because pybind11 keys enum registrations by
   C++ type and `lmcache_native` already owns this one.
 
-Both sides being head-major is the whole point: every `(K|V, layer, block,
-head)` slab is contiguous on the device and in the chunk, so it moves as one
-`rbln_memcpy_{v2h,h2v}_async` DMA (one per `(K|V, layer)` when a chunk holds
-exactly one block) and the head<->token permute that `kv_ops.py` must run on
-the host for the token-major wire layout never happens. RBLN has no stream or
-event objects, so the kernel drains the whole burst with one
+MLA is the layout where a native kernel is pure win: with no head axis, one
+block of one layer is a contiguous `block_size * head_size` run on both sides,
+so the transfer is exactly one `rbln_memcpy_{v2h,h2v}_async` DMA per
+(layer, block) with no permute and no device-side staging tensor. (The torch
+path has to stage through `torch.empty(device=...)`, which on RBLN is a lazy
+SHM tensor that pushes the ops onto the CPU-fallback path.) RBLN has no stream
+or event objects, so the kernel drains the whole burst with one
 `rbln_device_synchronize` before returning; the caller sees a fully
-materialised chunk (D2H) or cache (H2D).
+materialised chunk (D2H) or cache (H2D). Every geometry check -- rank, per-layer
+shape/dtype agreement, host-resident chunks, chunk capacity, block-id range --
+runs before the first DMA is issued.
 
-What it is **not**: a replacement for `multi_layer_block_kv_transfer`. That
-method's contract is the token-major wire layout shared with every other
-device, which this kernel deliberately does not produce. It is bound under its
-own name and has no torch fallback; callers feature-detect it with `hasattr`
-and fall back to the torch path when the extension is absent. Wiring it into
-the head-major staging format is a separate change.
+What it is **not**, yet: routed from `multi_layer_block_kv_transfer`. The op
+is bound under its own name and has no torch fallback; callers feature-detect
+it with `hasattr` and fall back to the torch path when the extension is absent.
+Dispatching the `NL_X_NB_BS_HS` branch of `multi_layer_block_kv_transfer` to it
+is a one-line follow-up once the MLA format is accepted there.
 
 ### Build
 

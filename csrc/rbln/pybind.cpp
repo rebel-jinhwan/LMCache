@@ -17,20 +17,20 @@
 namespace py = pybind11;
 
 PYBIND11_MODULE(rbln_ops, m) {
-  m.doc() = "RBLN-native head-major block KV transfer for LMCache";
+  m.doc() = "RBLN-native block KV transfer kernels for LMCache";
 
   m.def(
-      "block_kv_transfer_head_major",
-      &lmcache::rbln::block_kv_transfer_head_major, py::arg("kv_caches"),
-      py::arg("lmcache_chunks"), py::arg("block_ids"), py::arg("direction"),
-      py::arg("skip_prefix_n_blocks") = 0,
+      "block_kv_transfer_mla", &lmcache::rbln::block_kv_transfer_mla,
+      py::arg("kv_caches"), py::arg("lmcache_chunks"), py::arg("block_ids"),
+      py::arg("direction"), py::arg("skip_prefix_n_blocks") = 0,
       py::call_guard<py::gil_scoped_release>(),
-      R"doc(Move whole paged blocks between RBLN 6-D KV caches and head-major chunks.
+      R"doc(Move whole paged blocks between RBLN MLA caches and [L, T, HS] chunks.
 
 Args:
-    kv_caches: Per-layer contiguous RBLN tensors ``[2, NB, NH, 1, BS, HD]``.
+    kv_caches: Per-layer contiguous RBLN tensors ``[NB, BS, HS]``
+        (``EngineKVFormat.NL_X_NB_BS_HS``).
     lmcache_chunks: Contiguous host tensors, one per chunk, each holding a
-        head-major ``[2, L, H, T, D]`` view (``T = blocks_per_chunk * BS``).
+        token-major ``[L, T, HS]`` view (``T = blocks_per_chunk * BS``).
     block_ids: Flat paged-block ids, ``len == num_chunks * blocks_per_chunk``.
     direction: ``TransferDirection.D2H`` (store) or ``H2D`` (retrieve).
     skip_prefix_n_blocks: Leading flat blocks neither read nor written.

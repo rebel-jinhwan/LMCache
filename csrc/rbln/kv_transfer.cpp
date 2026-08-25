@@ -33,11 +33,11 @@ void copy_async(TransferDirection dir, uint64_t dev_vaddr, uintptr_t host_ptr,
 
 }  // namespace
 
-void block_kv_transfer_head_major(std::vector<at::Tensor> kv_caches,
-                                  std::vector<at::Tensor> lmcache_chunks,
-                                  std::vector<int64_t> block_ids,
-                                  TransferDirection direction,
-                                  int skip_prefix_n_blocks) {
+void block_kv_transfer_mla(std::vector<at::Tensor> kv_caches,
+                           std::vector<at::Tensor> lmcache_chunks,
+                           std::vector<int64_t> block_ids,
+                           TransferDirection direction,
+                           int skip_prefix_n_blocks) {
   TORCH_CHECK(direction == TransferDirection::D2H ||
                   direction == TransferDirection::H2D,
               "unsupported transfer direction ", static_cast<int>(direction));
@@ -48,18 +48,12 @@ void block_kv_transfer_head_major(std::vector<at::Tensor> kv_caches,
 
   // --- Geometry from the first (representative) layer -----------------------
   const at::Tensor& first = kv_caches[0];
-  TORCH_CHECK(first.dim() == 6,
-              "kv_caches must be 6-D [2, NB, NH, 1, BS, HD]; got dim ",
-              first.dim());
-  const int64_t kv_size = first.size(0);  // 2
-  const int64_t num_blocks = first.size(1);
-  const int64_t num_kv_heads = first.size(2);
-  const int64_t block_size = first.size(4);
-  const int64_t head_dim = first.size(5);
+  TORCH_CHECK(first.dim() == 3,
+              "MLA kv_caches must be 3-D [NB, BS, HS]; got dim ", first.dim());
+  const int64_t num_blocks = first.size(0);
+  const int64_t block_size = first.size(1);
+  const int64_t head_size = first.size(2);
   const int64_t elem = first.element_size();
-  TORCH_CHECK(kv_size == 2, "kv_caches dim 0 must be 2 (K,V); got ", kv_size);
-  TORCH_CHECK(first.size(3) == 1, "kv_caches dim 3 must be 1; got ",
-              first.size(3));
 
   const int total_blocks = static_cast<int>(block_ids.size());
   TORCH_CHECK(total_blocks >= 1, "block_ids is empty");
@@ -71,10 +65,9 @@ void block_kv_transfer_head_major(std::vector<at::Tensor> kv_caches,
       static_cast<int64_t>(blocks_per_chunk) * block_size;
 
   // Each layer is contiguous with the representative geometry; each chunk is a
-  // contiguous host buffer big enough for a head-major [2, L, H, T, D] view.
+  // contiguous host buffer big enough for a token-major [L, T, HS] view.
   // Checked up front so a mismatch is a clean error, not a silent OOB DMA.
-  const int64_t chunk_numel =
-      2 * num_layers * num_kv_heads * chunk_tokens * head_dim;
+  const int64_t chunk_numel = num_layers * chunk_tokens * head_size;
   for (const auto& kv : kv_caches) {
     TORCH_CHECK(kv.is_contiguous(), "kv_caches tensors must be contiguous");
     TORCH_CHECK(kv.sizes() == first.sizes() && kv.dtype() == first.dtype(),
@@ -87,7 +80,7 @@ void block_kv_transfer_head_major(std::vector<at::Tensor> kv_caches,
     TORCH_CHECK(c.dtype() == first.dtype(),
                 "lmcache_chunks dtype must match kv_caches dtype");
     TORCH_CHECK(c.numel() >= chunk_numel, "lmcache chunk numel (", c.numel(),
-                ") smaller than head-major chunk size (", chunk_numel, ")");
+                ") smaller than MLA chunk size (", chunk_numel, ")");
   }
   TORCH_CHECK(skip_prefix_n_blocks >= 0, "skip_prefix_n_blocks must be >= 0");
   for (int flat = skip_prefix_n_blocks; flat < total_blocks; ++flat) {
@@ -96,20 +89,11 @@ void block_kv_transfer_head_major(std::vector<at::Tensor> kv_caches,
                 ")");
   }
 
-  // Per-layer element strides of the paged buffer (contiguous 6-D layout).
-  const int64_t head_stride = block_size * head_dim;        // one head
-  const int64_t block_stride = num_kv_heads * head_stride;  // one block
-  const int64_t kv_stride = num_blocks * block_stride;      // K vs V half
-
-  // Head-major chunk [2, L, H, T, D] element strides.
-  const int64_t lm_head_stride = chunk_tokens * head_dim;
-  const int64_t lm_layer_stride = num_kv_heads * lm_head_stride;
-  const int64_t lm_kv_stride = num_layers * lm_layer_stride;
-
-  // When each chunk holds exactly one block (chunk_tokens == block_size) a
-  // whole (K|V, layer) block is contiguous on both sides, so it moves in one
-  // DMA per (kv, layer) instead of one per head.
-  const bool coalesce_heads = (chunk_tokens == block_size);
+  // One block of one layer: contiguous on both sides.
+  const int64_t block_numel = block_size * head_size;
+  const uint64_t block_bytes = static_cast<uint64_t>(block_numel) * elem;
+  // Chunk [L, T, HS] element strides.
+  const int64_t lm_layer_stride = chunk_tokens * head_size;
 
   int device_id =
       -1;  // resolved once from the first vaddr, for the final sync.
@@ -120,42 +104,22 @@ void block_kv_transfer_head_major(std::vector<at::Tensor> kv_caches,
     const int64_t b = block_ids[flat];
     const auto host_base =
         reinterpret_cast<uintptr_t>(lmcache_chunks[chunk_idx].data_ptr());
+    const int64_t eng_off = b * block_numel;  // element offset of the block
 
-    for (int kv = 0; kv < 2; ++kv) {
-      for (int layer = 0; layer < num_layers; ++layer) {
-        const auto eng_base =
-            reinterpret_cast<uint64_t>(kv_caches[layer].data_ptr());
-        // Block start on the device (element offset -> bytes below).
-        const int64_t eng_off = kv * kv_stride + b * block_stride;
-        // Chunk start for this (kv, layer, block) at head 0 (element offset).
-        const int64_t lm_off = kv * lm_kv_stride + layer * lm_layer_stride +
-                               block_in_chunk * block_size * head_dim;
+    for (int layer = 0; layer < num_layers; ++layer) {
+      const auto eng_base =
+          reinterpret_cast<uint64_t>(kv_caches[layer].data_ptr());
+      const int64_t lm_off =
+          layer * lm_layer_stride + block_in_chunk * block_numel;
+      const uint64_t dev = eng_base + static_cast<uint64_t>(eng_off) * elem;
+      const uintptr_t host = host_base + static_cast<uintptr_t>(lm_off) * elem;
+      copy_async(direction, dev, host, block_bytes);
 
-        if (coalesce_heads) {
-          const uint64_t dev = eng_base + static_cast<uint64_t>(eng_off) * elem;
-          const uintptr_t host =
-              host_base + static_cast<uintptr_t>(lm_off) * elem;
-          const uint64_t nbytes =
-              static_cast<uint64_t>(block_stride) * elem;  // H*BS*HD
-          copy_async(direction, dev, host, nbytes);
-        } else {
-          for (int h = 0; h < num_kv_heads; ++h) {
-            const uint64_t dev =
-                eng_base +
-                static_cast<uint64_t>(eng_off + h * head_stride) * elem;
-            const uintptr_t host =
-                host_base +
-                static_cast<uintptr_t>(lm_off + h * lm_head_stride) * elem;
-            const uint64_t nbytes = static_cast<uint64_t>(head_stride) * elem;
-            copy_async(direction, dev, host, nbytes);
-          }
-        }
-        if (device_id < 0) {
-          uint32_t did = 0;
-          check(::rbln::rbln_get_torch_device_id_from_vaddr(eng_base, did),
-                "rbln_get_torch_device_id_from_vaddr");
-          device_id = static_cast<int>(did);
-        }
+      if (device_id < 0) {
+        uint32_t did = 0;
+        check(::rbln::rbln_get_torch_device_id_from_vaddr(eng_base, did),
+              "rbln_get_torch_device_id_from_vaddr");
+        device_id = static_cast<int>(did);
       }
     }
   }
