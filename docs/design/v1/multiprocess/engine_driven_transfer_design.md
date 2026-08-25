@@ -220,7 +220,9 @@ It also computes `shm_pool_info` once from `StorageManagerConfig`:
 The engine-driven path uses five request types:
 
 1. `REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT`  
-   Worker registers engine-driven KV layout metadata. Server then:
+   Worker registers engine-driven KV layout metadata, including the
+   `chunk_format` it will write (see 3.4). Server then:
+   - validates `chunk_format` and stamps it on the `MemoryLayoutDesc.fmt`
    - stores `EngineDrivenContextEntry` (metadata + model/world info)
    - registers `MemoryLayoutDesc` in `LayoutDescRegistry`
    - creates `TransferStrategy` from engine-level `shm_pool_info`
@@ -288,3 +290,61 @@ Retrieve:
 Notes:
 - SHM pool metadata is computed once in `MPCacheServerContext` init, not per registration.
 - `chunk_indices` optimization reduces unnecessary gather/copy work on partial cache hits.
+
+### 3.4 Chunk Format: `KV_2LTD` (token-major) vs `KV_2LHTD` (head-major)
+
+Every staged chunk is a `[2, num_layers, chunk_tokens, hidden_dim]` buffer, but
+the order of the bytes inside each `(kv, layer)` plane is a choice, named by
+`MemoryFormat`:
+
+| `MemoryFormat` | plane bytes | written by | interchangeable with |
+|---|---|---|---|
+| `KV_2LTD` (default) | `[T, H*D]` -- LMCache's canonical wire layout | `DeviceOps.multi_layer_block_kv_transfer` | every device backend, PD disaggregation, cross-device sharing |
+| `KV_2LHTD` | `[H, T, D]` -- the paged cache's own HND order | `DeviceOps.multi_layer_block_kv_transfer_head_major` | only `KV_2LHTD` readers |
+
+`KV_2LHTD` exists for engines whose paged KV cache is HND (heads before block
+tokens: vLLM `VLLM_KV_CACHE_LAYOUT=HND`, FlashInfer, vLLM-RBLN). There a paged
+block `layer[kv, block]` is already a contiguous `[H, BS, D]` run in the chunk's
+axis order, so the whole transfer is one batched copy with no head<->token
+transpose and no device-side scratch -- the token-major kernel pays that
+transpose on every store and retrieve. It is refused up front for NHD, MLA,
+fused-K/V and cross-layer layouts (`validate_chunk_format`), where it would not
+remove any work.
+
+**The format is a property of the store, not of a transfer.** Nothing in the
+bytes says which order they are in, so the design makes the choice explicit
+and checkable end to end:
+
+1. The worker is configured once (`kv_connector_extra_config`
+   `lmcache.mp.chunk_format`, default `KV_2LTD`) and checks the value against
+   the detected engine layout at `register()`, before anything is sent.
+2. `REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT` carries `chunk_format` (a
+   `MemoryFormat` member name; older workers omit it and mean `KV_2LTD`). The
+   server rejects unknown names and `KV_2LHTD` for single-plane (`use_mla`)
+   layouts, then stamps the format on `MemoryLayoutDesc.fmt`.
+3. `MemoryLayoutDesc.fmt` flows through `StorageManager.reserve_write` into L1
+   allocation, so every `MemoryObj` the server creates for that worker records
+   the format in `MemoryObjMetadata.fmt` -- and therefore into L2 metadata via
+   `to_dict()`.
+4. On `PREPARE_RETRIEVE` both transport strategies compare each object's
+   `metadata.fmt` against the worker's registered format
+   (`chunk_format_matches`) and fail the retrieve (logged at error level)
+   instead of handing over bytes the worker would scatter under the wrong
+   order. A mismatch is a deployment error -- e.g. a head-major worker pointed
+   at a token-major store -- and surfaces as a retrieve failure, never as
+   silent KV corruption.
+5. `gather_paged_kv_to_cpu` / `scatter_cpu_to_paged_kv` take `chunk_format`
+   and dispatch to the matching `DeviceOps` kernel. The head-major kernel is
+   torch-only and always takes tensor operands, so it needs no pinned memory.
+
+Why `KV_2LHTD` keeps the 4-D logical shape: the remote-backend protocol pads
+shapes to four integers, and `token_dim()` consumers (`get_num_tokens`, P2P
+offsets) index axis 2. Recording the head-major order as a *format* on the
+same shape keeps all of that valid; a 5-D shape would not. The price is that
+slicing the last axis of a `KV_2LHTD` tensor is meaningless -- the format tag
+is what tells a consumer not to.
+
+Tests: `tests/v1/multiprocess/test_engine_driven_chunk_format.py` (plumbing and
+enforcement), `tests/v1/platform/test_head_major_block_transfer.py` (kernel
+layout, pinned against the token-major kernel), and
+`tests/v1/platform/rbln/test_rbln_kv_ops.py` (RBLN squeeze + delegate).

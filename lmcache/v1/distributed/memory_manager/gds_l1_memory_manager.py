@@ -87,6 +87,7 @@ class GDSL1MemoryManager:
                 address=address,
                 phy_size=allocated,
                 ref_count=0,
+                fmt=layout_desc.fmt,
             )
             objects.append(GDSMemoryObject(meta))
         return L1Error.SUCCESS, objects

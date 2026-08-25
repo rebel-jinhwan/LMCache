@@ -240,3 +240,93 @@ def test_chunk_size_must_be_a_block_multiple() -> None:
             EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
             0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Head-major (KV_2LHTD)
+# ---------------------------------------------------------------------------
+
+
+def _head_major_transfer(
+    layers: list[torch.Tensor],
+    chunks: list[torch.Tensor],
+    direction: TransferDirection,
+    engine_kv_format: EngineKVFormat = EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
+) -> None:
+    RblnDeviceOps().multi_layer_block_kv_transfer_head_major(
+        layers,
+        chunks,
+        list(range(NUM_BLOCKS)),
+        torch.device("cpu"),
+        direction,
+        _shape_desc(),
+        CHUNK_TOKENS,
+        engine_kv_format,
+        0,
+    )
+
+
+def test_head_major_matches_the_generic_torch_kernel() -> None:
+    """RBLN's head-major path is the squeeze plus the shared kernel, no more.
+
+    The generic kernel owns the layout; what RBLN adds is dropping the
+    singleton axis. Feeding the squeezed tensors to the generic kernel under
+    the 5-D HND format must give byte-identical chunks.
+    """
+    # First Party
+    from lmcache.v1.platform.torch_ops import (
+        multi_layer_block_kv_transfer_head_major,
+    )
+
+    layers = _paged_layers()
+    ours, theirs = _chunks(), _chunks()
+    _head_major_transfer(layers, ours, TransferDirection.D2H)
+    multi_layer_block_kv_transfer_head_major(
+        squeeze_singleton_axis(layers),
+        theirs,
+        list(range(NUM_BLOCKS)),
+        torch.device("cpu"),
+        TransferDirection.D2H,
+        _shape_desc(),
+        CHUNK_TOKENS,
+        EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
+        0,
+    )
+    for got, expected in zip(ours, theirs, strict=True):
+        assert torch.equal(got, expected)
+    # And it is not the token-major layout.
+    token_major = _chunks()
+    _transfer(layers, token_major, TransferDirection.D2H)
+    assert not all(torch.equal(a, b) for a, b in zip(ours, token_major, strict=True))
+
+
+def test_head_major_round_trip_restores_the_paged_cache() -> None:
+    src = _paged_layers()
+    dst = _paged_layers(fill_random=False)
+    chunks = _chunks()
+    _head_major_transfer(src, chunks, TransferDirection.D2H)
+    _head_major_transfer(dst, chunks, TransferDirection.H2D)
+    for got, expected in zip(dst, src, strict=True):
+        assert torch.equal(got, expected)
+
+
+def test_head_major_refuses_other_formats_and_pointers() -> None:
+    with pytest.raises(ValueError, match="NL_X_TWO_NB_NH_ONE_BS_HS"):
+        _head_major_transfer(
+            _paged_layers(),
+            _chunks(),
+            TransferDirection.D2H,
+            engine_kv_format=EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
+        )
+    with pytest.raises(ValueError, match="tensor operands"):
+        RblnDeviceOps().multi_layer_block_kv_transfer_head_major(
+            torch.tensor([0, 1], dtype=torch.int64),
+            [0, 1],
+            list(range(NUM_BLOCKS)),
+            torch.device("cpu"),
+            TransferDirection.D2H,
+            _shape_desc(),
+            CHUNK_TOKENS,
+            EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
+            0,
+        )

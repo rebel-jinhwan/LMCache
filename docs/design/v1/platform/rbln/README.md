@@ -93,3 +93,17 @@ The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
 never touch a connector -- which is why the format must be recognised by
 detection rather than by a connector.
+
+## Head-major chunks (`MemoryFormat.KV_2LHTD`)
+
+Because the RBLN cache is HND, writing the canonical token-major chunk costs a
+head<->token transpose on the host for every store and retrieve. The
+multiprocess path can instead store chunks head-major
+(`kv_connector_extra_config` `lmcache.mp.chunk_format: KV_2LHTD`), which
+copies each `[NH, BS, HS]` block straight into the chunk. This is not an RBLN
+feature: the kernel is the generic `torch_ops.multi_layer_block_kv_transfer_head_major`,
+valid for any per-layer HND split-K/V engine. `RblnDeviceOps` overrides only
+to `squeeze_singleton_axis` and delegate under `NL_X_TWO_NB_NH_BS_HS`. The
+format is recorded on every stored object and enforced at retrieve; the store
+must be homogeneous. Design and trade-offs:
+`docs/design/v1/multiprocess/engine_driven_transfer_design.md` §3.4.

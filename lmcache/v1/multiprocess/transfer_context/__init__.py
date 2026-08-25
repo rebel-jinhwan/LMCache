@@ -14,7 +14,9 @@ from .base import (
     compute_kv_layout,
     create_engine_driven_context,
     gather_paged_kv_to_cpu,
+    parse_chunk_format,
     scatter_cpu_to_paged_kv,
+    validate_chunk_format,
 )
 from .pickle import EngineDrivenContextPickle
 from .shm import EngineDrivenContextShm, ShmSlotDescriptor
@@ -41,5 +43,7 @@ __all__ = [
     "create_engine_driven_context",
     "create_transfer_context",
     "gather_paged_kv_to_cpu",
+    "parse_chunk_format",
     "scatter_cpu_to_paged_kv",
+    "validate_chunk_format",
 ]

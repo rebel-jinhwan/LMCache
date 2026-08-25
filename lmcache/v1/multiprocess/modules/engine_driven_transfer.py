@@ -11,6 +11,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.memory_management import MemoryFormat
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
@@ -32,7 +33,10 @@ from lmcache.v1.multiprocess.protocols.engine import (
     PrepareStoreResponse,
     RegisterEngineDrivenContextResponse,
 )
-from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMetadata
+from lmcache.v1.multiprocess.transfer_context.base import (
+    EngineDrivenContextMetadata,
+    parse_chunk_format,
+)
 
 # Local
 from .server_transfer import (
@@ -309,7 +313,10 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 num_layers, hidden_dim_size, dtype_str, use_mla).
 
         Raises:
-            ValueError: If ``payload.dtype_str`` is not a valid torch dtype name.
+            ValueError: If ``payload.dtype_str`` is not a valid torch dtype
+                name, ``payload.chunk_format`` is not a supported chunk
+                format, or a head-major format is requested for an MLA
+                (single-plane) layout.
         """
         shm_name = self._shm_pool_info["shm_name"]
         pool_size = self._shm_pool_info["pool_size"]
@@ -335,6 +342,13 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
             )
 
+        chunk_format = parse_chunk_format(payload.chunk_format)
+        if payload.use_mla and chunk_format is not MemoryFormat.KV_2LTD:
+            raise ValueError(
+                f"chunk format {chunk_format.name} requires a split K/V layout; "
+                "the registered layout is single-plane (use_mla=True)"
+            )
+
         shape = (
             torch.Size(
                 [payload.num_layers, self._ctx.chunk_size, payload.hidden_dim_size]
@@ -344,7 +358,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 [2, payload.num_layers, self._ctx.chunk_size, payload.hidden_dim_size]
             )
         )
-        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype], fmt=chunk_format)
         metadata = EngineDrivenContextMetadata(
             layout_desc=layout_desc,
             block_size=payload.block_size,
@@ -494,10 +508,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no non-GPU context is registered for the given
                 instance ID.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
+        entry, strategy = self._resolve_for_transfer(instance_id)
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
+            context=entry.metadata,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)

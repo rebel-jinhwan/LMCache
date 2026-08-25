@@ -119,6 +119,17 @@ class DeviceOps:
     # ... (one per op, 36 total)
 ```
 
+The block-transfer op comes in two chunk layouts with identical signatures:
+`multi_layer_block_kv_transfer` writes LMCache's canonical token-major
+`KV_2LTD` chunk, and `multi_layer_block_kv_transfer_head_major` writes the
+head-major `KV_2LHTD` chunk (same buffer, `[2, L, H, T, D]` order) for
+per-layer HND split-K/V engines. The head-major baseline is torch-only and
+device-independent; a backend overrides it only to adapt its native paged
+layout first (RBLN squeezes its singleton axis, then delegates). The caller
+(`gather_paged_kv_to_cpu` / `scatter_cpu_to_paged_kv`) picks the op from the
+store's `MemoryFormat`; see
+`docs/design/v1/multiprocess/engine_driven_transfer_design.md` §3.4.
+
 ### 3.3 Key design decisions
 
 - **No `OPS` constant.** Op names are derived dynamically from the class body

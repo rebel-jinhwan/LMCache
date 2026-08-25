@@ -2737,3 +2737,190 @@ def drain_recorded_events() -> list[
         items = list(_event_buffer)
         _event_buffer.clear()
     return items
+
+
+# ---------------------------------------------------------------------------
+# Head-major block transfer (MemoryFormat.KV_2LHTD)
+# ---------------------------------------------------------------------------
+
+
+def head_major_chunk_view(
+    chunk: torch.Tensor, num_heads: int, head_size: int
+) -> torch.Tensor:
+    """Reinterpret a ``[2, L, T, H*D]`` chunk buffer as ``[2, L, H, T, D]``.
+
+    This is the :attr:`~lmcache.v1.memory_management.MemoryFormat.KV_2LHTD`
+    reading of a KV chunk: the buffer LMCache allocates for the token-major
+    ``KV_2LTD`` layout, with the bytes of each ``(kv, layer)`` plane ordered
+    heads-first. No bytes move; ``T`` is taken from the buffer, so a trailing
+    chunk allocated for fewer tokens views just as well.
+
+    Args:
+        chunk: Contiguous chunk shaped ``[2, L, T, H*D]``.
+        num_heads: ``H``, the KV heads per layer.
+        head_size: ``D``, the elements per head.
+
+    Returns:
+        A view shaped ``[2, L, H, T, D]`` sharing ``chunk``'s storage.
+
+    Raises:
+        ValueError: If ``chunk`` is not contiguous, not 4-D, or its last axis
+            is not ``num_heads * head_size``.
+    """
+    if chunk.ndim != 4 or chunk.shape[-1] != num_heads * head_size:
+        raise ValueError(
+            "head-major chunk must be [2, L, T, H*D] with H*D="
+            f"{num_heads * head_size}; got {tuple(chunk.shape)}"
+        )
+    if not chunk.is_contiguous():
+        raise ValueError("head-major chunk must be contiguous to be re-viewed")
+    kv, num_layers, num_tokens, _ = chunk.shape
+    return chunk.view(kv, num_layers, num_heads, num_tokens, head_size)
+
+
+def _split_kv_planes(
+    layer: torch.Tensor, is_two_major: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the ``(K, V)`` planes of one per-layer HND tensor as ``[NB, NH, BS, HS]``.
+
+    Args:
+        layer: ``[2, NB, NH, BS, HS]`` when *is_two_major*, else
+            ``[NB, 2, NH, BS, HS]``.
+        is_two_major: Whether the K/V axis leads the block axis.
+    """
+    if is_two_major:
+        return layer[0], layer[1]
+    return layer[:, 0], layer[:, 1]
+
+
+def multi_layer_block_kv_transfer_head_major(
+    paged_buffer_ptrs_tensor: "torch.Tensor | list",
+    lmcache_objects_ptrs: list[int] | list[torch.Tensor],
+    block_ids: torch.Tensor | list[int],
+    device: torch.device | str,
+    direction: TransferDirection,
+    shape_desc: PageBufferShapeDesc,
+    lmcache_chunk_size: int,
+    engine_kv_format: EngineKVFormat,
+    skip_prefix_n_blocks: int,
+) -> None:
+    """Block transfer that writes and reads **head-major** (``KV_2LHTD``) chunks.
+
+    Same contract as :func:`multi_layer_block_kv_transfer` -- the signature
+    mirrors it so :class:`~lmcache.v1.platform.base.device_ops.DeviceOps`
+    can expose both uniformly -- but each chunk is filled as ``[2, L, H, T, D]``
+    (see :func:`head_major_chunk_view`) instead of ``[2, L, T, H*D]``.
+
+    Only per-layer HND formats with a split K/V pair are supported: there a
+    paged block ``layer[kv, block]`` is already a contiguous ``[NH, BS, HS]``
+    run in the chunk's own axis order, so the whole transfer is one batched
+    copy per direction with no head<->token transpose and no device-side
+    scratch. That is the point of the format; for NHD, MLA, fused-K/V and
+    cross-layer engines the token-major kernel is the right one and this
+    function refuses them.
+
+    Args:
+        paged_buffer_ptrs_tensor: Per-layer paged KV tensors (or pointers
+            reconstructible via *shape_desc*).
+        lmcache_objects_ptrs: Chunk tensors (or CPU pointers), each a
+            ``[2, L, T, H*D]`` buffer to be filled or read head-major.
+        block_ids: Ordered engine block IDs for the transfer.
+        device: Device the paged tensors live on.
+        direction: ``D2H`` to store, ``H2D`` to retrieve.
+        shape_desc: Shape descriptor of the page buffer.
+        lmcache_chunk_size: Tokens per chunk; a positive multiple of
+            ``shape_desc.bs``.
+        engine_kv_format: Engine KV layout; must be per-layer HND split-K/V.
+        skip_prefix_n_blocks: Leading blocks neither read nor written.
+
+    Raises:
+        ValueError: If the chunk size or skip is invalid, the direction is
+            unknown, or *engine_kv_format* is not a per-layer HND split-K/V
+            layout.
+    """
+    if lmcache_chunk_size <= 0:
+        raise ValueError("lmcache_chunk_size must be positive")
+    if int(shape_desc.bs) <= 0 or lmcache_chunk_size % int(shape_desc.bs) != 0:
+        raise ValueError(
+            "lmcache_chunk_size must be a positive multiple of shape_desc.bs"
+        )
+    if skip_prefix_n_blocks < 0:
+        raise ValueError("skip_prefix_n_blocks must be >= 0")
+    is_d2h = int(direction) == int(TransferDirection.D2H)
+    if not is_d2h and int(direction) != int(TransferDirection.H2D):
+        raise ValueError(f"Unsupported transfer direction: {direction!r}")
+    if (
+        is_cross_layer(engine_kv_format)
+        or is_kv_list(engine_kv_format)
+        or is_mla(engine_kv_format)
+        or _is_fused_kv_format(engine_kv_format)
+        or not _is_hnd_format(engine_kv_format)
+    ):
+        raise ValueError(
+            "head-major (KV_2LHTD) block transfer supports only per-layer HND "
+            f"split-K/V formats; got {engine_kv_format!r}"
+        )
+
+    kv_dtype = _infer_kv_dtype(
+        paged_buffer_ptrs_tensor, lmcache_objects_ptrs, shape_desc
+    )
+    layer_tensors = _normalize_paged_layers(
+        paged_buffer_ptrs_tensor,
+        engine_kv_format,
+        shape_desc=shape_desc,
+        device=device,
+        dtype=kv_dtype,
+    )
+    object_tensors = _normalize_lmcache_objects(
+        lmcache_objects_ptrs,
+        shape_desc=shape_desc,
+        lmcache_chunk_size=lmcache_chunk_size,
+        engine_kv_format=engine_kv_format,
+        dtype=kv_dtype,
+    )
+    if not isinstance(layer_tensors, list) or not layer_tensors or not object_tensors:
+        return
+    layers = [t for t in layer_tensors if isinstance(t, torch.Tensor)]
+    if len(layers) != len(layer_tensors):
+        raise ValueError("head-major block transfer expects one tensor per layer")
+
+    block_id_list = (
+        [int(b) for b in block_ids.tolist()]
+        if isinstance(block_ids, torch.Tensor)
+        else [int(b) for b in block_ids]
+    )
+    block_size = int(shape_desc.bs)
+    blocks_per_object = lmcache_chunk_size // block_size
+    is_two_major = _is_two_major_format(engine_kv_format)
+    planes = [_split_kv_planes(layer, is_two_major) for layer in layers]
+    _nb, num_heads, _bs, head_size = planes[0][0].shape
+
+    dsts: list[torch.Tensor] = []
+    srcs: list[torch.Tensor] = []
+    for object_idx, obj in enumerate(object_tensors):
+        valid = _valid_block_range(
+            object_idx,
+            block_id_list,
+            blocks_per_object,
+            block_size,
+            skip_prefix_n_blocks,
+        )
+        if valid is None:
+            continue
+        blocks, offset_in_object = valid
+        view = head_major_chunk_view(obj, num_heads, head_size)
+        for position, block in enumerate(blocks):
+            start = offset_in_object + position * block_size
+            tokens = slice(start, start + block_size)
+            for layer_idx, (k_plane, v_plane) in enumerate(planes):
+                for half, plane in ((0, k_plane), (1, v_plane)):
+                    chunk_side = view[half, layer_idx, :, tokens, :]
+                    paged_side = plane[block]
+                    if is_d2h:
+                        dsts.append(chunk_side)
+                        srcs.append(paged_side)
+                    else:
+                        dsts.append(paged_side)
+                        srcs.append(chunk_side)
+    if dsts:
+        torch._foreach_copy_(dsts, srcs)

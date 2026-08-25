@@ -13,6 +13,12 @@ Block transfer is overridden for the op sequence, not for the layout. Chunks
 keep LMCache's canonical token-major wire layout (``[2, L, T, H*D]``), so a
 chunk written from an RBLN cache is byte-compatible with every other device --
 the case that matters for cross-device KV sharing and PD disaggregation.
+
+The head-major variant (``MemoryFormat.KV_2LHTD``, selected per store by the
+multiprocess worker) is not RBLN-specific: the generic torch kernel already
+handles any per-layer HND cache. RBLN only has to drop its singleton axis
+first, so :meth:`RblnDeviceOps.multi_layer_block_kv_transfer_head_major`
+squeezes and delegates.
 """
 
 # Future
@@ -32,6 +38,9 @@ from lmcache.v1.platform.rbln.kv_layout import squeeze_singleton_axis
 from lmcache.v1.platform.rbln.kv_ops import (
     gather_blocks_to_chunk,
     scatter_chunk_to_blocks,
+)
+from lmcache.v1.platform.torch_ops import (
+    multi_layer_block_kv_transfer_head_major as _torch_head_major_transfer,
 )
 import lmcache.lmcache_native as lmcache_native
 
@@ -134,3 +143,55 @@ class RblnDeviceOps(DeviceOps):
                     paged_layers, blocks, chunk, skip_prefix_n_blocks=local_skip
                 )
             consumed += len(blocks)
+
+    def multi_layer_block_kv_transfer_head_major(
+        self,
+        paged_buffer_ptrs_tensor: "torch.Tensor | list[torch.Tensor]",
+        lmcache_objects_ptrs: "list[int] | list[torch.Tensor]",
+        block_ids: "torch.Tensor | list[int]",
+        device: "torch.device | str",
+        direction: lmcache_native.TransferDirection,
+        shape_desc: PageBufferShapeDesc,
+        lmcache_chunk_size: int,
+        engine_kv_format: lmcache_native.EngineKVFormat,
+        skip_prefix_n_blocks: int,
+    ) -> None:
+        """Move whole paged blocks between RBLN KV and head-major chunks.
+
+        Drops the singleton axis of the native ``[2, NB, NH, 1, BS, HS]``
+        tensors and hands the resulting 5-D HND views to the generic torch
+        head-major kernel under the equivalent ``NL_X_TWO_NB_NH_BS_HS`` format.
+        Arguments are those of :meth:`multi_layer_block_kv_transfer`.
+
+        Raises:
+            ValueError: If the operands are not tensor lists, the format is
+                not the native RBLN layout, or a paged tensor is not
+                ``[2, NB, NH, 1, BS, HS]``.
+        """
+        if isinstance(paged_buffer_ptrs_tensor, torch.Tensor) or not all(
+            isinstance(obj, torch.Tensor) for obj in lmcache_objects_ptrs
+        ):
+            raise ValueError(
+                "RBLN block transfer requires tensor operands; the pointer "
+                "form is only produced for compiled backends, and RBLN has "
+                "no compiled block-transfer extension in tree."
+            )
+        if int(engine_kv_format) != int(_SUPPORTED_FORMAT):
+            raise ValueError(
+                "RBLN block transfer supports only "
+                f"{_SUPPORTED_FORMAT.name}; got {engine_kv_format!r}"
+            )
+        paged_layers = squeeze_singleton_axis(
+            cast("list[torch.Tensor]", list(paged_buffer_ptrs_tensor))
+        )
+        _torch_head_major_transfer(
+            paged_layers,
+            lmcache_objects_ptrs,
+            block_ids,
+            device,
+            direction,
+            shape_desc,
+            lmcache_chunk_size,
+            lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
+            skip_prefix_n_blocks,
+        )

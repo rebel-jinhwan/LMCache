@@ -112,8 +112,26 @@ class MemoryFormat(Enum):
     """[num_tokens, hidden_dim]
     """
 
+    KV_2LHTD = auto()
+    """Head-major KV: ``[2, num_layers, num_tokens, hidden_dim]`` buffer whose
+    bytes inside each ``(kv, layer)`` plane are ordered
+    ``[num_heads, num_tokens, head_size]`` instead of
+    ``[num_tokens, num_heads * head_size]``.
+
+    The logical shape, byte size and ``token_dim()`` are identical to
+    ``KV_2LTD``; only the order of the last two logical axes differs, so a
+    ``KV_2LHTD`` object is **not** interchangeable with a ``KV_2LTD`` one and
+    must be produced and consumed by head-major-aware transfer kernels
+    (``DeviceOps.multi_layer_block_kv_transfer_head_major``). It exists for
+    engines whose paged cache is HND (heads before block tokens): writing it
+    needs no head<->token transpose. Slicing the last logical axis of a
+    ``KV_2LHTD`` tensor is meaningless; consumers must check ``fmt`` first.
+    """
+
     def token_dim(self) -> int:
         if self == MemoryFormat.KV_2LTD:
+            return 2
+        elif self == MemoryFormat.KV_2LHTD:
             return 2
         elif self == MemoryFormat.KV_T2D:
             return 1

@@ -184,6 +184,38 @@ class DeviceOps:
             skip_prefix_n_blocks,
         )
 
+    def multi_layer_block_kv_transfer_head_major(
+        self,
+        paged_buffer_ptrs_tensor: "torch.Tensor | list",
+        lmcache_objects_ptrs: "list[int] | list[torch.Tensor]",
+        block_ids: "torch.Tensor | list[int]",
+        device: "torch.device | str",
+        direction: lmcache_native.TransferDirection,
+        shape_desc: ops_types.PageBufferShapeDesc,
+        lmcache_chunk_size: int,
+        engine_kv_format: lmcache_native.EngineKVFormat,
+        skip_prefix_n_blocks: int,
+    ) -> None:
+        """Block transfer producing / consuming head-major (``KV_2LHTD``) chunks.
+
+        Same arguments as :meth:`multi_layer_block_kv_transfer`; the chunk
+        layout is the only difference. The baseline is the torch
+        implementation, which supports per-layer HND split-K/V formats on
+        any device; backends whose native paged layout needs adapting first
+        (e.g. RBLN's singleton axis) override this method.
+        """
+        return torch_ops.multi_layer_block_kv_transfer_head_major(
+            paged_buffer_ptrs_tensor,
+            lmcache_objects_ptrs,
+            block_ids,
+            device,
+            direction,
+            shape_desc,
+            lmcache_chunk_size,
+            engine_kv_format,
+            skip_prefix_n_blocks,
+        )
+
     def multi_layer_kv_transfer(self, *args, **kwargs):
         return torch_ops.multi_layer_kv_transfer(*args, **kwargs)
 

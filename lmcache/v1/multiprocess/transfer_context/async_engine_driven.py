@@ -13,6 +13,7 @@ import torch
 from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.futures import MessagingFuture
+from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
@@ -67,6 +68,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
     def __init__(
         self,
         commit_workers: int = DEFAULT_ENGINE_DRIVEN_COMMIT_WORKERS,
+        chunk_format: MemoryFormat = MemoryFormat.KV_2LTD,
     ) -> None:
         """Initialize the async context and create its async resources.
 
@@ -74,8 +76,10 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             commit_workers: Number of background threads used to run commit
                 (CPU->server) work. >1 so a slow gather for one store does not
                 block the commit of another whose gather is already done.
+            chunk_format: Chunk layout; see
+                :class:`EngineDrivenTransferContext`.
         """
-        super().__init__()
+        super().__init__(chunk_format=chunk_format)
         self._commit_workers = max(1, int(commit_workers))
         self._copy_stream: Any = torch_dev.Stream()
         self._commit_executor: ThreadPoolExecutor = ThreadPoolExecutor(
@@ -268,6 +272,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             engine_kv_format=self._engine_kv_format,
                             out=gather_target,
                             chunk_indices=chunk_indices,
+                            chunk_format=self.chunk_format,
                         )
 
                         gather_done = torch_dev.Event()

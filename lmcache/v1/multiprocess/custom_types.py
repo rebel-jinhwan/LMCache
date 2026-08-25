@@ -132,6 +132,12 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         hidden_dim_size: Flattened hidden dimension per token.
         dtype_str: Torch dtype name (e.g. ``"float16"``).
         use_mla: Whether the worker KV format is MLA.
+        chunk_format: ``MemoryFormat`` member name the worker writes its
+            chunks in -- ``"KV_2LTD"`` (token-major, the default and the
+            only value older workers send) or ``"KV_2LHTD"`` (head-major).
+            The server stamps it on every object it allocates for this
+            worker and refuses to hand back objects stored under another
+            format.
     """
 
     instance_id: int
@@ -142,6 +148,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     hidden_dim_size: int
     dtype_str: str
     use_mla: bool
+    chunk_format: str = "KV_2LTD"
 
 
 @dataclass

@@ -30,6 +30,7 @@ from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.mq import MessageQueueClient
@@ -260,6 +261,75 @@ def create_engine_driven_context(
 # Shared gather / scatter utilities
 # ---------------------------------------------------------------------------
 
+#: Chunk formats the engine-driven path can write and read.
+SUPPORTED_CHUNK_FORMATS: frozenset[MemoryFormat] = frozenset(
+    {MemoryFormat.KV_2LTD, MemoryFormat.KV_2LHTD}
+)
+
+
+def parse_chunk_format(name: str) -> MemoryFormat:
+    """Resolve a ``MemoryFormat`` member name into a supported chunk format.
+
+    Args:
+        name: Member name, case-insensitive (``"KV_2LTD"``, ``"kv_2lhtd"``).
+
+    Returns:
+        MemoryFormat: The named format.
+
+    Raises:
+        ValueError: If ``name`` is not a member of
+            :data:`SUPPORTED_CHUNK_FORMATS`.
+    """
+    try:
+        fmt = MemoryFormat[name.strip().upper()]
+    except KeyError:
+        fmt = None
+    if fmt is None or fmt not in SUPPORTED_CHUNK_FORMATS:
+        choices = ", ".join(sorted(f.name for f in SUPPORTED_CHUNK_FORMATS))
+        raise ValueError(
+            f"Unsupported chunk format {name!r}; expected one of {choices}"
+        )
+    return fmt
+
+
+def validate_chunk_format(
+    chunk_format: MemoryFormat,
+    engine_kv_format: "lmcache_native.EngineKVFormat",
+    kv_size: int,
+) -> None:
+    """Check that ``chunk_format`` can be produced from ``engine_kv_format``.
+
+    ``KV_2LTD`` is the canonical layout every engine format maps to.
+    ``KV_2LHTD`` keeps the paged cache's head-major order, so it is only
+    defined for per-layer HND formats with a split K/V pair -- the case where
+    it removes the transpose. Anything else is refused up front, at
+    registration, rather than at the first transfer.
+
+    Args:
+        chunk_format: Requested chunk layout.
+        engine_kv_format: Detected engine KV layout.
+        kv_size: Object plane count reported by ``compute_kv_layout``
+            (2 for split K/V, 1 for MLA and fused-K/V).
+
+    Raises:
+        ValueError: If ``chunk_format`` is unsupported or incompatible with
+            the engine layout.
+    """
+    if chunk_format not in SUPPORTED_CHUNK_FORMATS:
+        raise ValueError(f"Unsupported chunk format {chunk_format!r}")
+    if chunk_format is MemoryFormat.KV_2LTD:
+        return
+    # First Party
+    from lmcache.v1.gpu_connector.kv_format.specs.registry import get_spec_class
+
+    spec = get_spec_class(engine_kv_format)
+    if kv_size != 2 or not spec.is_hnd or spec.is_mla or spec.is_fused_packed:
+        raise ValueError(
+            "chunk format KV_2LHTD (head-major) requires a per-layer HND engine "
+            f"layout with a split K/V pair; got {engine_kv_format!r} "
+            f"(kv_size={kv_size})"
+        )
+
 
 def compute_kv_layout(
     kv_caches: dict[str, torch.Tensor],
@@ -323,6 +393,7 @@ def gather_paged_kv_to_cpu(
     engine_kv_format: "lmcache_native.EngineKVFormat" | None = None,
     out: list[torch.Tensor] | None = None,
     chunk_indices: list[int] | None = None,
+    chunk_format: MemoryFormat = MemoryFormat.KV_2LTD,
 ) -> list[torch.Tensor]:
     """Gather paged KV blocks into CPU chunk tensors.
 
@@ -332,6 +403,10 @@ def gather_paged_kv_to_cpu(
         blocks_per_chunk: Number of paged blocks in one LMCache chunk.
         layout_hints: Optional engine layout hints.
         engine_kv_format: Optional pre-detected KV format.
+        chunk_format: Layout to write into each chunk: ``KV_2LTD``
+            (token-major, ``[2, L, T, H*D]``) or ``KV_2LHTD`` (head-major,
+            the same buffer filled as ``[2, L, H, T, D]``). Head-major always
+            takes the tensor-operand torch path and needs no pinned memory.
         out: Optional pre-allocated output tensors.  If provided, length
             must be at least ``len(chunk_indices)`` when ``chunk_indices``
             is given, or the total number of chunks otherwise.  Any extra
@@ -352,7 +427,8 @@ def gather_paged_kv_to_cpu(
 
     Raises:
         ValueError: If ``out`` is provided with fewer buffers than the number
-            of gathered chunks.
+            of gathered chunks, or ``chunk_format`` is incompatible with the
+            engine layout.
     """
     # First Party
     from lmcache import device_ops
@@ -373,6 +449,11 @@ def gather_paged_kv_to_cpu(
     )
     if engine_kv_format is None:
         engine_kv_format = fmt
+    head_major = chunk_format is MemoryFormat.KV_2LHTD
+    if head_major:
+        validate_chunk_format(
+            chunk_format, engine_kv_format, get_kv_size(normalized, engine_kv_format)
+        )
 
     block_size = get_block_size(normalized, engine_kv_format)
     num_layers = get_num_layers(normalized, engine_kv_format)
@@ -405,8 +486,9 @@ def gather_paged_kv_to_cpu(
         )
 
     # Determine if pinned memory is strictly required
-    # (only for the compiled C++ path which does not accept tensor)
-    requires_pinned = not _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR
+    # (only for the compiled C++ path which does not accept tensor). The
+    # head-major kernel is torch-only and always takes tensor operands.
+    requires_pinned = not _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR and not head_major
     needs_staging = False
     staged_chunks = []
 
@@ -471,7 +553,19 @@ def gather_paged_kv_to_cpu(
         )
 
     if selected_block_ids:
-        if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
+        if head_major:
+            device_ops.multi_layer_block_kv_transfer_head_major(
+                normalized,
+                chunks,
+                selected_block_ids,
+                tensors[0].device,
+                lmcache_native.TransferDirection.D2H,
+                shape_desc,
+                chunk_tokens,
+                engine_kv_format,
+                0,
+            )
+        elif _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
             # Python fallback: accepts tensor list directly for all params.
             paged_arg = normalized
             objs_arg = chunks
@@ -568,6 +662,7 @@ def scatter_cpu_to_paged_kv(
     skip_first_n_tokens: int = 0,
     layout_hints: LayoutHints | None = None,
     engine_kv_format: "lmcache_native.EngineKVFormat" | None = None,
+    chunk_format: MemoryFormat = MemoryFormat.KV_2LTD,
 ) -> None:
     """Scatter CPU chunk tensors back into paged KV tensors.
 
@@ -585,15 +680,19 @@ def scatter_cpu_to_paged_kv(
             GPU transfer path).
         layout_hints: Optional engine layout hints.
         engine_kv_format: Optional pre-detected KV format.
+        chunk_format: Layout the chunks were written in; see
+            :func:`gather_paged_kv_to_cpu`. Must match the writer's.
 
     Raises:
         ValueError: If ``block_ids`` is shorter than
-            ``len(chunks) * blocks_per_chunk``.
+            ``len(chunks) * blocks_per_chunk``, or ``chunk_format`` is
+            incompatible with the engine layout.
     """
     # First Party
     from lmcache import device_ops
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
+        get_kv_size,
         get_num_blocks,
         get_num_layers,
         make_page_buffer_shape_desc,
@@ -618,6 +717,11 @@ def scatter_cpu_to_paged_kv(
     )
     if engine_kv_format is None:
         engine_kv_format = fmt
+    head_major = chunk_format is MemoryFormat.KV_2LHTD
+    if head_major:
+        validate_chunk_format(
+            chunk_format, engine_kv_format, get_kv_size(normalized, engine_kv_format)
+        )
 
     block_size = get_block_size(normalized, engine_kv_format)
     num_layers = get_num_layers(normalized, engine_kv_format)
@@ -656,7 +760,19 @@ def scatter_cpu_to_paged_kv(
     if not selected_block_ids:
         return
 
-    if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
+    if head_major:
+        device_ops.multi_layer_block_kv_transfer_head_major(
+            normalized,
+            chunks,
+            selected_block_ids,
+            tensors[0].device,
+            lmcache_native.TransferDirection.H2D,
+            shape_desc,
+            chunk_tokens,
+            engine_kv_format,
+            skip_prefix_n_blocks,
+        )
+    elif _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
         # Python fallback: accepts tensor list directly for all params.
         paged_arg = normalized
         objs_arg = chunks

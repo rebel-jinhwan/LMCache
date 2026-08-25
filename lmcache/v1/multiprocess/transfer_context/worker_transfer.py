@@ -15,6 +15,7 @@ import torch
 from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
 from lmcache.v1.multiprocess.futures import MessagingFuture
@@ -29,6 +30,7 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     create_engine_driven_context,
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
+    validate_chunk_format,
 )
 from lmcache.v1.platform import get_device_spec, resolve_kv_wrapper_factory
 from lmcache.v1.platform.base.event_ipc import (
@@ -84,13 +86,16 @@ def _supports_async_primitives() -> bool:
     return True
 
 
-def _build_engine_driven_context() -> "TransferContext":
+def _build_engine_driven_context(chunk_format: MemoryFormat) -> "TransferContext":
     """Build the engine-driven context, async when device-capable else sync.
 
     Routes the ``ENGINE_DRIVEN`` and AUTO branches through a single capability
     check. ``AsyncEngineDrivenTransferContext`` is imported lazily to avoid an
     import cycle and to keep the synchronous path free of stream/event
     dependencies.
+
+    Args:
+        chunk_format: Chunk layout the context stores and retrieves.
 
     Returns:
         ``AsyncEngineDrivenTransferContext`` when async primitives are
@@ -103,10 +108,10 @@ def _build_engine_driven_context() -> "TransferContext":
         )
 
         logger.info("Using AsyncEngineDrivenTransferContext for store path")
-        return AsyncEngineDrivenTransferContext()
+        return AsyncEngineDrivenTransferContext(chunk_format=chunk_format)
 
     logger.info("Using EngineDrivenTransferContext (sync) for store path")
-    return EngineDrivenTransferContext()
+    return EngineDrivenTransferContext(chunk_format=chunk_format)
 
 
 class MPTransferMode(str, Enum):
@@ -638,10 +643,25 @@ class EngineDrivenTransferContext(TransferContext):
     message-queue, and the server side persists/rehydrates from storage.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, chunk_format: MemoryFormat = MemoryFormat.KV_2LTD) -> None:
+        """Create an engine-driven context.
+
+        Args:
+            chunk_format: Layout this worker writes into, and expects back
+                from, the server's chunks -- ``KV_2LTD`` (token-major,
+                default) or ``KV_2LHTD`` (head-major, HND engines only).
+                Announced to the server at :meth:`register`, which also
+                checks it against the detected engine layout.
+        """
         self._engine_driven_context: EngineDrivenContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
+        self._chunk_format = chunk_format
+
+    @property
+    def chunk_format(self) -> MemoryFormat:
+        """Layout of the chunks this context stores and retrieves."""
+        return self._chunk_format
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -690,6 +710,7 @@ class EngineDrivenTransferContext(TransferContext):
             engine_kv_format,
             kv_size,
         ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
+        validate_chunk_format(self._chunk_format, engine_kv_format, kv_size)
         self._layout_hints = layout_hints
         self._engine_kv_format = engine_kv_format
 
@@ -704,7 +725,9 @@ class EngineDrivenTransferContext(TransferContext):
             )
         )
         dtype = getattr(torch, dtype_str)
-        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        layout_desc = MemoryLayoutDesc(
+            shapes=[shape], dtypes=[dtype], fmt=self._chunk_format
+        )
 
         future = send_request(
             mq_client,
@@ -719,6 +742,7 @@ class EngineDrivenTransferContext(TransferContext):
                     hidden_dim_size=hidden_dim_size,
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
+                    chunk_format=self._chunk_format.name,
                 )
             ],
         )
@@ -780,6 +804,7 @@ class EngineDrivenTransferContext(TransferContext):
             engine_kv_format=self._engine_kv_format,
             out=out_buffers,
             chunk_indices=chunk_indices,
+            chunk_format=self._chunk_format,
         )
         if out_buffers is not None:
             # SHM path uses async device->CPU copies; complete them before commit.
@@ -819,6 +844,7 @@ class EngineDrivenTransferContext(TransferContext):
                     skip_first_n_tokens=skip_first_n_tokens,
                     layout_hints=self._layout_hints,
                     engine_kv_format=self._engine_kv_format,
+                    chunk_format=self._chunk_format,
                 )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
@@ -844,6 +870,7 @@ class EngineDrivenTransferContext(TransferContext):
 def create_transfer_context(
     kv_caches: dict[str, torch.Tensor],
     mode: "str | MPTransferMode | None" = None,
+    chunk_format: MemoryFormat = MemoryFormat.KV_2LTD,
     **_kwargs: Any,
 ) -> TransferContext:
     """Create a transfer context from KV cache device type.
@@ -857,6 +884,10 @@ def create_transfer_context(
         mode: Optional routing override. When ``None`` the value of
             ``LMCACHE_MP_TRANSFER_MODE`` is consulted, defaulting to
             :attr:`MPTransferMode.AUTO`.
+        chunk_format: Layout of the chunks the engine-driven context writes
+            and reads (``KV_2LTD`` token-major, or ``KV_2LHTD`` head-major).
+            Only the engine-driven path stages chunks, so any value other
+            than ``KV_2LTD`` is refused for the lmcache-driven path.
         **kwargs: Unused placeholder for forward-compatible factory extension.
 
     Returns:
@@ -864,8 +895,9 @@ def create_transfer_context(
 
     Raises:
         ValueError: If ``kv_caches`` is empty, has mixed device types, the
-            requested mode string is unknown, or the requested mode is not
-            supported for the worker device.
+            requested mode string is unknown, the requested mode is not
+            supported for the worker device, or ``chunk_format`` is not
+            ``KV_2LTD`` on the lmcache-driven path.
     """
     if not kv_caches:
         raise ValueError("kv_caches is empty")
@@ -881,11 +913,20 @@ def create_transfer_context(
         device_type,
         resolved_mode.value,
     )
+    lmcache_driven = resolved_mode is MPTransferMode.LMCACHE_DRIVEN or (
+        resolved_mode is MPTransferMode.AUTO and device_type == "cuda"
+    )
+    if lmcache_driven and chunk_format is not MemoryFormat.KV_2LTD:
+        raise ValueError(
+            f"chunk_format {chunk_format.name} is only supported by the "
+            "engine-driven transfer path; the lmcache-driven path does not "
+            "stage chunks. Use mode 'engine_driven' or chunk_format KV_2LTD."
+        )
     if resolved_mode is MPTransferMode.LMCACHE_DRIVEN:
         return _build_lmcache_driven_context(device_type)
     if resolved_mode is MPTransferMode.ENGINE_DRIVEN:
-        return _build_engine_driven_context()
+        return _build_engine_driven_context(chunk_format)
     # AUTO: dispatch by device type (CUDA -> handle path, else -> data path).
     if device_type == "cuda":
         return LMCacheDrivenTransferContext()
-    return _build_engine_driven_context()
+    return _build_engine_driven_context(chunk_format)

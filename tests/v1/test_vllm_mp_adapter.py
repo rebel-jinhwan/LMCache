@@ -131,7 +131,7 @@ def _patch_transfer_context_factory(
     contexts: list[MagicMock] = []
 
     def fake_create_transfer_context(
-        kv_caches: dict[str, torch.Tensor], mode: str
+        kv_caches: dict[str, torch.Tensor], mode: str, **_kwargs: object
     ) -> MagicMock:
         ctx = MagicMock(name=f"transfer_ctx_{len(contexts)}")
         contexts.append(ctx)
@@ -669,7 +669,9 @@ def test_register_uses_local_context_when_self_transfer_ctx_nulled(
     monkeypatch.setattr("lmcache.integration.vllm.utils.vllm_layout_hints", lambda: {})
     local_ctx = MagicMock(name="local_transfer_ctx")
     monkeypatch.setattr(
-        adapter_mod, "create_transfer_context", lambda kv, mode: local_ctx
+        adapter_mod,
+        "create_transfer_context",
+        lambda kv, mode, **_kwargs: local_ctx,
     )
 
     parallel_strategy = ParallelStrategy(

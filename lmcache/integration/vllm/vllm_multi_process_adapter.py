@@ -30,6 +30,7 @@ from lmcache.v1.multiprocess.group_view import (
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 from lmcache.v1.multiprocess.transfer_context import (
+    parse_chunk_format,
     EngineDrivenTransferContext,
     TransferContext,
     create_transfer_context,
@@ -65,6 +66,13 @@ class ExtraConfigDefault(enum.Enum):
     # Mirrors the ``LMCACHE_MP_TRANSFER_MODE`` env var; this extra_config
     # key wins when both are set.
     mp_transfer_mode = "auto"
+    # ``MemoryFormat`` name the engine-driven path writes its chunks in:
+    # ``KV_2LTD`` (token-major, the canonical wire layout every device can
+    # read) or ``KV_2LHTD`` (head-major, HND engines only, no host
+    # transpose). A property of the *store*: every worker sharing a server
+    # must use the same value, and the server refuses to hand back chunks
+    # stored under another format.
+    chunk_format = "KV_2LTD"
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
@@ -1088,8 +1096,14 @@ class LMCacheMPWorkerAdapter:
                 self._mp_transfer_mode = cfg[ExtraConfigDefault.mp_transfer_mode.name]
             else:
                 self._mp_transfer_mode = None
+            self._chunk_format = parse_chunk_format(
+                cfg[ExtraConfigDefault.chunk_format.name]
+            )
         else:
             self._mp_transfer_mode = None
+            self._chunk_format = parse_chunk_format(
+                ExtraConfigDefault.chunk_format.value
+            )
         self.mq_client = MessageQueueClient(server_url, context)
         self._mq_timeout = mq_timeout
 
@@ -1287,7 +1301,9 @@ class LMCacheMPWorkerAdapter:
                 mq_timeout.
         """
         self.kv_caches = kv_caches
-        transfer_ctx = create_transfer_context(kv_caches, mode=self._mp_transfer_mode)
+        transfer_ctx = create_transfer_context(
+            kv_caches, mode=self._mp_transfer_mode, chunk_format=self._chunk_format
+        )
         layout_hints = vllm_layout_hints()
         self.transfer_ctx = transfer_ctx
         try:

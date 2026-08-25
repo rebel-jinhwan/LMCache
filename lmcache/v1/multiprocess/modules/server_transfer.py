@@ -13,6 +13,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.protocols.engine import (
@@ -132,13 +133,21 @@ class TransferStrategy(abc.ABC):
         self,
         key: IPCCacheServerKey,
         instance_id: int,
+        context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
     ) -> PrepareRetrieveResponse:
         """Prepare source resources for a retrieve request.
 
+        Implementations must refuse (``success=False``) objects whose stored
+        ``MemoryFormat`` differs from ``context.layout_desc.fmt``: the worker
+        will scatter the bytes under its own layout, so handing back a chunk
+        written under another one would corrupt its KV cache silently. Use
+        :func:`chunk_format_matches`.
+
         Args:
             key: Cache key identifying the requested token range.
             instance_id: Worker instance identifier.
+            context: Non-GPU transfer metadata for the instance.
             resolve_obj_keys: Callable that resolves object keys from ``key``.
 
         Returns:
@@ -160,6 +169,39 @@ class TransferStrategy(abc.ABC):
         Returns:
             ``True`` when retrieve finalization succeeds.
         """
+
+
+def chunk_format_matches(
+    memory_obj: MemoryObj, context: EngineDrivenContextMetadata
+) -> bool:
+    """Return whether a stored object is laid out as the worker expects.
+
+    Logs the mismatch at error level: a store that holds objects under one
+    ``MemoryFormat`` while a worker registered another is a deployment error
+    (e.g. a head-major worker pointed at a token-major store), not a
+    transient miss, and the resulting retrieve failures should be
+    attributable.
+
+    Args:
+        memory_obj: Object about to be handed to the worker.
+        context: The worker's registered transfer metadata.
+
+    Returns:
+        bool: ``True`` when ``memory_obj.metadata.fmt`` equals
+        ``context.layout_desc.fmt``.
+    """
+    expected = context.layout_desc.fmt
+    actual = memory_obj.metadata.fmt
+    if actual == expected:
+        return True
+    logger.error(
+        "Refusing retrieve: object is stored as %s but the worker registered "
+        "chunk format %s; a chunk must be read under the format it was written "
+        "with.",
+        getattr(actual, "name", actual),
+        expected.name,
+    )
+    return False
 
 
 class PickleTransferStrategy(TransferStrategy):
@@ -238,6 +280,7 @@ class PickleTransferStrategy(TransferStrategy):
         self,
         key: IPCCacheServerKey,
         instance_id: int,
+        context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
     ) -> PrepareRetrieveResponse:
         """Read prefetched objects and return serialized pickle payload."""
@@ -251,7 +294,9 @@ class PickleTransferStrategy(TransferStrategy):
                 prefetched_keys = obj_keys[: len(maybe_memory_objs)]
                 chunks = []
                 for memory_obj in maybe_memory_objs:
-                    if memory_obj.tensor is None:
+                    if memory_obj.tensor is None or not chunk_format_matches(
+                        memory_obj, context
+                    ):
                         return PrepareRetrieveResponse(
                             success=False, data=b"", context={}
                         )
@@ -393,6 +438,7 @@ class ShmTransferStrategy(TransferStrategy):
         self,
         key: IPCCacheServerKey,
         instance_id: int,
+        context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
     ) -> PrepareRetrieveResponse:
         """Read SHM objects and return slot descriptors for worker access."""
@@ -410,7 +456,9 @@ class ShmTransferStrategy(TransferStrategy):
             return PrepareRetrieveResponse(success=False, data=b"", context={})
         slots: list[dict[str, Any]] = []
         for memory_obj in shm_memory_objs:
-            if memory_obj.tensor is None:
+            if memory_obj.tensor is None or not chunk_format_matches(
+                memory_obj, context
+            ):
                 self._storage_manager.finish_read_prefetched(shm_prefetched_keys)
                 return PrepareRetrieveResponse(success=False, data=b"", context={})
             slots.append(

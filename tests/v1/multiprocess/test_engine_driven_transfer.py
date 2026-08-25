@@ -15,6 +15,7 @@ import torch
 # First Party
 from lmcache import torch_dev, torch_device_type
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.multiprocess.posix_shm import (
     shm_create_readwrite,
     shm_munmap,
@@ -1160,6 +1161,7 @@ def test_server_store_and_retrieve_cpu_chunks(
     mock_storage = MagicMock()
     target_tensor = torch.zeros(2, 2, 8, 16)
     mock_memory_obj = MagicMock()
+    mock_memory_obj.metadata.fmt = MemoryFormat.KV_2LTD
     mock_memory_obj.tensor = target_tensor
     mock_storage.reserve_write.return_value = {"obj": mock_memory_obj}
 
@@ -1271,6 +1273,7 @@ def test_server_shm_transport_uses_engine_level_config(
     """Ensure all instances share the same engine-level SHM transport setting."""
     mock_storage = MagicMock()
     mock_memory_obj = MagicMock()
+    mock_memory_obj.metadata.fmt = MemoryFormat.KV_2LTD
     mock_memory_obj.tensor = torch.zeros(2, 2, 8, 16)
     mock_memory_obj.shm_offset = 0
     mock_memory_obj.shm_byte_length = 2048
@@ -1326,6 +1329,7 @@ def test_server_unregister_engine_driven_context_releases_pending_shm_locks(
     """Ensure unregister releases pending SHM read/write reservations."""
     mock_storage = MagicMock()
     mock_memory_obj = MagicMock()
+    mock_memory_obj.metadata.fmt = MemoryFormat.KV_2LTD
     mock_memory_obj.tensor = torch.zeros(2, 2, 8, 16)
     mock_memory_obj.shm_offset = 0
     mock_memory_obj.shm_byte_length = 2048
@@ -1424,6 +1428,7 @@ def test_server_prepare_store_includes_chunk_indices(
     obj1 = "obj1"
     obj2 = "obj2"
     mock_memory_obj = MagicMock()
+    mock_memory_obj.metadata.fmt = MemoryFormat.KV_2LTD
     mock_memory_obj.tensor = torch.zeros(2, 2, 8, 16)
     mock_memory_obj.shm_offset = 0
     mock_memory_obj.shm_byte_length = 2048

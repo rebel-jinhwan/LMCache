@@ -16,6 +16,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.memory_management import MemoryFormat
 
 if TYPE_CHECKING:
     # First Party
@@ -310,12 +311,23 @@ class KeyListPage:
 
 @dataclass(frozen=True)
 class MemoryLayoutDesc:
-    """
-    Describes the layout of a memory object
+    """Describes the layout of a memory object.
+
+    Attributes:
+        shapes: Logical shape of each tensor in the object.
+        dtypes: Element type of each tensor in the object.
+        fmt: Memory format stamped on objects allocated from this layout.
+            It records how the bytes inside ``shapes`` are ordered -- e.g.
+            ``KV_2LTD`` (token-major) versus ``KV_2LHTD`` (head-major) share
+            a shape but are not interchangeable -- so a reader can refuse an
+            object written under a different format instead of misreading
+            it. Defaults to ``KV_2LTD``, the layout every writer produced
+            before the field existed.
     """
 
     shapes: list[torch.Size]
     dtypes: list[torch.dtype]
+    fmt: MemoryFormat = MemoryFormat.KV_2LTD
 
     def __post_init__(self):
         if len(self.shapes) != len(self.dtypes):

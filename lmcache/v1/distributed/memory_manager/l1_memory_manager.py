@@ -124,7 +124,7 @@ class L1MemoryManager:
             If the allocation fails, the memory object list will be empty.
         """
         objects = self._allocator.batched_allocate(
-            layout_desc.shapes, layout_desc.dtypes, count
+            layout_desc.shapes, layout_desc.dtypes, count, layout_desc.fmt
         )
         if objects is None:
             return L1Error.OUT_OF_MEMORY, []

@@ -269,3 +269,38 @@ shared-memory (SHM) pool instead:
     # Engine-driven path with a named SHM segment:
     lmcache server --l1-size-gb 60 --eviction-policy LRU \
         --supported-transfer-mode engine_driven --shm-name "lmcache_pool"
+
+Chunk Layout (``lmcache.mp.chunk_format``)
+------------------------------------------
+
+On the engine-driven path every KV chunk the server stores is a
+``[2, num_layers, chunk_tokens, hidden_dim]`` buffer. The order of the
+bytes inside it is chosen once per store with the worker-side
+``kv_connector_extra_config`` key ``lmcache.mp.chunk_format``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 80
+
+   * - Value
+     - Effect
+   * - ``KV_2LTD`` (default)
+     - Token-major, LMCache's canonical layout. Chunks are byte-compatible
+       with every device backend and with PD disaggregation.
+   * - ``KV_2LHTD``
+     - Head-major. For engines whose paged KV cache is HND (heads before
+       block tokens -- ``VLLM_KV_CACHE_LAYOUT=HND``, FlashInfer, vLLM-RBLN)
+       this skips the head/token transpose on every store and retrieve.
+       Rejected at registration for NHD, MLA and fused-K/V layouts.
+
+The format is recorded on every stored chunk. A worker that registers one
+format against a store holding the other has its retrieves refused (logged
+as errors on the server) rather than served with mis-ordered bytes, so
+**all workers sharing a server must use the same value**, and an existing
+store must not be switched between values.
+
+.. code-block:: bash
+
+   vllm serve <model> \
+     --kv-transfer-config \
+     '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.port":6555,"lmcache.mp.chunk_format":"KV_2LHTD"}}'
