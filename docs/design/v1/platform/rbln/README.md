@@ -143,3 +143,18 @@ Both layouts require the engine's KV caches to be real device tensors
 allocation the per-layer tensors are `meta`, and any transfer -- this
 backend's or the shared path's -- dies at the first host copy with "Cannot
 copy out of meta tensor".
+
+## HND chunk layout: `LMCACHE_RBLN_SAVE_HEAD_MAJOR`
+
+By default HND chunks are token-major (`[2, L, T, H*D]`), which costs a
+head<->token transpose on the host per transfer but keeps chunks
+byte-compatible with every other device. `LMCACHE_RBLN_SAVE_HEAD_MAJOR=1`
+writes the same buffer as `[2, L, H, T, D]` instead (`RblnChunkLayout` in
+`kv_layout.py`, the `chunk_layout` argument of the `_hnd` kernels): each
+`[H, BS, D]` block copies straight through, no transpose, no staging. This is
+the layout the in-process `lmcache-rbln` connector uses.
+
+The layout is a property of the store and is not recorded on the chunk: every
+worker sharing a store must use the same setting, and switching it on an
+existing store yields mis-ordered KV, not an error. MLA chunks have no head
+axis and are unaffected.

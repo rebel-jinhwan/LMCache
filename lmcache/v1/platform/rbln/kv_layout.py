@@ -27,7 +27,9 @@ tensors are indexed to move bytes.
 from __future__ import annotations
 
 # Standard
+from enum import Enum
 from typing import Sequence
+import os
 
 # Third Party
 import torch
@@ -40,6 +42,42 @@ RBLN_MLA_KV_NDIM = 3
 
 #: Axis of the native layout that is always 1 and is squeezed away.
 RBLN_SINGLETON_AXIS = 3
+
+#: Environment variable enabling head-major staging chunks (``1`` / ``0``).
+HEAD_MAJOR_ENV_VAR = "LMCACHE_RBLN_SAVE_HEAD_MAJOR"
+
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off", ""})
+
+
+class RblnChunkLayout(Enum):
+    """Byte order of an HND staging chunk. Same ``[2, L, T, H*D]`` buffer either
+    way; a chunk must be read back under the layout it was written with."""
+
+    TOKEN_MAJOR = "token_major"
+    """Canonical ``[2, L, T, H*D]``; interchangeable with other devices."""
+
+    HEAD_MAJOR = "head_major"
+    """``[2, L, H, T, D]``; no host transpose, RBLN-only."""
+
+    @classmethod
+    def from_env(cls) -> "RblnChunkLayout":
+        """Resolve the layout from ``LMCACHE_RBLN_SAVE_HEAD_MAJOR`` (1/0).
+
+        Returns:
+            RblnChunkLayout: ``HEAD_MAJOR`` when truthy, else ``TOKEN_MAJOR``.
+
+        Raises:
+            ValueError: If the value is neither truthy nor falsy.
+        """
+        raw = os.environ.get(HEAD_MAJOR_ENV_VAR, "").strip().lower()
+        if raw in _TRUE_VALUES:
+            return cls.HEAD_MAJOR
+        if raw in _FALSE_VALUES:
+            return cls.TOKEN_MAJOR
+        raise ValueError(
+            f"{HEAD_MAJOR_ENV_VAR}={raw!r} must be 1/0 (or true/false, yes/no, on/off)"
+        )
 
 
 def is_rbln_kv_layout(tensor: torch.Tensor) -> bool:
