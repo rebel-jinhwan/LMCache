@@ -13,6 +13,15 @@ Block transfer is overridden for the op sequence, not for the layout. Chunks
 keep LMCache's canonical token-major wire layout (``[2, L, T, H*D]``), so a
 chunk written from an RBLN cache is byte-compatible with every other device --
 the case that matters for cross-device KV sharing and PD disaggregation.
+
+The compiled ``lmcache.rbln_ops`` extension (``csrc/rbln/``) adds one
+native-only symbol on top of that baseline, bound by :meth:`ensure_native`:
+``block_kv_transfer_head_major``, which moves whole blocks between the 6-D
+RBLN cache and a head-major ``[2, L, H, T, D]`` chunk over the rebel runtime's
+DMA queue without any host-side permute. It has no torch fallback -- callers
+feature-detect it with ``hasattr`` -- and it does not replace
+:meth:`RblnDeviceOps.multi_layer_block_kv_transfer`, whose token-major
+contract it deliberately does not implement.
 """
 
 # Future
@@ -20,6 +29,7 @@ from __future__ import annotations
 
 # Standard
 from typing import ClassVar, cast
+import importlib
 
 # Third Party
 import torch
@@ -44,6 +54,29 @@ _SUPPORTED_FORMAT = lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS
 
 class RblnDeviceOps(DeviceOps):
     device_type: ClassVar[str] = "rbln"
+
+    def ensure_native(self) -> None:
+        """Bind ``lmcache.rbln_ops`` on top of the torch baseline, once.
+
+        The extension is only built when the rebel runtime headers and
+        ``librbln.so`` are present at install time (see
+        ``setup_extensions/build_profiles/rbln.py``). When it is missing the
+        instance keeps every op on the torch baseline and
+        ``block_kv_transfer_head_major`` stays unbound, so ``hasattr`` on it
+        reports the feature as unavailable.
+        """
+        if self._native_bound:
+            return
+        self._native_bound = True  # set early to prevent repeated attempts
+        try:
+            rbln_ops = importlib.import_module("lmcache.rbln_ops")
+        except ImportError:
+            logger.warning(
+                "lmcache.rbln_ops not built; RblnDeviceOps stays on the torch "
+                "baseline and exposes no native head-major block transfer."
+            )
+            return
+        self.bind_native(rbln_ops)
 
     def multi_layer_block_kv_transfer(
         self,
@@ -85,8 +118,8 @@ class RblnDeviceOps(DeviceOps):
         ):
             raise ValueError(
                 "RBLN block transfer requires tensor operands; the pointer "
-                "form is only produced for compiled backends, and RBLN has "
-                "no compiled block-transfer extension in tree."
+                "form is only produced for compiled backends, and the RBLN "
+                "token-major block transfer is torch-only."
             )
         if int(engine_kv_format) != int(_SUPPORTED_FORMAT):
             raise ValueError(

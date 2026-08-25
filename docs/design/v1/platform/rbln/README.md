@@ -83,13 +83,73 @@ Consequences of the format being first-class:
   pass-through variant, since the detected format has already established what
   the caller holds.
 
-- **No transfer kernel handles format 15.** RBLN has no compiled
-  block-transfer extension in tree, and the CUDA / SYCL kernels never see an
-  RBLN cache, so their `default:` arm rejecting the format is correct rather
-  than a gap. `csrc` therefore carries only the enum value, its
-  `is_layer_list` classification, and the two pybind registrations.
+- **No shared transfer kernel handles format 15.** The CUDA / SYCL kernels
+  never see an RBLN cache, so their `default:` arm rejecting the format is
+  correct rather than a gap. The shared `csrc` therefore carries only the enum
+  value, its `is_layer_list` classification, and the two pybind registrations;
+  the one RBLN kernel lives in `csrc/rbln/` and addresses the 6-D tensor
+  directly (below).
 
 The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
 never touch a connector -- which is why the format must be recognised by
 detection rather than by a connector.
+
+## Native extension: `lmcache.rbln_ops`
+
+`csrc/rbln/` builds `lmcache.rbln_ops`, which `RblnDeviceOps.ensure_native`
+layers over the torch baseline through `DeviceOps.bind_native`. It exports a
+single **native-only** op:
+
+```
+block_kv_transfer_head_major(kv_caches, lmcache_chunks, block_ids,
+                             direction, skip_prefix_n_blocks=0)
+```
+
+- `kv_caches` are the per-layer 6-D tensors as vllm-rbln allocated them (no
+  squeeze: the kernel computes strides from the 6-D shape).
+- `lmcache_chunks` are contiguous host tensors holding a **head-major**
+  `[2, L, H, T, D]` view, `T = blocks_per_chunk * block_size`.
+- `direction` is the shared `lmcache_native.TransferDirection`; the extension
+  registers no enum of its own, because pybind11 keys enum registrations by
+  C++ type and `lmcache_native` already owns this one.
+
+Both sides being head-major is the whole point: every `(K|V, layer, block,
+head)` slab is contiguous on the device and in the chunk, so it moves as one
+`rbln_memcpy_{v2h,h2v}_async` DMA (one per `(K|V, layer)` when a chunk holds
+exactly one block) and the head<->token permute that `kv_ops.py` must run on
+the host for the token-major wire layout never happens. RBLN has no stream or
+event objects, so the kernel drains the whole burst with one
+`rbln_device_synchronize` before returning; the caller sees a fully
+materialised chunk (D2H) or cache (H2D).
+
+What it is **not**: a replacement for `multi_layer_block_kv_transfer`. That
+method's contract is the token-major wire layout shared with every other
+device, which this kernel deliberately does not produce. It is bound under its
+own name and has no torch fallback; callers feature-detect it with `hasattr`
+and fall back to the torch path when the extension is absent. Wiring it into
+the head-major staging format is a separate change.
+
+### Build
+
+`setup_extensions/build_profiles/rbln.py` registers the `rbln` build profile
+(`BUILD_WITH_RBLN=1`, or auto-detected when the `torch_rbln` package is
+installed). It compiles `csrc/rbln/` against the rebel runtime headers and
+links `librbln.so`, both taken from the installed `rebel-compiler` wheel
+(`rebel/include`, `tvm/librbln.so`) so header and library cannot drift apart;
+`RBLN_RUNTIME_INCLUDE` / `RBLN_RUNTIME_LIB_DIR` override the lookup for a
+runtime checkout. When the runtime is missing, an auto-detected build skips
+the extension with a warning and an explicit `BUILD_WITH_RBLN=1` build fails.
+
+The profile also selects `requirements/rbln_core.txt`, which adds `torch-rbln`
+to `install_requires`. Two dependency facts shape that file:
+
+- `torch-rbln` declares `torch==2.11.0+cpu`, a local version that only the
+  PyTorch CPU wheel index serves, so `torch-rbln` has to be installed (or that
+  index supplied) before `pip install lmcache` can resolve.
+- `torch-rbln` imports `rebel` (the `rebel-compiler` distribution) at start-up
+  but does **not** depend on it; `rebel-compiler` is a build-system requirement
+  of torch-rbln only, and it is published solely on Rebellions' credentialed
+  index (`pypi.rbln.ai`). It therefore cannot live in `install_requires` -- the
+  same reason `rocm_core.txt` omits torch -- and is installed manually per the
+  installation docs.

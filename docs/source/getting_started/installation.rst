@@ -238,6 +238,36 @@ Install LMCache
                             # Build LMCache with SYCL backend.
                             BUILD_WITH_SYCL=1 uv pip install --no-build-isolation -e .
 
+                    .. tab-item:: Rebellions RBLN
+
+                        .. code-block:: bash
+
+                            git clone https://github.com/LMCache/LMCache.git
+                            cd LMCache
+
+                            uv venv --python 3.12
+                            source .venv/bin/activate
+
+                            # Need to install these packages manually to avoid build isolation
+                            uv pip install -r requirements/build.txt
+
+                            # torch-rbln provides the torch.rbln backend and pins torch to the
+                            # CPU wheel index. rebel-compiler is the NPU runtime torch-rbln
+                            # imports at start-up and the library lmcache.rbln_ops links; it is
+                            # NOT a dependency of torch-rbln and is only published on the RBLN
+                            # package index (RBLN Portal account required, see
+                            # https://docs.rbln.ai), so install it explicitly.
+                            uv pip install torch-rbln \
+                                --extra-index-url https://download.pytorch.org/whl/cpu
+                            uv pip install rebel-compiler \
+                                --extra-index-url https://pypi.rbln.ai/simple
+
+                            # Build LMCache. BUILD_WITH_RBLN=1 builds lmcache.rbln_ops against the
+                            # rebel runtime shipped in the rebel-compiler wheel and picks
+                            # requirements/rbln_core.txt (torch-rbln); the profile is also
+                            # auto-selected when torch-rbln is already installed.
+                            BUILD_WITH_RBLN=1 uv pip install --no-build-isolation -e .
+
 
     .. tab-item:: Docker
 

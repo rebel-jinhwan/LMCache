@@ -44,6 +44,9 @@ NO_GPU_EXT=1 pip install -e . --no-build-isolation
 
 # HIP/ROCm build
 BUILD_WITH_HIP=1 pip install -e .
+
+# Rebellions RBLN build (lmcache.rbln_ops; needs torch-rbln + rebel-compiler installed)
+BUILD_WITH_RBLN=1 pip install -e . --no-build-isolation
 ```
 
 ## Testing

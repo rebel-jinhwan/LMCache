@@ -1,0 +1,18 @@
+# Vendor-specific runtime deps baked into install_requires by setup.py
+# when building for Rebellions NPUs (BUILD_WITH_RBLN=1, or auto-detected
+# when torch-rbln is already installed).
+#
+# torch-rbln contributes the `torch.rbln` backend through a torch entry
+# point. It pins `torch==2.11.0+cpu`, which lives on the PyTorch CPU index
+# (https://download.pytorch.org/whl/cpu), so torch-rbln must already be
+# installed (or that index supplied) for this requirement to resolve.
+#
+# rebel-compiler is NOT listed here even though torch-rbln imports it at
+# start-up without depending on it, and lmcache.rbln_ops links its
+# librbln.so: it is only available from Rebellions' credentialed package
+# index (https://pypi.rbln.ai/simple), which pip cannot be told about via
+# install_requires. Users install it manually per the "Rebellions RBLN"
+# installation docs; setup.py skips (or, under BUILD_WITH_RBLN=1, refuses)
+# the native build when it is missing.
+
+torch-rbln
