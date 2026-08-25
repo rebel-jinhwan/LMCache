@@ -12,6 +12,10 @@ needs a head<->token transpose. It runs on the host, against host memory
 bandwidth, rather than as part of the device<->host copy: folding it in there
 would leave every copy across that boundary strided instead of contiguous.
 
+HND chunks can instead be staged head-major (``chunk_layout``): the same
+buffer written as ``[2, L, H, T, D]``, so each ``[H, BS, D]`` block copies
+straight through with no transpose. Not interchangeable with token-major.
+
 Implemented with torch ops only -- no compiled extension.
 """
 
@@ -24,6 +28,9 @@ import threading
 
 # Third Party
 import torch
+
+# First Party
+from lmcache.v1.platform.rbln.kv_layout import RblnChunkLayout
 
 #: Host landing buffers for the device<->host leg, per thread.
 _STAGING = threading.local()
@@ -64,8 +71,9 @@ def gather_blocks_to_chunk_hnd(
     paged_layers: Sequence[torch.Tensor],
     block_ids: Sequence[int],
     dst: torch.Tensor,
+    chunk_layout: RblnChunkLayout = RblnChunkLayout.TOKEN_MAJOR,
 ) -> None:
-    """Gather whole paged blocks into a token-major chunk.
+    """Gather whole paged blocks into a chunk.
 
     Args:
         paged_layers: Per-layer HND KV tensors, each ``[2, NB, NH, BS, HS]``.
@@ -74,9 +82,25 @@ def gather_blocks_to_chunk_hnd(
             ``len(block_ids) * BS`` tokens are written, so a trailing chunk
             holding fewer blocks than it was sized for is fine. May be on
             device (D2D) or host (D2H); ``copy_`` handles the transfer.
+        chunk_layout: ``TOKEN_MAJOR`` (canonical, via host transpose) or
+            ``HEAD_MAJOR`` (``dst`` written as ``[2, L, H, T, D]``, direct
+            copies).
     """
     _kv, _nb, num_heads, block_size, head_size = paged_layers[0].shape
     n_blocks = len(block_ids)
+    if chunk_layout is RblnChunkLayout.HEAD_MAJOR:
+        view = head_major_view(dst, num_heads, head_size)
+        chunk_views: list[torch.Tensor] = []
+        paged_blocks: list[torch.Tensor] = []
+        for position, block in enumerate(block_ids):
+            tokens = slice(position * block_size, (position + 1) * block_size)
+            for layer_idx, layer in enumerate(paged_layers):
+                for half in (0, 1):
+                    chunk_views.append(view[half, layer_idx, :, tokens, :])
+                    paged_blocks.append(layer[half, block])
+        if chunk_views:
+            torch._foreach_copy_(chunk_views, paged_blocks)
+        return
     # K and V are addressed separately: ``layer[:, block]`` spans both halves
     # of the layer and is not contiguous, ``layer[kv, block]`` is. With
     # ``staged`` laid out [B, L, 2, H, BS, D] its slot matches exactly, so
@@ -110,8 +134,9 @@ def scatter_chunk_to_blocks_hnd(
     block_ids: Sequence[int],
     src: torch.Tensor,
     skip_prefix_n_blocks: int = 0,
+    chunk_layout: RblnChunkLayout = RblnChunkLayout.TOKEN_MAJOR,
 ) -> None:
-    """Scatter a token-major chunk back into whole paged blocks.
+    """Scatter a chunk back into whole paged blocks.
 
     Args:
         paged_layers: Per-layer HND KV tensors, each ``[2, NB, NH, BS, HS]``.
@@ -121,11 +146,25 @@ def scatter_chunk_to_blocks_hnd(
             than it was sized for is fine.
         skip_prefix_n_blocks: Leading blocks already present in the KV cache;
             neither read from ``src`` nor written.
+        chunk_layout: Layout ``src`` was written with.
     """
     _kv, _nb, num_heads, block_size, head_size = paged_layers[0].shape
     n_blocks = len(block_ids)
     start = min(skip_prefix_n_blocks, n_blocks)
     if start >= n_blocks:
+        return
+    if chunk_layout is RblnChunkLayout.HEAD_MAJOR:
+        view = head_major_view(src, num_heads, head_size)
+        paged_blocks: list[torch.Tensor] = []
+        chunk_views: list[torch.Tensor] = []
+        for position in range(start, n_blocks):
+            block = block_ids[position]
+            tokens = slice(position * block_size, (position + 1) * block_size)
+            for layer_idx, layer in enumerate(paged_layers):
+                for half in (0, 1):
+                    paged_blocks.append(layer[half, block])
+                    chunk_views.append(view[half, layer_idx, :, tokens, :])
+        torch._foreach_copy_(paged_blocks, chunk_views)
         return
     tokens = src.unflatten(-1, (num_heads, head_size))
 
@@ -180,9 +219,7 @@ def gather_blocks_to_chunk_mla(
     """
     n_blocks = len(block_ids)
     _nb, block_size, head_size = paged_layers[0].shape
-    idx = torch.as_tensor(
-        block_ids, dtype=torch.long, device=paged_layers[0].device
-    )
+    idx = torch.as_tensor(block_ids, dtype=torch.long, device=paged_layers[0].device)
     # [L, B, BS, HS] on the paged tensors' device; stack decomposes to the
     # v2v cat kernel, and the result is contiguous so the view below is free.
     gathered = torch.stack(
@@ -230,3 +267,31 @@ def scatter_chunk_to_blocks_mla(
         layer.index_copy_(
             0, idx, chunk_dev[layer_idx].view(n_valid, block_size, head_size)
         )
+
+
+def head_major_view(
+    chunk: torch.Tensor, num_heads: int, head_size: int
+) -> torch.Tensor:
+    """View a contiguous ``[2, L, T, H*D]`` chunk as ``[2, L, H, T, D]``.
+
+    Args:
+        chunk: Contiguous chunk buffer.
+        num_heads: ``H``.
+        head_size: ``D``.
+
+    Returns:
+        torch.Tensor: A view sharing ``chunk``'s storage.
+
+    Raises:
+        ValueError: If ``chunk`` is not contiguous, not 4-D, or its last axis
+            is not ``num_heads * head_size``.
+    """
+    if chunk.ndim != 4 or chunk.shape[-1] != num_heads * head_size:
+        raise ValueError(
+            "head-major chunk must be [2, L, T, H*D] with H*D="
+            f"{num_heads * head_size}; got {tuple(chunk.shape)}"
+        )
+    if not chunk.is_contiguous():
+        raise ValueError("head-major chunk must be contiguous to be re-viewed")
+    kv, num_layers, num_tokens, _ = chunk.shape
+    return chunk.view(kv, num_layers, num_heads, num_tokens, head_size)

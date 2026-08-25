@@ -13,6 +13,9 @@ Block transfer is overridden for the op sequence, not for the layout. Chunks
 keep LMCache's canonical token-major wire layout (``[2, L, T, H*D]``), so a
 chunk written from an RBLN cache is byte-compatible with every other device --
 the case that matters for cross-device KV sharing and PD disaggregation.
+``LMCACHE_RBLN_SAVE_HEAD_MAJOR=1`` opts HND chunks into the head-major
+``[2, L, H, T, D]`` order instead (no host transpose, not interchangeable);
+MLA is unaffected.
 
 For HND, what the override replaces is the shared path's strided device
 indexing: RBLN stores heads before block tokens, and the head<->token
@@ -46,6 +49,7 @@ from lmcache.logging import init_logger
 from lmcache.v1.platform.base.device_ops import DeviceOps
 from lmcache.v1.platform.ops_types import PageBufferShapeDesc
 from lmcache.v1.platform.rbln.kv_layout import (
+    RblnChunkLayout,
     squeeze_singleton_axis,
     validate_mla_layers,
 )
@@ -73,6 +77,28 @@ _MLA_FORMAT = lmcache_native.EngineKVFormat.NL_X_NB_BS_HS
 class RblnDeviceOps(DeviceOps):
     device_type: ClassVar[str] = "rbln"
 
+    def __init__(self, chunk_layout: RblnChunkLayout | None = None) -> None:
+        """Create the RBLN ops backend.
+
+        Args:
+            chunk_layout: HND chunk layout; ``None`` resolves it from
+                ``LMCACHE_RBLN_SAVE_HEAD_MAJOR``.
+
+        Raises:
+            ValueError: If the environment variable is not boolean.
+        """
+        super().__init__()
+        self._chunk_layout = (
+            RblnChunkLayout.from_env() if chunk_layout is None else chunk_layout
+        )
+        if self._chunk_layout is RblnChunkLayout.HEAD_MAJOR:
+            logger.info("RBLN block transfer uses head-major HND chunks")
+
+    @property
+    def chunk_layout(self) -> RblnChunkLayout:
+        """Layout of HND staging chunks."""
+        return self._chunk_layout
+
     def multi_layer_block_kv_transfer(
         self,
         paged_buffer_ptrs_tensor: "torch.Tensor | list[torch.Tensor]",
@@ -85,14 +111,14 @@ class RblnDeviceOps(DeviceOps):
         engine_kv_format: lmcache_native.EngineKVFormat,
         skip_prefix_n_blocks: int,
     ) -> None:
-        """Move whole paged blocks between RBLN KV and token-major chunks.
+        """Move whole paged blocks between RBLN KV and staging chunks.
 
         Args:
             paged_buffer_ptrs_tensor: Native per-layer KV tensors --
                 ``[2, NB, NH, 1, BS, HS]`` (HND attention) or
                 ``[NB, BS, HS]`` (MLA).
-            lmcache_objects_ptrs: Staging chunks in the canonical token-major
-                layout -- ``[2, L, T, H*D]`` (HND) or ``[L, T, HS]`` (MLA).
+            lmcache_objects_ptrs: Staging chunks -- ``[2, L, T, H*D]`` (HND,
+                in :attr:`chunk_layout`) or ``[L, T, HS]`` (MLA).
             block_ids: Flat paged-block IDs in chunk-token order.
             device: Device the transfer runs on. Unused; taken from the
                 tensors.
@@ -175,7 +201,9 @@ class RblnDeviceOps(DeviceOps):
                 if is_mla:
                     gather_blocks_to_chunk_mla(paged_layers, blocks, chunk)
                 else:
-                    gather_blocks_to_chunk_hnd(paged_layers, blocks, chunk)
+                    gather_blocks_to_chunk_hnd(
+                        paged_layers, blocks, chunk, chunk_layout=self._chunk_layout
+                    )
             else:
                 # The prefix skip is global across the transfer; translate it
                 # into this chunk's local block offset.
@@ -186,6 +214,10 @@ class RblnDeviceOps(DeviceOps):
                     )
                 else:
                     scatter_chunk_to_blocks_hnd(
-                        paged_layers, blocks, chunk, skip_prefix_n_blocks=local_skip
+                        paged_layers,
+                        blocks,
+                        chunk,
+                        skip_prefix_n_blocks=local_skip,
+                        chunk_layout=self._chunk_layout,
                     )
             consumed += len(blocks)
