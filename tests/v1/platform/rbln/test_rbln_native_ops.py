@@ -59,11 +59,9 @@ def test_ensure_native_binds_extension_symbols(
     ops.block_kv_transfer_mla([], [], [], TransferDirection.D2H, 0)
 
     assert calls == [([], [], [], TransferDirection.D2H, 0)]
-    # The torch-baseline override is untouched by the bind.
-    assert (
-        ops.multi_layer_block_kv_transfer.__func__
-        is RblnDeviceOps.multi_layer_block_kv_transfer
-    )
+    # bind_native sets symbols on the instance; the torch-baseline override
+    # stays a class method, i.e. it was not shadowed by the bind.
+    assert "multi_layer_block_kv_transfer" not in vars(ops)
 
 
 def test_ensure_native_without_extension_leaves_symbol_unbound(
