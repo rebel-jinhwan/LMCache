@@ -211,7 +211,7 @@ def test_unsupported_format_is_refused() -> None:
 
 
 def test_pointer_operands_are_refused() -> None:
-    """RBLN has no compiled block-transfer extension, so pointers can't occur."""
+    """The torch fallback refuses pointer operands; native bind expects tensors."""
     with pytest.raises(ValueError, match="tensor operands"):
         RblnDeviceOps().multi_layer_block_kv_transfer(
             torch.tensor([0, 1], dtype=torch.int64),

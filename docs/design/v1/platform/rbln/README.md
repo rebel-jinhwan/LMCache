@@ -76,19 +76,19 @@ Consequences of the format being first-class:
   forces HND for `cpu` (vLLM's CPU attention backend misreports its layout),
   but that table no longer has an `rbln` entry.
 
-- **The squeeze happens where bytes move.** `RblnDeviceOps.multi_layer_block_kv_transfer`
-  accepts only format 15 and applies `squeeze_singleton_axis` at entry, so
-  `kv_ops.py` keeps indexing a 5-D tensor. `kv_layout.py` therefore exports the
-  strict squeeze plus the `is_rbln_kv_layout` predicate -- no tolerant
-  pass-through variant, since the detected format has already established what
-  the caller holds.
+- **The squeeze happens where bytes move on the torch fallback.**
+  `RblnDeviceOps.multi_layer_block_kv_transfer` accepts only format 15 and
+  applies `squeeze_singleton_axis` at entry, so `kv_ops.py` keeps indexing a
+  5-D tensor. `kv_layout.py` therefore exports the strict squeeze plus the
+  `is_rbln_kv_layout` predicate -- no tolerant pass-through variant, since the
+  detected format has already established what the caller holds. The native
+  kernel accepts the 6-D tensor (or the squeezed 5-D) directly.
 
-- **No transfer kernel handles format 15.** RBLN has no compiled kernel for
-  the HND attention layout, and the CUDA / SYCL kernels never see an RBLN
-  cache, so their `default:` arm rejecting the format is correct rather than a
-  gap. `csrc` therefore carries only the enum value, its `is_layer_list`
-  classification, and the two pybind registrations. (The one compiled RBLN
-  kernel, below, is for the MLA layout, which is the pre-existing format 3.)
+- **Native transfer lives in `csrc/rbln`.** `lmcache.rbln_ops` exports
+  `multi_layer_block_kv_transfer` with the DeviceOps argument list, and
+  `RblnDeviceOps.ensure_native` binds it over the torch fallback the same way
+  CUDA binds `cuda_ops`. CUDA / SYCL kernels still reject format 15 in their
+  `default:` arm, because they never see an RBLN cache.
 
 The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
@@ -98,44 +98,71 @@ detection rather than by a connector.
 ## Native extension: `lmcache.rbln_ops`
 
 `csrc/rbln/` builds `lmcache.rbln_ops`, which `RblnDeviceOps.ensure_native`
-layers over the torch baseline through `DeviceOps.bind_native`. It exports a
-single **native-only** op for the MLA layout:
+layers over the torch baseline through `DeviceOps.bind_native`. It exports
 
 ```
+multi_layer_block_kv_transfer(paged_buffer_ptrs_tensor, lmcache_objects_ptrs,
+                              block_ids, device, direction, shape_desc,
+                              lmcache_chunk_size, engine_kv_format,
+                              skip_prefix_n_blocks)
 block_kv_transfer_mla(kv_caches, lmcache_chunks, block_ids,
                       direction, skip_prefix_n_blocks=0)
 ```
 
-- `kv_caches` are the per-layer 3-D tensors vllm-rbln's MLA attention backend
-  allocates, `[num_blocks, block_size, head_size]` -- a single latent plane,
-  no K/V split and no head axis. The vLLM detector classifies this as the
-  pre-existing `EngineKVFormat.NL_X_NB_BS_HS` (3).
-- `lmcache_chunks` are contiguous host tensors holding LMCache's canonical MLA
-  chunk `[L, T, HS]`, `T = blocks_per_chunk * block_size` -- the same bytes
-  the shared torch path (`_transfer_per_layer_mla`) reads and writes, so a
-  chunk produced by this kernel is interchangeable with one from any other
-  device.
-- `direction` is the shared `lmcache_native.TransferDirection`; the extension
-  registers no enum of its own, because pybind11 keys enum registrations by
-  C++ type and `lmcache_native` already owns this one.
+The first has the `DeviceOps` argument list, so after `ensure_native` the
+multiprocess gather / scatter path (`gather_paged_kv_to_cpu` /
+`scatter_cpu_to_paged_kv`) reaches the native kernel without knowing it exists.
+It dispatches on `engine_kv_format`:
 
-MLA is the layout where a native kernel is pure win: with no head axis, one
-block of one layer is a contiguous `block_size * head_size` run on both sides,
-so the transfer is exactly one `rbln_memcpy_{v2h,h2v}_async` DMA per
-(layer, block) with no permute and no device-side staging tensor. (The torch
-path has to stage through `torch.empty(device=...)`, which on RBLN is a lazy
-SHM tensor that pushes the ops onto the CPU-fallback path.) RBLN has no stream
-or event objects, so the kernel drains the whole burst with one
-`rbln_device_synchronize` before returning; the caller sees a fully
-materialised chunk (D2H) or cache (H2D). Every geometry check -- rank, per-layer
-shape/dtype agreement, host-resident chunks, chunk capacity, block-id range --
-runs before the first DMA is issued.
+- **HND, format 15** (`[2, NB, NH, 1, BS, HS]` per layer, the layout vLLM-RBLN's
+  attention backend allocates) <-> LMCache's canonical token-major chunk
+  `[2, L, T, NH*HS]`. One paged block is a contiguous `NH*BS*HS` run on the
+  device, so it moves in one DMA; the head <-> token permute into the wire
+  layout is a host memcpy after (D2H) or before (H2D) that DMA. The chunk is
+  byte-identical to what the torch fallback produces.
+- **MLA, format 3** (`[NB, BS, HS]`) <-> `[L, T, HS]`. No head axis on either
+  side, so one block of one layer is contiguous in both and there is no
+  permute; `block_kv_transfer_mla` is also exported under its own name.
 
-What it is **not**, yet: routed from `multi_layer_block_kv_transfer`. The op
-is bound under its own name and has no torch fallback; callers feature-detect
-it with `hasattr` and fall back to the torch path when the extension is absent.
-Dispatching the `NL_X_NB_BS_HS` branch of `multi_layer_block_kv_transfer` to it
-is a one-line follow-up once the MLA format is accepted there.
+`direction` and `engine_kv_format` are the shared `lmcache_native` enums; the
+extension registers none of its own, because pybind11 keys enum registrations
+by C++ type and `lmcache_native` already owns them.
+
+### How the kernel spends its time
+
+Measured on RBLN-CR13 with `benchmarks/rbln/bench_kv_transfer_mp.py`
+(Qwen3-Coder-30B-A3B, `block_size=1024`, 48 layers, one block = 100 MiB moved
+as 96 slices of 1 MiB), inside a vLLM worker on the real DRAM KV:
+
+| step | gather (D2H) | scatter (H2D) |
+|---|---|---|
+| one `rbln_memcpy_*_async` per slice + `rbln_device_synchronize` | 44.1 ms | 23.4 ms |
+| one `rbln_memcpy_*_multi` per call | 32.0 ms | 15.8 ms |
+| + 2 MiB-page (THP) staging | 10.1 ms | 10.2 ms |
+| + permute on `at::get_num_threads()` threads | **8.0 ms** | **7.8 ms** |
+| torch fallback, same run | 21.4 ms | 21.3 ms |
+
+Three decisions follow from that table:
+
+- **Batch the DMA.** `rbln_memcpy_{v2h,h2v}_multi` takes the whole descriptor
+  list and is synchronous, so the kernel builds one `CopyBatch` per call and
+  needs no async handles and no explicit device synchronize.
+- **Stage through hugepages.** The runtime pins the host range of every copy
+  on each command buffer; with 4 KiB pages that pin -- not the DMA -- was the
+  dominant cost. The staging area (`host_staging`) is 2 MiB-aligned,
+  `MADV_HUGEPAGE`d and pre-touched, which cuts the page count 512x. The hint
+  is advisory; on plain pages the kernel still works, only slower. The
+  staging area is `thread_local` and grows to the largest transfer seen.
+- **Do not use `at::parallel_for` for the permute.** The mp worker calls this
+  kernel off the main thread, where `at::parallel_for` degrades to a serial
+  loop; `for_each_slice` fans the (block, K/V, layer) slices out on plain
+  threads instead (0.9 ms per 100 MiB instead of 4.5 ms).
+
+What is left is the DMA itself: ~7 ms per 100 MiB, i.e. six 16 MiB command
+buffers at ~1 ms each, which is the runtime's device<->host rate inside a
+compiled-model context on this hardware. Overlapping the permute with the DMA
+was tried and removed: with the permute at 0.9 ms it recovers nothing until the
+DMA gets faster.
 
 ### Build
 

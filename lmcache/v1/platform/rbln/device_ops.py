@@ -14,14 +14,11 @@ keep LMCache's canonical token-major wire layout (``[2, L, T, H*D]``), so a
 chunk written from an RBLN cache is byte-compatible with every other device --
 the case that matters for cross-device KV sharing and PD disaggregation.
 
-The compiled ``lmcache.rbln_ops`` extension (``csrc/rbln/``) adds one
-native-only symbol on top of that baseline, bound by :meth:`ensure_native`:
-``block_kv_transfer_mla``, which moves whole blocks between the 3-D RBLN MLA
-cache (``[NB, BS, HS]``, ``EngineKVFormat.NL_X_NB_BS_HS``) and the canonical
-``[L, T, HS]`` chunk over the rebel runtime's DMA queue, one DMA per
-(layer, block). It has no torch fallback -- callers feature-detect it with
-``hasattr`` -- and this module does not yet route
-:meth:`RblnDeviceOps.multi_layer_block_kv_transfer` to it.
+The compiled ``lmcache.rbln_ops`` extension (``csrc/rbln/``) exports the same
+``multi_layer_block_kv_transfer`` name. :meth:`ensure_native` binds it onto
+the instance, shadowing this class method the same way CUDA binds
+``lmcache.cuda_ops``. When the extension is missing the instance stays on
+the torch method below.
 """
 
 # Future
@@ -61,9 +58,7 @@ class RblnDeviceOps(DeviceOps):
         The extension is only built when the rebel runtime headers and
         ``librbln.so`` are present at install time (see
         ``setup_extensions/build_profiles/rbln.py``). When it is missing the
-        instance keeps every op on the torch baseline and
-        ``block_kv_transfer_mla`` stays unbound, so ``hasattr`` on it
-        reports the feature as unavailable.
+        instance keeps every op on the torch baseline.
         """
         if self._native_bound:
             return
@@ -73,10 +68,40 @@ class RblnDeviceOps(DeviceOps):
         except ImportError:
             logger.warning(
                 "lmcache.rbln_ops not built; RblnDeviceOps stays on the torch "
-                "baseline and exposes no native MLA block transfer."
+                "baseline for multi_layer_block_kv_transfer."
             )
             return
         self.bind_native(rbln_ops)
+        # pybind functions often lack ``Tensor`` in their inspect annotations.
+        # The MP gather/scatter path keys off that string to decide tensor vs
+        # pointer operands; wrap so engine-driven transfer keeps the tensor
+        # calling convention this backend actually implements.
+        native_fn = self.multi_layer_block_kv_transfer
+
+        def multi_layer_block_kv_transfer(
+            paged_buffer_ptrs_tensor: torch.Tensor | list[torch.Tensor],
+            lmcache_objects_ptrs: list[int] | list[torch.Tensor],
+            block_ids: torch.Tensor | list[int],
+            device: torch.device | str,
+            direction: lmcache_native.TransferDirection,
+            shape_desc: PageBufferShapeDesc,
+            lmcache_chunk_size: int,
+            engine_kv_format: lmcache_native.EngineKVFormat,
+            skip_prefix_n_blocks: int,
+        ) -> None:
+            native_fn(
+                paged_buffer_ptrs_tensor,
+                lmcache_objects_ptrs,
+                block_ids,
+                device,
+                direction,
+                shape_desc,
+                lmcache_chunk_size,
+                engine_kv_format,
+                skip_prefix_n_blocks,
+            )
+
+        self.multi_layer_block_kv_transfer = multi_layer_block_kv_transfer
 
     def multi_layer_block_kv_transfer(
         self,
@@ -91,6 +116,9 @@ class RblnDeviceOps(DeviceOps):
         skip_prefix_n_blocks: int,
     ) -> None:
         """Move whole paged blocks between RBLN KV and token-major chunks.
+
+        This is the torch fallback. After :meth:`ensure_native` succeeds,
+        ``bind_native`` replaces this method with ``lmcache.rbln_ops``.
 
         Args:
             paged_buffer_ptrs_tensor: Native per-layer HND KV tensors,
@@ -118,8 +146,7 @@ class RblnDeviceOps(DeviceOps):
         ):
             raise ValueError(
                 "RBLN block transfer requires tensor operands; the pointer "
-                "form is only produced for compiled backends, and the RBLN "
-                "token-major block transfer is torch-only."
+                "form is only produced for compiled backends."
             )
         if int(engine_kv_format) != int(_SUPPORTED_FORMAT):
             raise ValueError(
@@ -160,8 +187,6 @@ class RblnDeviceOps(DeviceOps):
             if is_d2h:
                 gather_blocks_to_chunk(paged_layers, blocks, chunk)
             else:
-                # The prefix skip is global across the transfer; translate it
-                # into this chunk's local block offset.
                 local_skip = min(len(blocks), max(0, skip_prefix_n_blocks - consumed))
                 scatter_chunk_to_blocks(
                     paged_layers, blocks, chunk, skip_prefix_n_blocks=local_skip
