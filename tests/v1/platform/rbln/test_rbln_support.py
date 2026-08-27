@@ -7,8 +7,8 @@ These tests cover the device-backend contract documented in
 - Registry discovery of :class:`~lmcache.v1.platform.rbln.RblnDeviceSpec`.
 - Availability probing, including the case where ``torch.rbln.is_available()``
   raises because every NPU is already claimed.
-- The engine-driven-only capability surface (no IPC handle transfer, no event
-  IPC backend, no cache context).
+- The capability surface: handle transfer gated off, host-synchronizing event
+  IPC backend, stubbed dma-buf IPC wrapper, no cache context.
 
 ``torch`` is replaced with a stub in ``sys.modules`` rather than importing
 ``torch_rbln``, so the suite runs on any platform.
@@ -28,6 +28,8 @@ from lmcache.v1.platform._device_detect import _detect_device, get_device_spec
 from lmcache.v1.platform.base.device_spec import DeviceSpec
 from lmcache.v1.platform.rbln import RblnDeviceSpec
 from lmcache.v1.platform.rbln.device_ops import RblnDeviceOps
+from lmcache.v1.platform.rbln.event_ipc import RblnEventIPCBackend
+from lmcache.v1.platform.rbln.ipc_wrapper import RblnIPCWrapper
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -143,11 +145,31 @@ def test_handle_transfer_is_unavailable() -> None:
     assert RblnDeviceSpec().is_handle_transfer_available() is False
 
 
-def test_no_ipc_wrapper_and_no_event_backend() -> None:
-    """Neither LMCache-driven building block is advertised."""
+def test_lmcache_driven_building_blocks_are_registered() -> None:
+    """Event backend and IPC wrapper are wired even while gated off."""
     spec = RblnDeviceSpec()
-    assert spec.ipc_wrapper_cls is None
-    assert spec.event_ipc_backend is None
+    assert spec.ipc_wrapper_cls is RblnIPCWrapper
+    assert isinstance(spec.event_ipc_backend, RblnEventIPCBackend)
+    assert spec.event_ipc_backend is spec.event_ipc_backend
+
+
+def test_ipc_wrapper_is_still_a_stub() -> None:
+    """dma-buf export/import is not implemented yet."""
+    with pytest.raises(NotImplementedError):
+        RblnIPCWrapper.wrap(SimpleNamespace())  # type: ignore[arg-type]
+
+
+def test_event_backend_host_syncs_on_export() -> None:
+    """``export_event`` waits on the host; imported events are complete."""
+    backend = RblnEventIPCBackend()
+    event = SimpleNamespace(synchronize=lambda: setattr(event, "synced", True))
+    assert backend.export_event(event, device=0) == b""
+    assert event.synced is True
+
+    imported = backend.import_event(b"", device=0)
+    assert backend.query_event(imported) is True
+    backend.wait_event(imported, stream=None)
+    backend.synchronize_event(imported, device=0)
 
 
 def test_create_cache_context_is_not_implemented() -> None:
