@@ -16,6 +16,11 @@ an IPC handle wrapper) cannot be supported.  The spec therefore reports
 requesting ``mp_transfer_mode=lmcache_driven`` fails fast with a clear
 error rather than crashing deeper in the transfer path.
 
+Host memory is the one capability the spec does add:
+:class:`~lmcache.v1.platform.rbln.pin_memory.RblnPinMemoryBackend` registers a
+host region with the runtime through ``torch.rbln.register_host_memory`` -- the
+RBLN counterpart of ``cudaHostRegister`` -- so copies into it reuse one pin.
+
 See ``docs/design/v1/platform/rbln/README.md`` for the full contract.
 """
 
@@ -31,6 +36,7 @@ from lmcache.v1.platform.base.device_spec import DeviceSpec
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.platform.base.device_ops import DeviceOps
+    from lmcache.v1.platform.base.pin_memory import PinMemoryBackend
 
 # ---------------------------------------------------------------------------
 # Device detection registry entry
@@ -77,6 +83,21 @@ class RblnDeviceSpec(DeviceSpec):
             return hasattr(torch, "rbln") and torch.rbln.is_available()
         except Exception:
             return False
+
+    @property
+    def pin_memory_backend(self) -> type[PinMemoryBackend] | None:
+        """Return the backend that pins host memory for RBLN DMA.
+
+        It registers the range through ``torch.rbln.register_host_memory``;
+        see :mod:`lmcache.v1.platform.rbln.pin_memory`.
+
+        Returns:
+            type[PinMemoryBackend]: :class:`RblnPinMemoryBackend`.
+        """
+        # First Party
+        from lmcache.v1.platform.rbln.pin_memory import RblnPinMemoryBackend
+
+        return RblnPinMemoryBackend
 
     def is_handle_transfer_available(self) -> bool:
         """Report that RBLN cannot ship KV tensors as IPC handles.
