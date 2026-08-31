@@ -15,17 +15,20 @@ chunk written from an RBLN cache is byte-compatible with every other device --
 the case that matters for cross-device KV sharing and PD disaggregation.
 
 For HND, what the override replaces is the shared path's strided device
-indexing: RBLN stores heads before block tokens, and the head<->token
-transpose is hoisted to the host. The MLA layout (``NL_X_NB_BS_HS``, single
-latent plane, no head axis) has no transpose to hoist; its RBLN sequence in
-:mod:`kv_ops` exists for the op ordering. The shared torch path stages through
-``torch.empty(device=...)`` + ``index_select(out=...)``, and on RBLN a raw
-``torch.empty`` on the device is a lazy SHM tensor -- ops against it run on
-the CPU-fallback path, never on the chip. The MLA sequence builds the gather
-functionally instead (``index_select`` + ``stack``, both device-native v2v
-kernels) and crosses the device boundary with one DMA per chunk.
+indexing: RBLN stores heads before block tokens, so ``lmcache.rbln_ops``
+gathers whole blocks device-to-device, swaps the head and token axes with one
+compiled device program, and copies each chunk's bytes straight into the chunk
+on a separate stream, pipelined against the next slice. The MLA layout
+(``NL_X_NB_BS_HS``, single latent plane, no head axis) has no transpose; its
+RBLN sequence in :mod:`kv_ops` exists for the op ordering. The shared torch
+path stages through ``torch.empty(device=...)`` + ``index_select(out=...)``,
+and on RBLN a raw ``torch.empty`` on the device is a lazy SHM tensor -- ops
+against it run on the CPU-fallback path, never on the chip. The MLA sequence
+builds the gather functionally instead (``index_select`` + ``stack``, both
+device-native v2v kernels) and crosses the device boundary with one DMA per
+chunk.
 
-Both layouts require the engine's KV caches to be real device tensors
+Both paths require the engine's KV caches to be real device tensors
 (vLLM-RBLN: ``VLLM_RBLN_USE_DEVICE_TENSOR=1``). With the default compile-mode
 allocation the per-layer tensors are ``meta`` and any transfer -- this
 module's or the shared path's -- dies at the first host copy with "Cannot
@@ -50,11 +53,15 @@ from lmcache.v1.platform.rbln.kv_layout import (
     validate_mla_layers,
 )
 from lmcache.v1.platform.rbln.kv_ops import (
-    gather_blocks_to_chunk_hnd,
     gather_blocks_to_chunk_mla,
-    scatter_chunk_to_blocks_hnd,
     scatter_chunk_to_blocks_mla,
 )
+
+try:
+    # First Party
+    from lmcache import rbln_ops
+except ImportError:  # built only with torch-rbln present (BUILD_WITH_RBLN)
+    rbln_ops = None
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
@@ -73,6 +80,10 @@ _MLA_FORMAT = lmcache_native.EngineKVFormat.NL_X_NB_BS_HS
 class RblnDeviceOps(DeviceOps):
     device_type: ClassVar[str] = "rbln"
 
+    def __init__(self) -> None:
+        """Create the RBLN ops backend."""
+        super().__init__()
+
     def multi_layer_block_kv_transfer(
         self,
         paged_buffer_ptrs_tensor: "torch.Tensor | list[torch.Tensor]",
@@ -85,14 +96,14 @@ class RblnDeviceOps(DeviceOps):
         engine_kv_format: lmcache_native.EngineKVFormat,
         skip_prefix_n_blocks: int,
     ) -> None:
-        """Move whole paged blocks between RBLN KV and token-major chunks.
+        """Move whole paged blocks between RBLN KV and staging chunks.
 
         Args:
             paged_buffer_ptrs_tensor: Native per-layer KV tensors --
                 ``[2, NB, NH, 1, BS, HS]`` (HND attention) or
                 ``[NB, BS, HS]`` (MLA).
-            lmcache_objects_ptrs: Staging chunks in the canonical token-major
-                layout -- ``[2, L, T, H*D]`` (HND) or ``[L, T, HS]`` (MLA).
+            lmcache_objects_ptrs: Staging chunks -- ``[2, L, T, H*D]`` (HND,
+                or ``[L, T, HS]`` (MLA).
             block_ids: Flat paged-block IDs in chunk-token order.
             device: Device the transfer runs on. Unused; taken from the
                 tensors.
@@ -164,6 +175,26 @@ class RblnDeviceOps(DeviceOps):
         if not is_d2h and int(direction) != int(lmcache_native.TransferDirection.H2D):
             raise ValueError(f"Unsupported transfer direction: {direction!r}")
 
+        if not is_mla:
+            if rbln_ops is None:
+                raise RuntimeError(
+                    "lmcache.rbln_ops is not built; install LMCache with torch-rbln "
+                    "present (BUILD_WITH_RBLN=1)"
+                )
+            if is_d2h:
+                rbln_ops.gather_blocks_to_chunks_hnd(
+                    paged_layers, flat_blocks, chunks, blocks_per_chunk
+                )
+            else:
+                rbln_ops.scatter_chunks_to_blocks_hnd(
+                    paged_layers,
+                    flat_blocks,
+                    chunks,
+                    blocks_per_chunk,
+                    skip_prefix_n_blocks,
+                )
+            return
+
         consumed = 0
         for chunk_idx, chunk in enumerate(chunks):
             blocks = flat_blocks[
@@ -172,20 +203,12 @@ class RblnDeviceOps(DeviceOps):
             if not blocks:
                 break
             if is_d2h:
-                if is_mla:
-                    gather_blocks_to_chunk_mla(paged_layers, blocks, chunk)
-                else:
-                    gather_blocks_to_chunk_hnd(paged_layers, blocks, chunk)
+                gather_blocks_to_chunk_mla(paged_layers, blocks, chunk)
             else:
                 # The prefix skip is global across the transfer; translate it
                 # into this chunk's local block offset.
                 local_skip = min(len(blocks), max(0, skip_prefix_n_blocks - consumed))
-                if is_mla:
-                    scatter_chunk_to_blocks_mla(
-                        paged_layers, blocks, chunk, skip_prefix_n_blocks=local_skip
-                    )
-                else:
-                    scatter_chunk_to_blocks_hnd(
-                        paged_layers, blocks, chunk, skip_prefix_n_blocks=local_skip
-                    )
+                scatter_chunk_to_blocks_mla(
+                    paged_layers, blocks, chunk, skip_prefix_n_blocks=local_skip
+                )
             consumed += len(blocks)

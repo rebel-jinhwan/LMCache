@@ -5,19 +5,17 @@
 sequence RBLN is tuned for, **not** for the chunk layout: chunks stay in
 LMCache's canonical token-major ``[2, L, T, H*D]``.
 
-The load-bearing test is :func:`test_chunk_matches_the_canonical_torch_path`:
-a round trip alone passes under any self-consistent layout, because the same
-code writes and reads the chunk. Only byte equality against the shared torch
-path proves an RBLN chunk is interchangeable with one written by another
-device -- the property cross-device sharing and PD disaggregation rely on.
-
-No RBLN hardware is needed: the kernels are torch-only, so CPU tensors are
-enough to pin the layout contract. That is also the limit of what these cover
--- the device dispatch and the transfer cost are not exercised here.
+For HND, the validation that ``multi_layer_block_kv_transfer`` runs before
+dispatching to ``lmcache.rbln_ops`` (format, operand kind, chunk-size
+divisibility) is covered here on CPU tensors; ``lmcache.rbln_ops`` itself
+takes only RBLN tensors now, so the layout it produces and its byte-equality
+with the shared torch path are covered by ``bench_kv_transfer_mp.py
+--verify`` on an NPU instead.
 
 The MLA tests pin the same properties for the ``NL_X_NB_BS_HS`` layout
 (``[NB, BS, HS]``, single latent plane), which ``RblnDeviceOps`` validates and
-routes to the shared torch path.
+routes to the shared torch path -- no native extension is involved, so these
+still run on CPU tensors end to end.
 """
 
 # Third Party
@@ -27,7 +25,6 @@ import torch
 # First Party
 from lmcache.v1.platform.ops_types import PageBufferShapeDesc
 from lmcache.v1.platform.rbln.device_ops import RblnDeviceOps
-from lmcache.v1.platform.rbln.kv_layout import squeeze_singleton_axis
 from lmcache.v1.platform.torch_ops import multi_layer_block_kv_transfer
 import lmcache.lmcache_native as lmcache_native
 
@@ -92,110 +89,6 @@ def _transfer(
         engine_kv_format,
         skip_prefix_n_blocks,
     )
-
-
-# ---------------------------------------------------------------------------
-# Layout
-# ---------------------------------------------------------------------------
-
-
-def test_chunk_is_canonical_token_major() -> None:
-    """Each chunk row is one token's heads laid end to end."""
-    layers = _paged_layers()
-    chunks = _chunks()
-    _transfer(layers, chunks, TransferDirection.D2H)
-
-    assert all(
-        torch.equal(
-            chunks[0][kv, li, ti],
-            layers[li][kv, ti // BLOCK_SIZE, :, 0, ti % BLOCK_SIZE, :].reshape(
-                NUM_HEADS * HEAD_SIZE
-            ),
-        )
-        for kv in (0, 1)
-        for li in range(NUM_LAYERS)
-        for ti in range(CHUNK_TOKENS)
-    )
-
-
-def test_chunk_matches_the_canonical_torch_path() -> None:
-    """RBLN chunks are byte-identical to the shared torch HND path's.
-
-    The RBLN layout is the 5-D HND format plus a singleton axis, so the shared
-    path fed the squeezed tensors must produce exactly the same bytes. This is
-    what makes a chunk written on RBLN readable by another device.
-    """
-    layers = _paged_layers()
-    ours = _chunks()
-    theirs = _chunks()
-
-    _transfer(layers, ours, TransferDirection.D2H)
-    multi_layer_block_kv_transfer(
-        squeeze_singleton_axis(layers),
-        theirs,
-        list(range(NUM_BLOCKS)),
-        torch.device("cpu"),
-        TransferDirection.D2H,
-        _shape_desc(),
-        CHUNK_TOKENS,
-        EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
-        0,
-    )
-
-    for got, expected in zip(ours, theirs, strict=True):
-        assert torch.equal(got, expected)
-
-
-def test_round_trip_restores_the_paged_cache() -> None:
-    """Gather then scatter reproduces the source exactly."""
-    src = _paged_layers()
-    dst = _paged_layers(fill_random=False)
-    chunks = _chunks()
-    _transfer(src, chunks, TransferDirection.D2H)
-    _transfer(dst, chunks, TransferDirection.H2D)
-    for got, expected in zip(dst, src, strict=True):
-        assert torch.equal(got, expected)
-
-
-def test_prefix_skip_leaves_leading_blocks_untouched() -> None:
-    """A whole-block prefix skip is neither read nor written."""
-    src = _paged_layers()
-    dst = _paged_layers(fill_random=False)
-    chunks = _chunks()
-    _transfer(src, chunks, TransferDirection.D2H)
-    _transfer(dst, chunks, TransferDirection.H2D, skip_prefix_n_blocks=1)
-
-    for got, expected in zip(dst, src, strict=True):
-        assert torch.count_nonzero(got[:, 0]) == 0
-        assert torch.equal(got[:, 1:], expected[:, 1:])
-
-
-def test_trailing_partial_chunk_is_handled() -> None:
-    """A chunk holding fewer blocks than it is sized for round-trips."""
-    src = _paged_layers()
-    dst = _paged_layers(fill_random=False)
-    chunks = _chunks()
-    partial = NUM_BLOCKS - 1
-
-    for direction, layers in (
-        (TransferDirection.D2H, src),
-        (TransferDirection.H2D, dst),
-    ):
-        RblnDeviceOps().multi_layer_block_kv_transfer(
-            layers,
-            chunks,
-            list(range(partial)),
-            torch.device("cpu"),
-            direction,
-            _shape_desc(),
-            CHUNK_TOKENS,
-            EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
-            0,
-        )
-
-    for got, expected in zip(dst, src, strict=True):
-        assert torch.equal(got[:, :partial], expected[:, :partial])
-        assert torch.count_nonzero(got[:, partial:]) == 0
 
 
 # ---------------------------------------------------------------------------
