@@ -143,3 +143,101 @@ Both layouts require the engine's KV caches to be real device tensors
 allocation the per-layer tensors are `meta`, and any transfer -- this
 backend's or the shared path's -- dies at the first host copy with "Cannot
 copy out of meta tensor".
+
+## Token-major transfer
+
+The ceiling is descriptors, not bandwidth: a host-DMA descriptor costs ~17 us on
+CR13, a single contiguous D2H runs at 58 GB/s, and a block striped over 4
+chiplets is 4+ descriptors per (block, layer, kv). The transfer lives in the
+native extension `lmcache.rbln_ops` (`csrc/rbln/kv_transfer.cpp`, built by the
+`rbln` profile when torch-rbln is installed):
+
+1. D2D gather of whole blocks into `[S, 2, L, R, H, BS, D]` device staging
+   (command-stream copies, ~240 GB/s);
+2. the head<->token swap as a plain `copy_` from a permuted view -- torch-rbln
+   runs a large permuted device copy as a compiled program (~0.4 ms per 117 MB
+   against ~90 ms for the strided walk);
+3. D2H of each chunk's bytes straight into the (pinned) chunk on a dedicated
+   stream, one descriptor per whole chunk.
+
+Two slots alternate; per-unit events order swap -> copy and copy -> slot reuse
+(a blanket "wait for the copy stream" would make the swap wait for the *next*
+unit's copy and serialise the pipeline); scatter is the mirror with the next
+H2D prefetched. The overlap
+comes from rebel-compiler's transfer context (a second UMD context for async
+host copies -- the device runs one context's jobs in order) and its range-aware
+sync-copy waits; see `rebel/src/runtime/vmemory/README.md`. `kv_ops.py` keeps
+only the MLA sequence.
+
+The extension uses ATen only -- it does not link torch-rbln, which supplies the
+RBLN implementations of these copies at runtime. Two runtime facts shaped the
+pipeline and cost a day to find, both about *binding*: a compiled program binds
+its operands once, and rebinding a 117 MB buffer costs ~2 ms, so a program is
+kept per source buffer (torch-rbln does this for the `copy_` fast path) rather
+than one program fed alternating buffers.
+
+In-worker e2e, verified (pinned chunks):
+
+| gather / scatter | upstream | pipelined (native) |
+|---|---|---|
+| Qwen3-1.7B, 1 block (117 MB) | 21.7 / 20.0 ms | **4.51 / 3.14 ms** |
+| Qwen3-1.7B, 8 blocks (940 MB) | 173 / 160 ms | **20.1 (46.8 GB/s) / 25.1 ms** |
+| MiniMax-M2.5 geometry, 1 block (260 MB) | 37.5 / 36.0 ms | **7.02 / 8.57 ms** |
+| MiniMax-M2.5 geometry, 8 blocks (2.08 GB) | 300 / 273 ms | **42.8 (48.6 GB/s) / 57.3 ms** |
+
+What each mechanism is worth, A/B on the 940 MB gather / scatter: the transfer
+context 20.1 -> 25.5 ms on gather and nothing on scatter; the copy stream and
+its second staging slot 25.1 -> 42.5 ms on scatter (a correctly fenced single
+slot is not slower, but the slot is what makes the overlap safe). Splitting a
+single-batch transfer along the layer axis was removed: +0.71 ms gather,
+-0.86 ms scatter.
+
+`bench_kv_transfer_mp.py --trace-legs` synchronizes after every leg and hides
+the overlap; use it for leg costs only.
+
+## One chunk layout
+
+HND chunks are always token-major (`[2, L, T, H*D]`), byte-compatible with
+every other device. Earlier iterations carried a head-major
+(`LMCACHE_RBLN_SAVE_HEAD_MAJOR`) and a chiplet-major (`LMCACHE_RBLN_CHUNK_LAYOUT`)
+layout to avoid the head<->token transpose; once the transpose ran on the
+device and the copies pipelined, token-major was as fast or faster
+(chiplet-major: 43 ms per 940 MB against 20 ms now), so both layouts, the host
+staging buffers and the per-chunk `_hnd` kernels were removed. MLA chunks have
+no head axis and take the shared per-chunk path.
+
+## Host memory: register through torch-rbln
+
+`PinMemoryBackend` is written around `cudaHostRegister`: hand an existing host
+address to the runtime and it records the region as DMA-able. RBLN has the
+same thing since UMD 3.5 (`rblnRegisterHostMemory`), surfaced by rebel-compiler
+as `rbln_host_register` and by torch-rbln >= 0.4.1 as
+`torch.rbln.register_host_memory(address, nbytes)` / `unregister_host_memory`.
+`RblnPinMemoryBackend` is a thin adapter over that pair.
+
+What registration buys: the pages are pinned once, and every later host<->device
+copy whose page-aligned operand lies inside the range is recorded against the
+buffer's device VA, so the kernel reuses that pin instead of pinning the pages on
+each command buffer. Measured on CR13, a D2H into a registered buffer runs at
+36.6 GB/s against 13.8 GB/s into pageable memory. The mp SHM pool -- created by
+the LMCache server, mapped by the worker -- is exactly the "memory another
+process owns" case `cudaHostRegister` exists for, which is why the call sites
+are the ones upstream already has: `EngineDrivenContextShm` on the worker's
+mapping right after it opens the pool, and `torch_ops.alloc_shm_pinned_ptr` on
+the server's when it creates it.
+
+Bounds worth stating:
+
+- **Unaligned operands do not take the device-VA path.** The pin itself does
+  not need alignment, but the DMA engine wants 4 KiB-aligned operands; the
+  runtime keeps an unaligned copy on its bounce path. The pool is page-aligned
+  by construction (`mmap` base, 4 KiB `AddressManager` slots).
+- **Unregister only after the copies are done**, as with `cudaHostUnregister`.
+  The runtime drains the device's pending transfers before unpinning; a copy
+  issued from another thread afterwards is the caller's to order.
+- **No pretend pin.** The backend calls `torch.rbln.register_host_memory`
+  directly and assumes it exists (torch-rbln >= 0.4.1); a refused registration
+  (overlap, a UMD without `rblnRegisterHostMemory`) reports False and the caller
+  keeps the per-copy pin path. A weaker fallback (populating the mapping with
+  `madvise`) was tried and dropped: it hides the real answer and buys little
+  once the copy is pinned per command buffer anyway.
