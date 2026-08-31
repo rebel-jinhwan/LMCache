@@ -121,10 +121,10 @@ void check_chunks(const std::vector<at::Tensor>& chunks, int64_t bpc,
 
 }  // namespace
 
-void gather_blocks_to_chunks_token_major(const std::vector<at::Tensor>& layers,
-                                         const std::vector<int64_t>& block_ids,
-                                         const std::vector<at::Tensor>& chunks,
-                                         int64_t bpc) {
+void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
+                                 const std::vector<int64_t>& block_ids,
+                                 const std::vector<at::Tensor>& chunks,
+                                 int64_t bpc) {
   const int64_t n = static_cast<int64_t>(block_ids.size());
   if (n == 0) return;
   const Geometry g = geometry(layers);
@@ -166,11 +166,10 @@ void gather_blocks_to_chunks_token_major(const std::vector<at::Tensor>& layers,
   guard_impl.synchronizeStream(copy);
 }
 
-void scatter_chunks_to_blocks_token_major(const std::vector<at::Tensor>& layers,
-                                          const std::vector<int64_t>& block_ids,
-                                          const std::vector<at::Tensor>& chunks,
-                                          int64_t bpc,
-                                          int64_t skip_prefix_n_blocks) {
+void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
+                                  const std::vector<int64_t>& block_ids,
+                                  const std::vector<at::Tensor>& chunks,
+                                  int64_t bpc, int64_t skip_prefix_n_blocks) {
   const int64_t n = static_cast<int64_t>(block_ids.size());
   const int64_t start = std::min(std::max<int64_t>(skip_prefix_n_blocks, 0), n);
   if (start >= n) return;

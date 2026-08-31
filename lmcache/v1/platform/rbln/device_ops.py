@@ -182,11 +182,11 @@ class RblnDeviceOps(DeviceOps):
                     "present (BUILD_WITH_RBLN=1)"
                 )
             if is_d2h:
-                rbln_ops.gather_blocks_to_chunks_token_major(
+                rbln_ops.gather_blocks_to_chunks_hnd(
                     paged_layers, flat_blocks, chunks, blocks_per_chunk
                 )
             else:
-                rbln_ops.scatter_chunks_to_blocks_token_major(
+                rbln_ops.scatter_chunks_to_blocks_hnd(
                     paged_layers,
                     flat_blocks,
                     chunks,

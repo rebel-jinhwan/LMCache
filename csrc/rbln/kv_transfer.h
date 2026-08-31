@@ -12,17 +12,17 @@ namespace lmcache::rbln {
 // into device staging, head<->token swap on the device, D2H of each chunk's
 // bytes on a copy stream, pipelined over two staging slots (one block per
 // pipeline step). `layers` are per-layer HND tensors [2, NB, NH, BS, HS].
-void gather_blocks_to_chunks_token_major(const std::vector<at::Tensor>& layers,
-                                         const std::vector<int64_t>& block_ids,
-                                         const std::vector<at::Tensor>& chunks,
-                                         int64_t blocks_per_chunk);
+void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
+                                 const std::vector<int64_t>& block_ids,
+                                 const std::vector<at::Tensor>& chunks,
+                                 int64_t blocks_per_chunk);
 
 // Mirror of the gather; `skip_prefix_n_blocks` leading blocks are left
 // untouched.
-void scatter_chunks_to_blocks_token_major(const std::vector<at::Tensor>& layers,
-                                          const std::vector<int64_t>& block_ids,
-                                          const std::vector<at::Tensor>& chunks,
-                                          int64_t blocks_per_chunk,
-                                          int64_t skip_prefix_n_blocks);
+void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
+                                  const std::vector<int64_t>& block_ids,
+                                  const std::vector<at::Tensor>& chunks,
+                                  int64_t blocks_per_chunk,
+                                  int64_t skip_prefix_n_blocks);
 
 }  // namespace lmcache::rbln
