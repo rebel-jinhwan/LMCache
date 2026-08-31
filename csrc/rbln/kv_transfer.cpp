@@ -19,8 +19,6 @@ struct Unit {
   int64_t first, count;
 };
 
-bool is_rbln(const at::Device& d) { return d.is_privateuseone(); }
-
 // Batches of `blocks_per_slice` blocks over the positions [start, n).
 std::vector<Unit> pipeline_units(int64_t start, int64_t n,
                                  int64_t blocks_per_slice) {
@@ -53,18 +51,14 @@ at::Tensor staging(int64_t min_lead, at::IntArrayRef per_block,
 }
 
 // The host copies run on their own stream so they overlap the next unit's
-// gather and swap, and events order the two streams. Both are torch's; the only
-// thing that needs a branch is that a CPU tensor has no events (the tests run
-// this same code on CPU, where the copies are blocking and there is nothing to
-// order).
+// gather and swap, and events order the two streams.
 //
 // The waits are per unit, never "everything queued on the copy stream": the
 // pipeline issues the next unit's host copy before the current unit's swap, so
 // a blanket wait would serialise them.
 using Fence = std::optional<c10::Event>;
 
-Fence record(const c10::Stream& stream, bool on_device) {
-  if (!on_device) return std::nullopt;
+Fence record(const c10::Stream& stream) {
   Fence fence(std::in_place, stream.device_type());
   fence->record(stream);
   return fence;
@@ -74,13 +68,8 @@ void wait(Fence& fence, const c10::Stream& stream) {
   if (fence.has_value()) fence->block(stream);
 }
 
-void copy_pairs(const c10::Stream& stream, bool on_device,
-                const std::vector<at::Tensor>& dsts,
+void copy_pairs(const c10::Stream& stream, const std::vector<at::Tensor>& dsts,
                 const std::vector<at::Tensor>& srcs) {
-  if (!on_device) {
-    at::_foreach_copy_(dsts, srcs, /*non_blocking=*/false);
-    return;
-  }
   c10::StreamGuard guard(stream);
   at::_foreach_copy_(dsts, srcs, /*non_blocking=*/true);
 }
@@ -181,10 +170,9 @@ void gather_blocks_to_chunks_token_major(const std::vector<at::Tensor>& layers,
                                        g.head_size};
   const std::vector<int64_t> per_block_out{2, g.layers, g.block_size, g.heads,
                                            g.head_size};
-  const bool on_device = is_rbln(g.device);
   c10::impl::VirtualGuardImpl guard_impl(g.device.type());
   const c10::Stream main = guard_impl.getStream(g.device);
-  const c10::Stream copy = on_device ? guard_impl.getNewStream(g.device) : main;
+  const c10::Stream copy = guard_impl.getNewStream(g.device);
   std::vector<Fence> d2h_done(units.size());
   for (size_t u = 0; u < units.size(); ++u) {
     const Unit& unit = units[u];
@@ -210,12 +198,12 @@ void gather_blocks_to_chunks_token_major(const std::vector<at::Tensor>& layers,
     std::vector<at::Tensor> regions, pieces;
     chunk_copy_lists(chunks, token_major, unit, bpc, g.block_size, regions,
                      pieces);
-    Fence swapped = record(main, on_device);
+    Fence swapped = record(main);
     wait(swapped, copy);
-    copy_pairs(copy, on_device, regions, pieces);
-    d2h_done[u] = record(copy, on_device);
+    copy_pairs(copy, regions, pieces);
+    d2h_done[u] = record(copy);
   }
-  if (on_device) guard_impl.synchronizeStream(copy);
+  guard_impl.synchronizeStream(copy);
 }
 
 void scatter_chunks_to_blocks_token_major(const std::vector<at::Tensor>& layers,
@@ -234,10 +222,9 @@ void scatter_chunks_to_blocks_token_major(const std::vector<at::Tensor>& layers,
                                           g.head_size};
   const std::vector<int64_t> per_block_out{2, g.layers, g.heads, g.block_size,
                                            g.head_size};
-  const bool on_device = is_rbln(g.device);
   c10::impl::VirtualGuardImpl guard_impl(g.device.type());
   const c10::Stream main = guard_impl.getStream(g.device);
-  const c10::Stream copy = on_device ? guard_impl.getNewStream(g.device) : main;
+  const c10::Stream copy = guard_impl.getNewStream(g.device);
 
   auto landing = [&](size_t u) {
     return staging(units[u].count, per_block_in, g.dtype, g.device,
@@ -251,8 +238,8 @@ void scatter_chunks_to_blocks_token_major(const std::vector<at::Tensor>& layers,
     std::vector<at::Tensor> regions, pieces;
     chunk_copy_lists(chunks, token_major, units[u], bpc, g.block_size, regions,
                      pieces);
-    copy_pairs(copy, on_device, pieces, regions);
-    h2d_done[u] = record(copy, on_device);
+    copy_pairs(copy, pieces, regions);
+    h2d_done[u] = record(copy);
   };
 
   if (!units.empty()) issue_copy(0);
@@ -272,13 +259,13 @@ void scatter_chunks_to_blocks_token_major(const std::vector<at::Tensor>& layers,
     out.view({rows, g.heads, g.block_size, g.head_size})
         .copy_(in.view({rows, g.block_size, g.heads, g.head_size})
                    .permute({0, 2, 1, 3}));
-    swapped[u] = record(main, on_device);
+    swapped[u] = record(main);
 
     std::vector<at::Tensor> slots, blocks;
     block_copy_lists(layers, block_ids, out, units[u], slots, blocks);
     at::_foreach_copy_(blocks, slots, false);
   }
-  if (on_device) guard_impl.synchronizeStream(copy);
+  guard_impl.synchronizeStream(copy);
 }
 
 }  // namespace lmcache::rbln
