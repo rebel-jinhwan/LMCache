@@ -157,7 +157,10 @@ def test_create_cache_context_is_not_implemented() -> None:
         spec.create_cache_context()
 
 
-def test_pin_memory_falls_back_to_the_default_backend() -> None:
-    """No RBLN pin-memory backend is registered, so the default applies."""
+def test_pin_memory_uses_the_rbln_backend() -> None:
+    """Host pinning is routed to the torch-rbln registration backend."""
+    # First Party
+    from lmcache.v1.platform.rbln.pin_memory import RblnPinMemoryBackend
+
     spec: Any = RblnDeviceSpec()
-    assert spec.pin_memory_backend is None
+    assert spec.pin_memory_backend is RblnPinMemoryBackend
