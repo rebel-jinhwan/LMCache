@@ -13,6 +13,17 @@ Block transfer is overridden for the op sequence, not for the layout. Chunks
 keep LMCache's canonical token-major wire layout (``[2, L, T, H*D]``), so a
 chunk written from an RBLN cache is byte-compatible with every other device --
 the case that matters for cross-device KV sharing and PD disaggregation.
+
+What the override replaces is the shared path's strided device indexing: RBLN
+stores heads before block tokens, so ``lmcache.rbln_ops`` gathers whole blocks
+device-to-device, swaps the head and token axes with one compiled device
+program, and copies each chunk's bytes straight into the chunk on a separate
+stream, pipelined against the next slice.
+
+This path requires the engine's KV caches to be real device tensors
+(vLLM-RBLN: ``VLLM_RBLN_USE_DEVICE_TENSOR=1``). With the default compile-mode
+allocation the per-layer tensors are ``meta`` and the transfer dies at the
+first host copy with "Cannot copy out of meta tensor".
 """
 
 # Future
@@ -29,10 +40,12 @@ from lmcache.logging import init_logger
 from lmcache.v1.platform.base.device_ops import DeviceOps
 from lmcache.v1.platform.ops_types import PageBufferShapeDesc
 from lmcache.v1.platform.rbln.kv_layout import squeeze_singleton_axis
-from lmcache.v1.platform.rbln.kv_ops import (
-    gather_blocks_to_chunk,
-    scatter_chunk_to_blocks,
-)
+
+try:
+    # First Party
+    from lmcache import rbln_ops  # type: ignore[attr-defined]
+except ImportError:  # built only with torch-rbln present (BUILD_WITH_RBLN)
+    rbln_ops = None
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
@@ -57,7 +70,7 @@ class RblnDeviceOps(DeviceOps):
         engine_kv_format: lmcache_native.EngineKVFormat,
         skip_prefix_n_blocks: int,
     ) -> None:
-        """Move whole paged blocks between RBLN KV and token-major chunks.
+        """Move whole paged blocks between RBLN KV and staging chunks.
 
         Args:
             paged_buffer_ptrs_tensor: Native per-layer HND KV tensors,
@@ -78,6 +91,7 @@ class RblnDeviceOps(DeviceOps):
                 not the validated HND layout, a paged tensor is not in the
                 native ``[2, NB, NH, 1, BS, HS]`` shape, or the direction is
                 unknown.
+            RuntimeError: If ``lmcache.rbln_ops`` was not built.
         """
         del device  # taken from the operands
         if isinstance(paged_buffer_ptrs_tensor, torch.Tensor) or not all(
@@ -117,20 +131,20 @@ class RblnDeviceOps(DeviceOps):
         if not is_d2h and int(direction) != int(lmcache_native.TransferDirection.H2D):
             raise ValueError(f"Unsupported transfer direction: {direction!r}")
 
-        consumed = 0
-        for chunk_idx, chunk in enumerate(chunks):
-            blocks = flat_blocks[
-                chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
-            ]
-            if not blocks:
-                break
-            if is_d2h:
-                gather_blocks_to_chunk(paged_layers, blocks, chunk)
-            else:
-                # The prefix skip is global across the transfer; translate it
-                # into this chunk's local block offset.
-                local_skip = min(len(blocks), max(0, skip_prefix_n_blocks - consumed))
-                scatter_chunk_to_blocks(
-                    paged_layers, blocks, chunk, skip_prefix_n_blocks=local_skip
-                )
-            consumed += len(blocks)
+        if rbln_ops is None:
+            raise RuntimeError(
+                "lmcache.rbln_ops is not built; install LMCache with torch-rbln "
+                "present (BUILD_WITH_RBLN=1)"
+            )
+        if is_d2h:
+            rbln_ops.gather_blocks_to_chunks_hnd(
+                paged_layers, flat_blocks, chunks, blocks_per_chunk
+            )
+        else:
+            rbln_ops.scatter_chunks_to_blocks_hnd(
+                paged_layers,
+                flat_blocks,
+                chunks,
+                blocks_per_chunk,
+                skip_prefix_n_blocks,
+            )
