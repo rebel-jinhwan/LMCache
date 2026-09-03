@@ -126,12 +126,7 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
     std::vector<at::Tensor> regions, pieces;
     chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, regions,
                      pieces);
-    // Blocking: a non-blocking dispatch can land on a different UMD context
-    // than the next block's swap (the runtime may route async host copies
-    // there once it can), and different contexts run concurrently -- nothing
-    // here would then order that copy's read of `out` before the next
-    // iteration's write to it.
-    at::_foreach_copy_(regions, pieces, /*non_blocking=*/false);
+    at::_foreach_copy_(regions, pieces);
   }
 }
 
@@ -157,11 +152,7 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
     std::vector<at::Tensor> regions, pieces;
     chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, regions,
                      pieces);
-    // Blocking, for the same reason as the gather's D2H: the swap below
-    // reads `in` right after, and a non-blocking dispatch gives no guarantee
-    // this write to it has actually landed first if the two ran on
-    // different UMD contexts.
-    at::_foreach_copy_(pieces, regions, /*non_blocking=*/false);
+    at::_foreach_copy_(pieces, regions);
 
     out.view({rows, g.heads, g.block_size, g.head_size})
         .copy_(in.view({rows, g.block_size, g.heads, g.head_size})
