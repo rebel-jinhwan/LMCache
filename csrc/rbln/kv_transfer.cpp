@@ -1,33 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "kv_transfer.h"
 
+#include <c10/core/Event.h>
+#include <c10/core/StreamGuard.h>
+#include <c10/core/impl/VirtualGuardImpl.h>
+
 #include <algorithm>
-#include <array>
-#include <vector>
+#include <map>
+#include <optional>
+#include <tuple>
 
 namespace lmcache::rbln {
 namespace {
 
-// Staging buffers: one per thread per kind. kind 0/1 are gather's landing
-// buffer and swap output, kind 2/3 the same for scatter -- gather and
-// scatter never share a slot, even though one's landing shape is the
-// other's swap-output shape, so alternating directions (as a gather/scatter
-// round trip does) can't fight over one slot. Reused across calls rather
-// than freshly allocated: torch-rbln's compiled permute keys its device
-// program on the buffer's address and rebinding a new one costs
-// milliseconds, so a call that always got a fresh address would rebind
-// every time instead of every geometry change. A model's geometry is fixed
-// after load, so one buffer per kind is enough -- it is simply reallocated
-// on the rare call whose shape doesn't match.
+// Staging buffers: per thread, per (shape, dtype, device, slot, kind). Two
+// slots alternate per direction; kind 0 is the landing buffer, kind 1 is the
+// buffer the swap writes into.
 at::Tensor staging(at::IntArrayRef shape, at::ScalarType dtype,
-                   const at::Device& device, int kind) {
-  thread_local std::array<at::Tensor, 4> buffers;
-  at::Tensor& buf = buffers[kind];
-  if (!buf.defined() || buf.sizes() != shape || buf.scalar_type() != dtype ||
-      buf.device() != device) {
-    buf = at::empty(shape, at::TensorOptions().dtype(dtype).device(device));
+                   const at::Device& device, int slot, int kind) {
+  using Key =
+      std::tuple<std::vector<int64_t>, at::ScalarType, std::string, int, int>;
+  thread_local std::map<Key, at::Tensor> buffers;
+  Key key{shape.vec(), dtype, device.str(), slot, kind};
+  auto it = buffers.find(key);
+  if (it == buffers.end()) {
+    at::Tensor buf =
+        at::empty(shape, at::TensorOptions().dtype(dtype).device(device));
+    it = buffers.emplace(key, buf).first;
   }
-  return buf;
+  return it->second;
+}
+
+// The host copies run on their own stream so they overlap the next block's
+// gather and swap, and events order the two streams.
+//
+// The waits are per block, never "everything queued on the copy stream": the
+// pipeline issues the next block's host copy before the current block's swap,
+// so a blanket wait would serialise them.
+using Fence = std::optional<c10::Event>;
+
+Fence record(const c10::Stream& stream) {
+  Fence fence(std::in_place, stream.device_type());
+  fence->record(stream);
+  return fence;
+}
+
+void wait(Fence& fence, const c10::Stream& stream) {
+  if (fence.has_value()) fence->block(stream);
 }
 
 struct Geometry {
@@ -109,13 +128,20 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
   const std::vector<int64_t> out_shape{2, g.layers, g.block_size, g.heads,
                                        g.head_size};
   const int64_t rows = 2 * g.layers;
-  at::Tensor in = staging(in_shape, g.dtype, g.device, /*kind=*/0);
-  at::Tensor out = staging(out_shape, g.dtype, g.device, /*kind=*/1);
+  c10::impl::VirtualGuardImpl guard_impl(g.device.type());
+  const c10::Stream main = guard_impl.getStream(g.device);
+  const c10::Stream copy = guard_impl.getNewStream(g.device);
+  std::vector<Fence> d2h_done(n);
   for (int64_t u = 0; u < n; ++u) {
+    const int slot = static_cast<int>(u % 2);
+    at::Tensor in = staging(in_shape, g.dtype, g.device, slot, /*kind=*/0);
     std::vector<at::Tensor> slots, blocks;
     block_copy_lists(layers, block_ids[u], in, slots, blocks);
     at::_foreach_copy_(slots, blocks, false);
 
+    at::Tensor out = staging(out_shape, g.dtype, g.device, slot, /*kind=*/1);
+    // That block's D2H read the output slot this swap is about to overwrite.
+    if (u >= 2) wait(d2h_done[u - 2], main);
     // A permuted device copy: torch-rbln runs it as a compiled program.
     out.view({rows, g.block_size, g.heads, g.head_size})
         .copy_(in.view({rows, g.heads, g.block_size, g.head_size})
@@ -126,8 +152,15 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
     std::vector<at::Tensor> regions, pieces;
     chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, regions,
                      pieces);
-    at::_foreach_copy_(regions, pieces);
+    Fence swapped = record(main);
+    wait(swapped, copy);
+    {
+      c10::StreamGuard guard(copy);
+      at::_foreach_copy_(regions, pieces, /*non_blocking=*/true);
+    }
+    d2h_done[u] = record(copy);
   }
+  guard_impl.synchronizeStream(copy);
 }
 
 void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
@@ -144,24 +177,52 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
   const std::vector<int64_t> out_shape{2, g.layers, g.heads, g.block_size,
                                        g.head_size};
   const int64_t rows = 2 * g.layers;
-  at::Tensor in = staging(in_shape, g.dtype, g.device, /*kind=*/2);
-  at::Tensor out = staging(out_shape, g.dtype, g.device, /*kind=*/3);
-  for (int64_t u = start; u < n; ++u) {
+  c10::impl::VirtualGuardImpl guard_impl(g.device.type());
+  const c10::Stream main = guard_impl.getStream(g.device);
+  const c10::Stream copy = guard_impl.getNewStream(g.device);
+  const int64_t m = n - start;  // blocks in this transfer
+
+  auto landing = [&](int64_t u) {
+    return staging(in_shape, g.dtype, g.device, static_cast<int>(u % 2),
+                   /*kind=*/0);
+  };
+  std::vector<Fence> h2d_done(m), swapped(m);
+  auto issue_copy = [&](int64_t u) {
+    at::Tensor in = landing(u);
     at::Tensor token_major =
         in.view({2, g.layers, g.block_size, g.heads * g.head_size});
     std::vector<at::Tensor> regions, pieces;
-    chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, regions,
+    chunk_copy_lists(chunks, token_major, start + u, bpc, g.block_size, regions,
                      pieces);
-    at::_foreach_copy_(pieces, regions);
+    {
+      c10::StreamGuard guard(copy);
+      at::_foreach_copy_(pieces, regions, /*non_blocking=*/true);
+    }
+    h2d_done[u] = record(copy);
+  };
 
+  if (m > 0) issue_copy(0);
+  for (int64_t u = 0; u < m; ++u) {
+    if (u + 1 < m) {
+      // That H2D overwrites the landing slot the swap two blocks back read.
+      if (u >= 1) wait(swapped[u - 1], copy);
+      issue_copy(u + 1);
+    }
+    at::Tensor in = landing(u);
+    const int slot = static_cast<int>(u % 2);
+    at::Tensor out = staging(out_shape, g.dtype, g.device, slot, /*kind=*/1);
+    // This block's H2D, not the ones issued after it.
+    wait(h2d_done[u], main);
     out.view({rows, g.heads, g.block_size, g.head_size})
         .copy_(in.view({rows, g.block_size, g.heads, g.head_size})
                    .permute({0, 2, 1, 3}));
+    swapped[u] = record(main);
 
     std::vector<at::Tensor> slots, blocks;
-    block_copy_lists(layers, block_ids[u], out, slots, blocks);
+    block_copy_lists(layers, block_ids[start + u], out, slots, blocks);
     at::_foreach_copy_(blocks, slots, false);
   }
+  guard_impl.synchronizeStream(copy);
 }
 
 }  // namespace lmcache::rbln

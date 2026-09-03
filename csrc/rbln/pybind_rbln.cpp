@@ -4,7 +4,8 @@
 #include "kv_transfer.h"
 
 PYBIND11_MODULE(rbln_ops, m) {
-  m.doc() = "LMCache RBLN block transfer (token-major, device transpose)";
+  m.doc() =
+      "LMCache RBLN block transfer (token-major, pipelined device transpose)";
   m.def("gather_blocks_to_chunks_hnd",
         &lmcache::rbln::gather_blocks_to_chunks_hnd, py::arg("paged_layers"),
         py::arg("block_ids"), py::arg("chunks"), py::arg("blocks_per_chunk"));
