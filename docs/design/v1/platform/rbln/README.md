@@ -93,3 +93,48 @@ The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
 never touch a connector -- which is why the format must be recognised by
 detection rather than by a connector.
+
+## Host memory: populate, don't register
+
+`PinMemoryBackend` is written around `cudaHostRegister`: hand an existing host
+address to the runtime and it records the region as DMA-able. The RBLN runtime
+has no such entry point. Its one DMA-able-host-memory API,
+`torch.rbln.huge_host_empty`, **allocates** a fresh 2 MiB-aligned prefaulted
+buffer, which is no use for a region another process already created and owns --
+and that is exactly the mp case: the engine-driven SHM pool is created by the
+LMCache server and mapped by the worker.
+
+What the RBLN copy path wants from a host buffer is two properties, neither of
+them a registration:
+
+| property | why | in the mp SHM pool |
+|---|---|---|
+| page-aligned address | an unaligned host address is staged through a bounce buffer | already true -- `mmap` returns a page-aligned base and `AddressManager` carves 4 KiB-aligned slots out of it |
+| pages already faulted in | otherwise the first touch takes a fault per 4 KiB *inside* the transfer, in the request path | **not** true: a freshly mapped pool is lazily faulted |
+
+`RblnPinMemoryBackend` supplies the second one with
+`madvise(MADV_POPULATE_WRITE)`, which walks a mapping's pages as if they had
+been written to **without modifying a byte of its content** -- the property that
+makes it safe on a shared pool already holding cached KV. `pin_memory` widens
+the requested span to whole pages first, since `madvise` rejects an unaligned
+start.
+
+The call sites are upstream's, unchanged: `EngineDrivenContextShm` calls
+`current_device_spec.pin_memory(ptr, pool_size)` on the worker's mapping right
+after it opens the pool, and `torch_ops.alloc_shm_pinned_ptr` does the same on
+the server's when it creates it. Both processes therefore get populated page
+tables over the same segment.
+
+Bounds worth stating:
+
+- **`unpin_memory` releases nothing.** Population holds no resource; undoing it
+  would mean `MADV_DONTNEED`, which discards the contents of a shared mapping.
+  It returns `True` to say "nothing to hand back".
+- **This does not get huge pages.** `MADV_HUGEPAGE` is a no-op on tmpfs unless
+  `/sys/kernel/mm/transparent_hugepage/shmem_enabled` allows it, and even then a
+  2 MiB-backed pool really wants hugetlbfs. That is a pool-allocation change, not
+  a pinning one, and is out of scope here.
+- **Linux 5.14+.** `MADV_POPULATE_WRITE` is probed once against a throwaway
+  anonymous page at construction; where it is missing the backend reports
+  `is_pin_supported = False` and every caller keeps its existing lazily-faulted
+  path.
