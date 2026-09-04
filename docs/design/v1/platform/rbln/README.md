@@ -83,13 +83,83 @@ Consequences of the format being first-class:
   pass-through variant, since the detected format has already established what
   the caller holds.
 
-- **No transfer kernel handles format 15.** RBLN has no compiled
-  block-transfer extension in tree, and the CUDA / SYCL kernels never see an
-  RBLN cache, so their `default:` arm rejecting the format is correct rather
-  than a gap. `csrc` therefore carries only the enum value, its
-  `is_layer_list` classification, and the two pybind registrations.
+- **No transfer kernel handles format 15.** `lmcache.rbln_ops` (below) moves
+  only the MLA layout so far, and the CUDA / SYCL kernels never see an RBLN
+  cache, so their `default:` arm rejecting the format is correct rather than
+  a gap. `csrc` therefore carries only the enum value, its `is_layer_list`
+  classification, and the two pybind registrations for format 15.
 
 The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
 never touch a connector -- which is why the format must be recognised by
 detection rather than by a connector.
+
+## The MLA layout
+
+vllm-rbln's MLA attention backend
+(`vllm_rbln/v1/attention/backends/mla`) allocates each layer as
+
+```
+[num_blocks, block_size, head_size]
+```
+
+-- a single latent plane with no K/V split and no head axis. Unlike the 6-D
+HND cache this is not an RBLN-only shape: the vLLM detector already classifies
+it as the existing `EngineKVFormat.NL_X_NB_BS_HS`, so no new format is
+registered and detection needs no RBLN knowledge. Chunks stay in the canonical
+single-plane wire layout `[L, T, HS]`, so -- as with HND -- a chunk stored
+from an RBLN MLA cache is byte-compatible with every other device.
+
+What is RBLN-specific is the **DMA shape**, not the layout. The shared torch
+MLA path issues one `index_select` / `index_copy_` per layer. On torch-rbln
+each of those is a separate v2v submission (the index is read back to the
+host to build the copy descriptors), the gather result / `.to(device)` window
+is a fresh device allocation per chunk, and every one of those ops carries a
+whole-layer CPU fallback behind it (`submit_or_fallback`) should the runtime
+reject a copy. Measured on a real vLLM-RBLN DeepSeek-V3 KV cache the fallback
+never fires and the shared path is correct, so the RBLN sequence exists for
+cost, not correctness: with two or more blocks per chunk, batching a chunk's
+`L * B` whole-block copies into one device staging buffer and crossing the
+boundary once is 3.5-5x faster (61-layer DeepSeek-V3, 137-549 MiB chunks:
+10-41 ms vs 37-213 ms per chunk); with one block per chunk it is on par.
+
+### `lmcache.rbln_ops`
+
+The MLA sequence lives in a compiled extension, `csrc/rbln/` -> `lmcache.rbln_ops`,
+built by `setup_extensions/build_profiles/rbln.py` (`BUILD_WITH_RBLN=1`, or
+auto-detected from an installed `torch_rbln`). It is plain ATen -- nothing
+links against torch-rbln, which supplies the RBLN implementations of the
+copies at runtime -- so it also runs on CPU tensors, which is how its tests
+exercise the kernel without hardware.
+
+- **Native only.** There is no torch fallback for MLA in `RblnDeviceOps`:
+  without the extension the transfer raises `RuntimeError` naming
+  `BUILD_WITH_RBLN`. One sequence to keep correct and to measure.
+- **Staging slots, per thread, reused.** `staging()` in `kv_transfer.cpp`
+  keeps one device buffer per `(thread, slot)`; gather and scatter own
+  separate slots so a round trip on one thread never fights over a buffer,
+  and separate threads (the multiprocess server's pool) never share one.
+  Buffers are reused across calls rather than freshly allocated: torch-rbln
+  keys compiled device programs on the buffer's address, and a model's
+  geometry is fixed after load, so a slot is only reallocated on the rare
+  call whose shape doesn't match. The slot enum is where a further layout
+  (the HND head<->token swap, once it moves into the extension) adds its own
+  buffers.
+- **One chunk at a time.** Gather: `_foreach_copy_` of the chunk's whole
+  `[BS, HS]` blocks into their token windows of the `[L, bpc*BS, HS]` staging
+  buffer (D2D, direct `memcpy_v2v`, no index tensor), then the chunk's bytes
+  cross the host boundary -- one descriptor for a whole chunk, one per layer
+  for a partial window (a trailing short chunk, or the chunk a prefix skip
+  starts inside). Scatter is the mirror.
+- **Geometry is pinned in the extension.** `geometry()` requires every
+  layer to be a contiguous 3-D tensor: a permuted view would send each block
+  copy down torch-rbln's strided path, which has a CPU fallback behind it.
+  `RblnDeviceOps` only checks the format (`is_mla()` admits every MLA
+  variant; only `NL_X_NB_BS_HS` is accepted) and hands the tensors through
+  unsqueezed -- there is nothing to squeeze.
+
+Both layouts require the engine's KV caches to be real device tensors
+(vLLM-RBLN: `VLLM_RBLN_USE_DEVICE_TENSOR=1`). With the default compile-mode
+allocation the per-layer tensors are `meta`, and any transfer -- this
+backend's or the shared path's -- dies at the first host copy with "Cannot
+copy out of meta tensor".
