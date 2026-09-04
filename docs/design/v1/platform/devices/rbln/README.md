@@ -87,17 +87,17 @@ Consequences of the format being first-class:
   but that table no longer has an `rbln` entry.
 
 - **The squeeze happens where bytes move.** `RblnDeviceOps.multi_layer_block_kv_transfer`
-  accepts only format 15 and the MLA layout (below) and applies
-  `squeeze_singleton_axis` at entry on the HND side, so `kv_ops.py` keeps
-  indexing a 5-D tensor. `kv_layout.py` therefore exports the strict squeeze
-  plus the `is_rbln_kv_layout` predicate -- no tolerant pass-through variant,
-  since the detected format has already established what the caller holds.
+  accepts only format 15 and applies `squeeze_singleton_axis` at entry, so
+  `kv_ops.py` keeps indexing a 5-D tensor. `kv_layout.py` therefore exports the
+  strict squeeze plus the `is_rbln_kv_layout` predicate -- no tolerant
+  pass-through variant, since the detected format has already established what
+  the caller holds.
 
-- **No transfer kernel handles format 15.** RBLN has no compiled
-  block-transfer extension in tree, and the CUDA / SYCL kernels never see an
-  RBLN cache, so their `default:` arm rejecting the format is correct rather
-  than a gap. `csrc` therefore carries only the enum value, its
-  `is_layer_list` classification, and the two pybind registrations.
+- **No transfer kernel handles format 15.** `lmcache.rbln_ops` (below) moves
+  only the MLA layout so far, and the CUDA / SYCL kernels never see an RBLN
+  cache, so their `default:` arm rejecting the format is correct rather than
+  a gap. `csrc` therefore carries only the enum value, its `is_layer_list`
+  classification, and the two pybind registrations for format 15.
 
 The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
@@ -128,37 +128,45 @@ is a fresh device allocation per chunk, and every one of those ops carries a
 whole-layer CPU fallback behind it (`submit_or_fallback`) should the runtime
 reject a copy. Measured on a real vLLM-RBLN DeepSeek-V3 KV cache the fallback
 never fires and the shared path is correct, so the RBLN sequence exists for
-cost, not correctness: `kv_ops.py` fans the `L * B` blocks of a chunk into
-(or out of) a persistent per-thread *device* staging buffer with one batched
-`_foreach_copy_` of whole contiguous blocks -- direct `memcpy_v2v`, no index
-tensor, no fallback path -- and crosses the device boundary in one contiguous
-DMA. With one block per chunk this is on par with the shared path (the extra
-d2d hop cancels the saved submissions); with two or more blocks per chunk it
-is 3.5-5x faster (61-layer DeepSeek-V3, 137-549 MiB chunks: 10-41 ms vs
-37-213 ms per chunk).
+cost, not correctness: with two or more blocks per chunk, batching a chunk's
+`L * B` whole-block copies into one device staging buffer and crossing the
+boundary once is 3.5-5x faster (61-layer DeepSeek-V3, 137-549 MiB chunks:
+10-41 ms vs 37-213 ms per chunk); with one block per chunk it is on par.
 
-How the two layouts relate inside the backend:
+### `lmcache.rbln_ops`
 
-- **No transpose to hoist, so the staging moves to the device.** The HND
-  sequence exists to move the head<->token transpose to the host, which is why
-  its staging buffer is host memory. MLA has no head axis and its chunk is the
-  blocks laid end to end, so the only cost left is the number of DMAs; its
-  staging buffer is device memory (per thread, like the HND host buffer) so
-  that the block-granular copies stay on the device and the chunk crosses the
-  boundary once. The paged layers must be contiguous for those whole-block
-  copies to be direct; `validate_mla_layers` pins that too.
-- **Nothing to squeeze, so the rank is pinned instead.**
-  `validate_mla_layers` in `kv_layout.py` mirrors `squeeze_singleton_axis`'s
-  strictness -- the detected format has already established what the caller
-  holds, so any non-3-D tensor is a layout drift and fails loudly at the
-  transfer boundary -- but returns the tensors unchanged.
-- **Per-format addressing, shared bookkeeping.**
-  `RblnDeviceOps.multi_layer_block_kv_transfer` dispatches with
-  `lmcache_native.is_mla(engine_kv_format)`; the chunk/block bookkeeping
-  (blocks-per-chunk split, global prefix skip translated to a per-chunk
-  offset, direction handling) is shared between the layouts. The `kv_ops`
-  names carry the split: `gather_blocks_to_chunk_hnd` / `_mla` and
-  `scatter_chunk_to_blocks_hnd` / `_mla`.
+The MLA sequence lives in a compiled extension, `csrc/rbln/` -> `lmcache.rbln_ops`,
+built by `setup_extensions/build_profiles/rbln.py` (`BUILD_WITH_RBLN=1`, or
+auto-detected from an installed `torch_rbln`). It is plain ATen -- nothing
+links against torch-rbln, which supplies the RBLN implementations of the
+copies at runtime -- so it also runs on CPU tensors, which is how its tests
+exercise the kernel without hardware.
+
+- **Native only.** There is no torch fallback for MLA in `RblnDeviceOps`:
+  without the extension the transfer raises `RuntimeError` naming
+  `BUILD_WITH_RBLN`. One sequence to keep correct and to measure.
+- **Staging slots, per thread, reused.** `staging()` in `kv_transfer.cpp`
+  keeps one device buffer per `(thread, slot)`; gather and scatter own
+  separate slots so a round trip on one thread never fights over a buffer,
+  and separate threads (the multiprocess server's pool) never share one.
+  Buffers are reused across calls rather than freshly allocated: torch-rbln
+  keys compiled device programs on the buffer's address, and a model's
+  geometry is fixed after load, so a slot is only reallocated on the rare
+  call whose shape doesn't match. The slot enum is where a further layout
+  (the HND head<->token swap, once it moves into the extension) adds its own
+  buffers.
+- **One chunk at a time.** Gather: `_foreach_copy_` of the chunk's whole
+  `[BS, HS]` blocks into their token windows of the `[L, bpc*BS, HS]` staging
+  buffer (D2D, direct `memcpy_v2v`, no index tensor), then the chunk's bytes
+  cross the host boundary -- one descriptor for a whole chunk, one per layer
+  for a partial window (a trailing short chunk, or the chunk a prefix skip
+  starts inside). Scatter is the mirror.
+- **Geometry is pinned in the extension.** `geometry()` requires every
+  layer to be a contiguous 3-D tensor: a permuted view would send each block
+  copy down torch-rbln's strided path, which has a CPU fallback behind it.
+  `RblnDeviceOps` only checks the format (`is_mla()` admits every MLA
+  variant; only `NL_X_NB_BS_HS` is accepted) and hands the tensors through
+  unsqueezed -- there is nothing to squeeze.
 
 Both layouts require the engine's KV caches to be real device tensors
 (vLLM-RBLN: `VLLM_RBLN_USE_DEVICE_TENSOR=1`). With the default compile-mode
