@@ -13,15 +13,23 @@
 namespace lmcache::rbln {
 namespace {
 
-// Staging buffers: per thread, per (shape, dtype, device, slot, kind). Two
-// slots alternate per direction; kind 0 is the landing buffer, kind 1 is the
-// buffer the swap writes into.
+// Staging buffers: per thread, per (shape, dtype, device, slot). Two slots
+// alternate so a block's swap does not overwrite what the previous block's
+// host copy is still reading.
+//
+// The shape is the whole key a direction needs, because the two directions ask
+// for the same two shapes: gather lands in [2, L, H, BS, D] and swaps into
+// [2, L, BS, H, D], scatter lands in the second and swaps into the first. They
+// cannot be in flight together on one thread -- each call drains its copy
+// stream before returning -- so a gather/scatter round trip reuses one set of
+// buffers instead of holding two. On this geometry (117.44 MB per block) that
+// is 4 buffers per thread rather than 8, and the buffers are thread_local, so
+// it halves against the store pool's thread count as well.
 at::Tensor staging(at::IntArrayRef shape, at::ScalarType dtype,
-                   const at::Device& device, int slot, int kind) {
-  using Key =
-      std::tuple<std::vector<int64_t>, at::ScalarType, std::string, int, int>;
+                   const at::Device& device, int slot) {
+  using Key = std::tuple<std::vector<int64_t>, at::ScalarType, std::string, int>;
   thread_local std::map<Key, at::Tensor> buffers;
-  Key key{shape.vec(), dtype, device.str(), slot, kind};
+  Key key{shape.vec(), dtype, device.str(), slot};
   auto it = buffers.find(key);
   if (it == buffers.end()) {
     at::Tensor buf =
@@ -134,12 +142,12 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
   std::vector<Fence> d2h_done(n);
   for (int64_t u = 0; u < n; ++u) {
     const int slot = static_cast<int>(u % 2);
-    at::Tensor in = staging(in_shape, g.dtype, g.device, slot, /*kind=*/0);
+    at::Tensor in = staging(in_shape, g.dtype, g.device, slot);
     std::vector<at::Tensor> slots, blocks;
     block_copy_lists(layers, block_ids[u], in, slots, blocks);
     at::_foreach_copy_(slots, blocks, false);
 
-    at::Tensor out = staging(out_shape, g.dtype, g.device, slot, /*kind=*/1);
+    at::Tensor out = staging(out_shape, g.dtype, g.device, slot);
     // That block's D2H read the output slot this swap is about to overwrite.
     if (u >= 2) wait(d2h_done[u - 2], main);
     // A permuted device copy: torch-rbln runs it as a compiled program.
@@ -183,8 +191,7 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
   const int64_t m = n - start;  // blocks in this transfer
 
   auto landing = [&](int64_t u) {
-    return staging(in_shape, g.dtype, g.device, static_cast<int>(u % 2),
-                   /*kind=*/0);
+    return staging(in_shape, g.dtype, g.device, static_cast<int>(u % 2));
   };
   std::vector<Fence> h2d_done(m), swapped(m);
   auto issue_copy = [&](int64_t u) {
@@ -210,7 +217,7 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
     }
     at::Tensor in = landing(u);
     const int slot = static_cast<int>(u % 2);
-    at::Tensor out = staging(out_shape, g.dtype, g.device, slot, /*kind=*/1);
+    at::Tensor out = staging(out_shape, g.dtype, g.device, slot);
     // This block's H2D, not the ones issued after it.
     wait(h2d_done[u], main);
     out.view({rows, g.heads, g.block_size, g.head_size})
