@@ -13,4 +13,7 @@ PYBIND11_MODULE(rbln_ops, m) {
         &lmcache::rbln::scatter_chunks_to_blocks_hnd, py::arg("paged_layers"),
         py::arg("block_ids"), py::arg("chunks"), py::arg("blocks_per_chunk"),
         py::arg("skip_prefix_n_blocks") = 0);
+  m.def("staging_placement", &lmcache::rbln::staging_placement_name,
+        "The staging-buffer placement in effect: 'spread', 'spread-all', 'main' "
+        "or 'chiplet:<n>' (LMCACHE_RBLN_STAGING_CHIPLET, read once)");
 }

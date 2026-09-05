@@ -1,39 +1,140 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "kv_transfer.h"
 
+#include <ATen/core/dispatch/Dispatcher.h>
 #include <c10/core/Event.h>
 #include <c10/core/StreamGuard.h>
 #include <c10/core/impl/VirtualGuardImpl.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <optional>
+#include <string>
 #include <tuple>
 
 namespace lmcache::rbln {
 namespace {
 
-// Staging buffers: per thread, per (shape, dtype, device, slot). Two slots
-// alternate so a block's swap does not overwrite what the previous block's
-// host copy is still reading.
+// Staging buffers: per thread, per (shape, dtype, device, slot, role). Two
+// slots alternate so a block's swap does not overwrite what the previous
+// block's host copy is still reading.
 //
-// The shape is the whole key a direction needs, because the two directions ask
-// for the same two shapes: gather lands in [2, L, H, BS, D] and swaps into
-// [2, L, BS, H, D], scatter lands in the second and swaps into the first. They
-// cannot be in flight together on one thread -- each call drains its copy
-// stream before returning -- so a gather/scatter round trip reuses one set of
-// buffers instead of holding two. On this geometry (117.44 MB per block) that
-// is 4 buffers per thread rather than 8, and the buffers are thread_local, so
-// it halves against the store pool's thread count as well.
+// The two directions ask for the same two shapes: gather lands in
+// [2, L, H, BS, D] and swaps into [2, L, BS, H, D], scatter lands in the second
+// and swaps into the first. They cannot be in flight together on one thread --
+// each call drains its copy stream before returning -- so a thread that does
+// both reuses a buffer across directions when the role (below) agrees: the
+// token-major buffer is a host DMA endpoint for both, so it is shared, while
+// the head-major one is gather's device-filled landing but scatter's D2D
+// source, and those want different chiplets, so a thread doing both holds two.
+// In the serve a thread does one direction (store on the commit pool, retrieve
+// on its caller), so it holds 4 buffers -- 470 MB on this geometry -- and the
+// buffers are thread_local, so that multiplies by the pool's thread count.
+// Where a staging buffer lives on the device. RBLN DRAM is one pool per chiplet
+// and an allocation is pinned to the chiplet it lands on -- the runtime does not
+// spill -- and every torch allocation lands on chiplet 0 unless told otherwise.
+// The staging set is large (a whole block per buffer, several buffers per thread,
+// one set per transfer thread), so left alone it all stacks on chiplet 0's pool
+// next to that chiplet's share of the model.
+//
+// Which buffers can leave chiplet 0 without slowing the transfer was measured
+// (Qwen3-1.7B KV, 8 blocks): a host DMA endpoint on another chiplet is slower
+// in both directions (gather 46 -> 36 GB/s with its D2H source there, scatter
+// 41 -> 38 with its H2D landing there), and so is the source of a D2D (scatter
+// 41 -> 38 with its swap output there); the cost grows with the chiplet's
+// distance from 0 and chiplet 3 is the worst (gather 29 with everything on it).
+// The one buffer that is only ever the *destination* of a D2D and then read by
+// the compiled permute -- gather's landing buffer -- moves at full rate from any
+// chiplet (gather held 46.6 with it on chiplets 1 and 2). LMCACHE_RBLN_STAGING_CHIPLET:
+//   spread      gather's landing buffers round-robin over chiplets 1.., every
+//               other buffer on chiplet 0 -- no throughput cost (default)
+//   spread-all  every buffer round-robin over every chiplet
+//   main        chiplet 0 for everything, the runtime's default placement
+//   <n>         pin every staging buffer to chiplet n
+// Placement goes through torch-rbln's dispatcher op so this extension keeps
+// linking only ATen; a torch-rbln without the op leaves the buffers where the
+// runtime puts them.
+enum class Placement { kSpread, kSpreadAll, kMain, kPinned };
+
+// How a staging buffer is reached: only as the destination of a D2D and by the
+// compiled permute (may live on any chiplet), or as a host DMA endpoint or a
+// D2D source (stays on chiplet 0).
+enum class Role { kDeviceFilled, kDmaEndpoint };
+
+struct StagingPlacement {
+  Placement policy;
+  int64_t chiplet;  // kPinned only
+};
+
+StagingPlacement parse_placement(const char* value) {
+  if (value == nullptr || *value == '\0' || std::strcmp(value, "spread") == 0) {
+    return {Placement::kSpread, 0};
+  }
+  if (std::strcmp(value, "spread-all") == 0) return {Placement::kSpreadAll, 0};
+  if (std::strcmp(value, "main") == 0) return {Placement::kMain, 0};
+  char* end = nullptr;
+  const long n = std::strtol(value, &end, 10);
+  TORCH_CHECK(end != value && *end == '\0' && n >= 0,
+              "LMCACHE_RBLN_STAGING_CHIPLET must be 'spread', 'spread-all', 'main' "
+              "or a non-negative chiplet index, got '",
+              value, "'");
+  return {Placement::kPinned, static_cast<int64_t>(n)};
+}
+
+const StagingPlacement& staging_placement() {
+  static const StagingPlacement placement =
+      parse_placement(std::getenv("LMCACHE_RBLN_STAGING_CHIPLET"));
+  return placement;
+}
+
+// Places a freshly allocated staging buffer per the policy. A no-op under kMain
+// and when torch-rbln predates the placement op.
+void place_staging(at::Tensor& buf, Role role) {
+  const StagingPlacement& placement = staging_placement();
+  if (placement.policy == Placement::kMain) return;
+  static const auto bind = c10::Dispatcher::singleton().findSchema(
+      {"torch_rbln::bind_device_memory_at", ""});
+  static const auto count =
+      c10::Dispatcher::singleton().findSchema({"torch_rbln::chiplet_count", ""});
+  if (!bind.has_value() || !count.has_value()) {
+    TORCH_WARN_ONCE(
+        "LMCACHE_RBLN_STAGING_CHIPLET is set but this torch-rbln has no "
+        "torch_rbln::bind_device_memory_at; staging buffers stay on the runtime's "
+        "default chiplet");
+    return;
+  }
+  int64_t chiplet = placement.chiplet;
+  if (placement.policy != Placement::kPinned) {
+    static const int64_t n_chiplets = std::max<int64_t>(
+        count->typed<int64_t(const at::Tensor&)>().call(buf), 1);
+    // One counter for the process, so the per-thread staging sets interleave
+    // across chiplets instead of each thread starting over at the same one.
+    static std::atomic<int64_t> next{0};
+    if (placement.policy == Placement::kSpreadAll) {
+      chiplet = next.fetch_add(1) % n_chiplets;
+    } else if (role == Role::kDmaEndpoint || n_chiplets == 1) {
+      chiplet = 0;
+    } else {
+      chiplet = 1 + next.fetch_add(1) % (n_chiplets - 1);
+    }
+  }
+  bind->typed<void(at::Tensor&, int64_t)>().call(buf, chiplet);
+}
+
 at::Tensor staging(at::IntArrayRef shape, at::ScalarType dtype,
-                   const at::Device& device, int slot) {
-  using Key = std::tuple<std::vector<int64_t>, at::ScalarType, std::string, int>;
+                   const at::Device& device, int slot, Role role) {
+  using Key =
+      std::tuple<std::vector<int64_t>, at::ScalarType, std::string, int, Role>;
   thread_local std::map<Key, at::Tensor> buffers;
-  Key key{shape.vec(), dtype, device.str(), slot};
+  Key key{shape.vec(), dtype, device.str(), slot, role};
   auto it = buffers.find(key);
   if (it == buffers.end()) {
     at::Tensor buf =
         at::empty(shape, at::TensorOptions().dtype(dtype).device(device));
+    place_staging(buf, role);
     it = buffers.emplace(key, buf).first;
   }
   return it->second;
@@ -123,6 +224,21 @@ void check_chunks(const std::vector<at::Tensor>& chunks, int64_t bpc,
 
 }  // namespace
 
+std::string staging_placement_name() {
+  const StagingPlacement& placement = staging_placement();
+  switch (placement.policy) {
+    case Placement::kSpread:
+      return "spread";
+    case Placement::kSpreadAll:
+      return "spread-all";
+    case Placement::kMain:
+      return "main";
+    case Placement::kPinned:
+      return "chiplet:" + std::to_string(placement.chiplet);
+  }
+  return "spread";
+}
+
 void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
                                  const std::vector<int64_t>& block_ids,
                                  const std::vector<at::Tensor>& chunks,
@@ -142,12 +258,12 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
   std::vector<Fence> d2h_done(n);
   for (int64_t u = 0; u < n; ++u) {
     const int slot = static_cast<int>(u % 2);
-    at::Tensor in = staging(in_shape, g.dtype, g.device, slot);
+    at::Tensor in = staging(in_shape, g.dtype, g.device, slot, Role::kDeviceFilled);
     std::vector<at::Tensor> slots, blocks;
     block_copy_lists(layers, block_ids[u], in, slots, blocks);
     at::_foreach_copy_(slots, blocks, false);
 
-    at::Tensor out = staging(out_shape, g.dtype, g.device, slot);
+    at::Tensor out = staging(out_shape, g.dtype, g.device, slot, Role::kDmaEndpoint);
     // That block's D2H read the output slot this swap is about to overwrite.
     if (u >= 2) wait(d2h_done[u - 2], main);
     // A permuted device copy: torch-rbln runs it as a compiled program.
@@ -191,7 +307,8 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
   const int64_t m = n - start;  // blocks in this transfer
 
   auto landing = [&](int64_t u) {
-    return staging(in_shape, g.dtype, g.device, static_cast<int>(u % 2));
+    return staging(in_shape, g.dtype, g.device, static_cast<int>(u % 2),
+                   Role::kDmaEndpoint);
   };
   std::vector<Fence> h2d_done(m), swapped(m);
   auto issue_copy = [&](int64_t u) {
@@ -217,7 +334,7 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
     }
     at::Tensor in = landing(u);
     const int slot = static_cast<int>(u % 2);
-    at::Tensor out = staging(out_shape, g.dtype, g.device, slot);
+    at::Tensor out = staging(out_shape, g.dtype, g.device, slot, Role::kDmaEndpoint);
     // This block's H2D, not the ones issued after it.
     wait(h2d_done[u], main);
     out.view({rows, g.heads, g.block_size, g.head_size})

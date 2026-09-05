@@ -16,6 +16,10 @@ an IPC handle wrapper) cannot be supported.  The spec therefore reports
 requesting ``mp_transfer_mode=lmcache_driven`` fails fast with a clear
 error rather than crashing deeper in the transfer path.
 
+The native transfer's device staging buffers are placed across the NPU's
+chiplets according to ``LMCACHE_RBLN_STAGING_CHIPLET`` (``spread`` by default);
+see the design doc's "Staging buffers" section.
+
 Host memory is the one capability the spec does add:
 :class:`~lmcache.v1.platform.rbln.pin_memory.RblnPinMemoryBackend` registers a
 host region with the runtime through ``torch.rbln.register_host_memory`` -- the

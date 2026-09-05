@@ -4,6 +4,7 @@
 #include <ATen/ATen.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace lmcache::rbln {
@@ -24,5 +25,9 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
                                   const std::vector<at::Tensor>& chunks,
                                   int64_t blocks_per_chunk,
                                   int64_t skip_prefix_n_blocks);
+
+// The staging-buffer placement in effect, from LMCACHE_RBLN_STAGING_CHIPLET (read
+// once): "spread", "spread-all", "main" or "chiplet:<n>".
+std::string staging_placement_name();
 
 }  // namespace lmcache::rbln

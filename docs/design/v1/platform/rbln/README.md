@@ -93,3 +93,94 @@ The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
 never touch a connector -- which is why the format must be recognised by
 detection rather than by a connector.
+
+## Staging buffers: footprint and placement
+
+The native transfer (`csrc/rbln/kv_transfer.cpp`) moves each block through
+device staging: a landing buffer the paged block is gathered into, and a swap
+buffer the head<->token permute writes. Both are a whole block
+(`[2, L, H, BS, D]` / `[2, L, BS, H, D]`), and the pipelined path holds two
+slots of each so a block's host copy can overlap the next block's swap.
+
+### How many
+
+`staging()` keys its buffers on `(shape, dtype, device, slot, role)` and keeps
+them `thread_local`, so **every thread that transfers holds its own set**. Store
+runs on the engine-driven commit pool (`DEFAULT_ENGINE_DRIVEN_COMMIT_WORKERS = 4`
+threads), retrieve on the caller's thread. Gather and scatter ask for the same
+two shapes (one's landing shape is the other's swap shape), and they cannot be
+in flight together on one thread -- each call drains its copy stream before
+returning -- so a thread that does both reuses the token-major buffer across
+directions (the same role for both), and holds a second head-major one only
+because the two directions want it on different chiplets (below). A serve thread
+does one direction, so it holds:
+
+| per thread | buffers | Qwen3-1.7B (117.44 MB / block) |
+|---|---|---|
+| two slots x (landing, swap) | 4 | 470 MB |
+| x 4 store workers + 1 retrieve caller | 20 | 2.35 GB |
+
+Measured (`rbln-stat`, one process): +322 MB after one thread's gather, +966 MB
+after two, +1933 MB after four -- linear in the thread count, and a scatter on a
+thread that already gathered adds nothing.
+
+Tiling the staging over `k` layers would cut it by `L/k` but is not free:
+halving it costs ~5% of scatter throughput, quartering it ~13%, and below that
+the per-piece overhead dominates (measured 44.3 -> 42.2 -> 38.6 -> 32.4 GB/s at
+k = 28, 14, 7, 4). It is not implemented; it becomes worth a knob when a block
+approaches a gigabyte.
+
+### Where
+
+RBLN device DRAM is **one pool per chiplet** (32 GiB each on RBLN-CR13), and the
+runtime pins an allocation to the chiplet it names -- it does not spill to
+another when that one fills. Every torch allocation names chiplet 0, so with no
+further action the whole staging set lands on chiplet 0's pool, next to that
+chiplet's share of the model.
+
+Which buffers can leave chiplet 0 without slowing the transfer was measured
+(Qwen3-1.7B, 8 blocks, everything pinned to one chiplet):
+
+| staging on chiplet | gather | scatter |
+|---|---|---|
+| 0 | 46.3 GB/s | 41.2 GB/s |
+| 1 | 37.9 | 38.3 |
+| 2 | 35.7 | 38.1 |
+| 3 | 29.0 | 36.2 |
+
+A host DMA endpoint on another chiplet is slower in both directions (gather's
+D2H source, scatter's H2D landing), and so is the source of a D2D (scatter's
+swap output feeding the paged block); the cost grows with the chiplet's distance
+from 0. The one buffer that is only ever the *destination* of a D2D and then
+read by the compiled permute -- gather's landing buffer -- moves at full rate
+from any chiplet: gather held 46.6 GB/s with it on chiplets 1 and 2, while
+floating either of scatter's buffers cost 8%.
+
+`LMCACHE_RBLN_STAGING_CHIPLET` decides where staging goes, read once per process:
+
+| value | placement |
+|---|---|
+| `spread` (default) | gather's landing buffers round-robin over chiplets 1.., with one counter for the process so the per-thread sets interleave; every other buffer on chiplet 0. No throughput cost; halves a store worker's chiplet-0 staging |
+| `spread-all` | every buffer round-robin over every chiplet -- chiplet 0 keeps a quarter, at the cost above (measured 35.6 / 39.2 GB/s) |
+| `main` | chiplet 0 for everything, the runtime's default |
+| `<n>` | pin every staging buffer to chiplet `n` |
+
+Placement is applied when a buffer is first allocated, through torch-rbln's
+dispatcher op `torch_rbln::bind_device_memory_at` (the same thing
+`torch.rbln.bind_device_memory(t, chiplet=n)` does), so this extension keeps
+linking only ATen. A torch-rbln without the op leaves the buffers where the
+runtime puts them and warns once. `lmcache.rbln_ops.staging_placement()`
+reports the policy in effect.
+
+Two things in the layers below make this hold:
+
+- The runtime keeps a caller's placement when a compiled program later binds
+  the tensor as an operand. The program's I/O configuration names the chiplet
+  its compile assumed (0); without this the first permute would sync the buffer
+  to the host, free it and reallocate it on chiplet 0 -- which is also why a
+  rebind used to cost a host round trip.
+- The DMA descriptors carry each area's chiplet, and I/O relocation is an
+  address patch, so a block on chiplet 0 gathers into a landing buffer on
+  chiplet 2 and the permute reads it there without any special casing.
+
+`torch.rbln.memory_stats_per_chiplet()` shows the per-chiplet result.
