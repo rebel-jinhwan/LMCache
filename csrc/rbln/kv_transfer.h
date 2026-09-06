@@ -43,12 +43,8 @@ void scatter_chunks_to_blocks_mla(const std::vector<at::Tensor>& layers,
                                   int64_t blocks_per_chunk,
                                   int64_t skip_prefix_n_blocks);
 
-// How the head<->token swap is staged: "inplace" (one buffer per direction,
-// the program permutes it in its own storage) or "two-buffer".
-std::string staging_swap_mode();
-
-// How many layer groups the HND staging is split into, one per chiplet
-// (LMCACHE_RBLN_STAGING_SPLIT); needs a device tensor to ask the device.
-int64_t staging_split_groups(const at::Tensor& any_device_tensor);
+// How many shards the HND staging is cut into -- one per chiplet of the device
+// the tensor is on.
+int64_t staging_shard_count(const at::Tensor& any_device_tensor);
 
 }  // namespace lmcache::rbln
