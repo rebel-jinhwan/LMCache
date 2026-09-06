@@ -5,6 +5,13 @@
 
 PYBIND11_MODULE(rbln_ops, m) {
   m.doc() = "LMCache RBLN block transfer (device-staged, torch-rbln copies)";
+  m.def("gather_blocks_to_chunks_hnd",
+        &lmcache::rbln::gather_blocks_to_chunks_hnd, py::arg("paged_layers"),
+        py::arg("block_ids"), py::arg("chunks"), py::arg("blocks_per_chunk"));
+  m.def("scatter_chunks_to_blocks_hnd",
+        &lmcache::rbln::scatter_chunks_to_blocks_hnd, py::arg("paged_layers"),
+        py::arg("block_ids"), py::arg("chunks"), py::arg("blocks_per_chunk"),
+        py::arg("skip_prefix_n_blocks") = 0);
   m.def("gather_blocks_to_chunks_mla",
         &lmcache::rbln::gather_blocks_to_chunks_mla, py::arg("paged_layers"),
         py::arg("block_ids"), py::arg("chunks"), py::arg("blocks_per_chunk"));
@@ -12,4 +19,7 @@ PYBIND11_MODULE(rbln_ops, m) {
         &lmcache::rbln::scatter_chunks_to_blocks_mla, py::arg("paged_layers"),
         py::arg("block_ids"), py::arg("chunks"), py::arg("blocks_per_chunk"),
         py::arg("skip_prefix_n_blocks") = 0);
+  m.def("staging_shard_count", &lmcache::rbln::staging_shard_count,
+        py::arg("any_device_tensor"),
+        "How many shards the HND staging is cut into, one per chiplet");
 }

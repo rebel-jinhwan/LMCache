@@ -77,17 +77,18 @@ Consequences of the format being first-class:
   but that table no longer has an `rbln` entry.
 
 - **The squeeze happens where bytes move.** `RblnDeviceOps.multi_layer_block_kv_transfer`
-  accepts only format 15 and applies `squeeze_singleton_axis` at entry, so
-  `kv_ops.py` keeps indexing a 5-D tensor. `kv_layout.py` therefore exports the
-  strict squeeze plus the `is_rbln_kv_layout` predicate -- no tolerant
-  pass-through variant, since the detected format has already established what
-  the caller holds.
+  accepts format 15 (and the MLA layout, below) and applies
+  `squeeze_singleton_axis` at entry on the HND side, so `lmcache.rbln_ops`
+  receives a 5-D tensor. `kv_layout.py` therefore exports the strict squeeze
+  plus the `is_rbln_kv_layout` predicate -- no tolerant pass-through variant,
+  since the detected format has already established what the caller holds.
 
-- **No transfer kernel handles format 15.** `lmcache.rbln_ops` (below) moves
-  only the MLA layout so far, and the CUDA / SYCL kernels never see an RBLN
-  cache, so their `default:` arm rejecting the format is correct rather than
-  a gap. `csrc` therefore carries only the enum value, its `is_layer_list`
-  classification, and the two pybind registrations for format 15.
+- **No shared transfer kernel handles format 15.** Only `lmcache.rbln_ops`
+  (below) moves it, and the CUDA / SYCL kernels never see an RBLN cache, so
+  their `default:` arm rejecting the format is correct rather than a gap.
+  `csrc` outside `csrc/rbln` therefore carries only the enum value, its
+  `is_layer_list` classification, and the two pybind registrations for
+  format 15.
 
 The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
@@ -123,18 +124,28 @@ cost, not correctness: with two or more blocks per chunk, batching a chunk's
 boundary once is 3.5-5x faster (61-layer DeepSeek-V3, 137-549 MiB chunks:
 10-41 ms vs 37-213 ms per chunk); with one block per chunk it is on par.
 
-### `lmcache.rbln_ops`
+## `lmcache.rbln_ops`
 
-The MLA sequence lives in a compiled extension, `csrc/rbln/` -> `lmcache.rbln_ops`,
+Both sequences live in one compiled extension, `csrc/rbln/` -> `lmcache.rbln_ops`,
 built by `setup_extensions/build_profiles/rbln.py` (`BUILD_WITH_RBLN=1`, or
 auto-detected from an installed `torch_rbln`). It is plain ATen -- nothing
 links against torch-rbln, which supplies the RBLN implementations of the
 copies at runtime -- so it also runs on CPU tensors, which is how its tests
-exercise the kernel without hardware.
+exercise the kernels without hardware.
 
-- **Native only.** There is no torch fallback for MLA in `RblnDeviceOps`:
-  without the extension the transfer raises `RuntimeError` naming
-  `BUILD_WITH_RBLN`. One sequence to keep correct and to measure.
+- **Native only.** There is no torch fallback in `RblnDeviceOps`: without the
+  extension the transfer raises `RuntimeError` naming `BUILD_WITH_RBLN`. One
+  sequence per layout to keep correct and to measure.
+- **HND: the swap moves to the device.** The earlier torch sequence crossed
+  PCIe once per (block, layer, kv) and did the head<->token swap on the host.
+  The extension instead runs one device sequence per block: a D2D gather of
+  the whole block into device staging, the swap as a permuted `copy_` that
+  torch-rbln runs as a compiled program, and a D2H of the chunk's bytes --
+  one descriptor per whole chunk when `chunk_size == block_size`, one per
+  (kv, layer) otherwise. Scatter is the mirror. Sequential, one block at a
+  time, and the boundary copies are blocking: a non-blocking D2H followed by
+  the next block's swap into the same output buffer is a real race on a
+  runtime that routes async host copies to a second UMD context.
 - **Staging slots, per thread, reused.** `staging()` in `kv_transfer.cpp`
   keeps one device buffer per `(thread, slot)`; gather and scatter own
   separate slots so a round trip on one thread never fights over a buffer,
@@ -142,16 +153,15 @@ exercise the kernel without hardware.
   Buffers are reused across calls rather than freshly allocated: torch-rbln
   keys compiled device programs on the buffer's address, and a model's
   geometry is fixed after load, so a slot is only reallocated on the rare
-  call whose shape doesn't match. The slot enum is where a further layout
-  (the HND head<->token swap, once it moves into the extension) adds its own
-  buffers.
-- **One chunk at a time.** Gather: `_foreach_copy_` of the chunk's whole
+  call whose shape doesn't match. HND owns four slots (gather landing and
+  swap output, the same pair for scatter), MLA two.
+- **MLA: one chunk at a time.** Gather: `_foreach_copy_` of the chunk's whole
   `[BS, HS]` blocks into their token windows of the `[L, bpc*BS, HS]` staging
   buffer (D2D, direct `memcpy_v2v`, no index tensor), then the chunk's bytes
   cross the host boundary -- one descriptor for a whole chunk, one per layer
   for a partial window (a trailing short chunk, or the chunk a prefix skip
   starts inside). Scatter is the mirror.
-- **Geometry is pinned in the extension.** `geometry()` requires every
+- **MLA geometry is pinned in the extension.** `geometry()` requires every
   layer to be a contiguous 3-D tensor: a permuted view would send each block
   copy down torch-rbln's strided path, which has a CPU fallback behind it.
   `RblnDeviceOps` only checks the format (`is_mla()` admits every MLA
@@ -163,3 +173,92 @@ Both layouts require the engine's KV caches to be real device tensors
 allocation the per-layer tensors are `meta`, and any transfer -- this
 backend's or the shared path's -- dies at the first host copy with "Cannot
 copy out of meta tensor".
+
+## Staging buffers
+
+The native transfer (`csrc/rbln/kv_transfer.cpp`) moves each block through
+device staging: the block is gathered head-major (`[2, L, H, BS, D]`) and the
+host wants it token-major (`[2, L, BS, H, D]`), or the reverse on retrieve.
+
+### One buffer, swapped in place
+
+The swap between the two layouts is a compiled device program, and torch-rbln's
+`torch_rbln::copy_strided_view(src, out, inplace=True)` runs it with the output
+aliasing the input, so a direction needs **one buffer, not a landing and a swap
+buffer**:
+on Qwen3-1.7B (117.44 MB per block) 235 MB per thread instead of 470. A second
+buffer buys nothing at this stage -- a block is swapped and copied out before
+the next one starts -- and would only pay off in a pipeline that overlaps a
+block's host copy with the next block's swap.
+
+`copy_` cannot be used for this -- ATen refuses partially overlapping pairs --
+so the transfer calls the op directly. Correctness rests on the compiled
+schedule finishing its reads of a region before writing it, which is the
+compiler's tiling rather than anything this code controls; torch-rbln therefore
+checks each geometry once against a host reference (measured bit-exact on ten
+geometries: heads 2--16, tokens 16--256, head size 64/128, rows 2--72) and
+raises if the check fails.
+
+The three ops the transfer borrows from torch-rbln -- `copy_strided_view` with
+its `inplace` flag, `bind_device_memory_at`, `chiplet_count` -- are resolved once
+in `TorchRblnOps` and taken as given rather than probed for: this branch is built
+against a torch-rbln that has them, and a build that is not says so on the first
+transfer. They go through the dispatcher rather than as C++ calls because
+`copy_strided_view` is implemented in Python (it drives the compile path), and
+the other two follow it so this extension keeps linking only ATen.
+
+The buffers are `thread_local`, so every thread that transfers holds its own
+set: store runs on the engine-driven commit pool (4 workers by default),
+retrieve on the caller's thread.
+
+### Sharded over the chiplets
+
+RBLN device DRAM is one pool per chiplet (32 GiB each on RBLN-CR13) and the
+runtime pins an allocation to the chiplet it names, without spilling. Every
+torch allocation names chiplet 0, so a block of staging per direction per
+thread would all sit on chiplet 0's pool next to that chiplet's share of the
+model. The KV cache itself is split over the chiplets **by head** (heads
+`[2k, 2k+1]` of every layer and block live on chiplet `k` on this geometry).
+
+The staging is therefore **sharded by layer**, one shard per chiplet: shard `s`
+holds a contiguous run of layers, stages on chiplet `s`
+(`torch.rbln.bind_device_memory(t, chiplet=s)` through the dispatcher op), is
+swapped there in place, and its `(kv, layer)` rows are what the host chunk holds
+contiguously -- so the host copies are the same 2 MiB rows as before.
+Head-shaped shards would have matched the paged blocks, but the host wants every
+head of a token together, so they would have needed a token-granular merge
+(512 B pieces) on the device or a change of the host layout. Measured,
+device-to-device and host DMA cost the same from any chiplet; the swap program
+runs on chiplet 0 and reads the other chiplets over the die-to-die links, which
+is the one cost of the sharding. `rbln_ops.staging_shard_count(t)` reports how
+many shards are in use.
+
+### What it costs a chiplet
+
+A device runs out of memory on its heaviest chiplet, so that is the number to
+watch: the high-water mark of one chiplet's allocated bytes over a transfer.
+Measured on Qwen3-1.7B (117.44 MB per block) with the allocator's per-chiplet
+peak counters, as the delta over the pre-transfer level:
+
+| staging | 1 thread, gather | 1 thread, round trip | 4 threads, gather | 4 threads, round trip |
+|---|---|---|---|---|
+| two buffers, one chiplet (before) | 352.9 MB | 705.7 MB | 1411.5 MB | 2822.9 MB |
+| in place, one chiplet | 352.9 | 588.3 | 941.7 | 1883.4 |
+| **in place, sharded over 4 chiplets** | **146.9** | **293.8** | **352.6** | **470.0** |
+
+Six times less on the busiest chiplet for the four-thread round trip, and the
+sharding flattens the thread scaling: the staging is
+`threads x shards x block/shards` either way, but only `1/shards` of it lands on
+any one chiplet.
+
+What remains on chiplet 0 is mostly **not** staging. Each compiled swap program
+allocates an output-sized buffer of its own at load, even though the transfer
+hands it the staging buffer to write (`run(out=)`), and those buffers stay on
+chiplet 0: 8 of them (torch-rbln compiles one program per source buffer, capped
+at 8 slots), so `8 x block/shards` = 235 MB of the 470 above.
+
+Correctness under threads is its own gate: the bench's `--verify` drives one
+thread, so it cannot see two threads swapping each other's staging. The
+multi-threaded check (4 threads, distinct per-block patterns, gather compared on
+the host and scatter compared back on the device) is what caught the eager
+out-tensor binding being process-wide rather than per thread, in the runtime.

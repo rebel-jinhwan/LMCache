@@ -196,7 +196,7 @@ def test_trailing_partial_chunk_is_handled() -> None:
 def test_non_mla_layers_are_refused() -> None:
     """The 6-D attention layout under the MLA format fails loudly."""
     hnd = [torch.zeros(2, NUM_BLOCKS, 2, 1, BLOCK_SIZE, 8) for _ in range(NUM_LAYERS)]
-    with pytest.raises(RuntimeError, match=r"contiguous \[NB, BS, HS\]"):
+    with pytest.raises(RuntimeError, match="or contiguous"):
         _transfer(hnd, _chunks(), TransferDirection.D2H)
 
 
@@ -207,5 +207,5 @@ def test_non_contiguous_layers_are_refused() -> None:
         torch.zeros(BLOCK_SIZE, NUM_BLOCKS, HEAD_SIZE).permute(1, 0, 2)
         for _ in range(NUM_LAYERS)
     ]
-    with pytest.raises(RuntimeError, match="contiguous"):
+    with pytest.raises(RuntimeError, match="or contiguous"):
         _transfer(permuted, _chunks(), TransferDirection.D2H)
