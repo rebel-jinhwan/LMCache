@@ -183,8 +183,9 @@ host wants it token-major (`[2, L, BS, H, D]`), or the reverse on retrieve.
 ### One buffer, swapped in place
 
 The swap between the two layouts is a compiled device program, and torch-rbln's
-`torch_rbln::copy_strided_view_inplace` runs it with the output aliasing the
-input, so a direction needs **one buffer, not a landing and a swap buffer**:
+`torch_rbln::copy_strided_view(src, out, inplace=True)` runs it with the output
+aliasing the input, so a direction needs **one buffer, not a landing and a swap
+buffer**:
 on Qwen3-1.7B (117.44 MB per block) 235 MB per thread instead of 470. A second
 buffer buys nothing at this stage -- a block is swapped and copied out before
 the next one starts -- and would only pay off in a pipeline that overlaps a
@@ -194,9 +195,14 @@ block's host copy with the next block's swap.
 so the transfer calls the op directly. Correctness rests on the compiled
 schedule finishing its reads of a region before writing it, which is the
 compiler's tiling rather than anything this code controls; torch-rbln therefore
-checks each geometry once against an out-of-place copy (measured bit-exact on
-ten geometries: heads 2--16, tokens 16--256, head size 64/128, rows 2--72) and
+checks each geometry once against a host reference (measured bit-exact on ten
+geometries: heads 2--16, tokens 16--256, head size 64/128, rows 2--72) and
 raises if the check fails.
+
+The transfer takes `torch_rbln::copy_strided_view` (with its `inplace` flag),
+`torch_rbln::bind_device_memory_at` and `torch_rbln::chiplet_count` as given
+rather than probing for them: this branch is built against a torch-rbln that has
+them, and the dispatcher names whichever is missing if it is not.
 
 The buffers are `thread_local`, so every thread that transfers holds its own
 set: store runs on the engine-driven commit pool (4 workers by default),

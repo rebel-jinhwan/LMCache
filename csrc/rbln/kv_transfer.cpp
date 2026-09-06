@@ -26,27 +26,23 @@ enum Slot : int {
   kSlotCount
 };
 
-// The head<->token swap is a compiled device program, and torch-rbln's
-// copy_strided_view_inplace runs it with the output aliasing the input: the
-// program permutes the buffer in its own storage (torch-rbln verifies each
-// geometry once against an out-of-place copy), so a direction holds one
-// staging buffer rather than a landing and a swap buffer -- on Qwen3-1.7B,
-// 117.44 MB per block, 235 MB per thread instead of 470. A second buffer buys
-// nothing here: a block is swapped and copied out before the next one starts.
-// It would buy something to a pipeline that overlaps a block's host copy with
-// the next block's swap, and that is where it belongs.
+// The head<->token swap is the compiled view copy run in place (its output
+// aliasing its input), so it permutes the staging buffer in the buffer's own
+// storage (torch-rbln verifies each geometry once against a host reference).
+// One staging buffer per direction rather than a landing and a swap buffer --
+// on Qwen3-1.7B, 117.44 MB per block, 235 MB per thread instead of 470. A
+// second buffer buys nothing here: a block is swapped and copied out before
+// the next one starts. It would buy something to a pipeline that overlaps a
+// block's host copy with the next block's swap, and that is where it belongs.
 //
-// buf holds rows x [a, b, d]; afterwards it holds rows x [b, a, d].
-void swap_in_place(at::Tensor& buf, int64_t rows, int64_t a, int64_t b,
-                   int64_t d) {
+// This branch is built against a torch-rbln whose copy_strided_view takes the
+// flag; the dispatcher says so plainly if it does not.
+const auto& swap_view_op() {
   static const auto op =
       c10::Dispatcher::singleton()
-          .findSchemaOrThrow("torch_rbln::copy_strided_view_inplace", "")
-          .typed<bool(const at::Tensor&, at::Tensor&)>();
-  at::Tensor src = buf.view({rows, a, b, d}).permute({0, 2, 1, 3});
-  at::Tensor out = buf.view({rows, b, a, d});
-  TORCH_CHECK(op.call(src, out),
-              "copy_strided_view_inplace declined the swap view");
+          .findSchemaOrThrow("torch_rbln::copy_strided_view", "")
+          .typed<bool(const at::Tensor&, at::Tensor&, bool)>();
+  return op;
 }
 
 // How the staging is sharded, and where the shards live. RBLN device DRAM is
@@ -66,17 +62,10 @@ void swap_in_place(at::Tensor& buf, int64_t rows, int64_t a, int64_t b,
 // keeps linking only ATen.
 int64_t staging_shards(const at::Tensor& any_device_tensor) {
   static const int64_t shards = [&] {
-    const auto count = c10::Dispatcher::singleton().findSchema(
-        {"torch_rbln::chiplet_count", ""});
-    TORCH_CHECK(count.has_value() &&
-                    c10::Dispatcher::singleton()
-                        .findSchema({"torch_rbln::bind_device_memory_at", ""})
-                        .has_value(),
-                "this torch-rbln cannot place a tensor on a chiplet "
-                "(torch_rbln::chiplet_count, torch_rbln::bind_device_memory_at); "
-                "the RBLN KV transfer needs both");
-    return std::max<int64_t>(
-        count->typed<int64_t(const at::Tensor&)>().call(any_device_tensor), 1);
+    const auto count = c10::Dispatcher::singleton()
+                           .findSchemaOrThrow("torch_rbln::chiplet_count", "")
+                           .typed<int64_t(const at::Tensor&)>();
+    return std::max<int64_t>(count.call(any_device_tensor), 1);
   }();
   return shards;
 }
@@ -109,7 +98,7 @@ at::Tensor staging(at::IntArrayRef shape, at::ScalarType dtype,
               .findSchemaOrThrow("torch_rbln::bind_device_memory_at", "")
               .typed<void(at::Tensor&, int64_t)>();
       bind.call(buf, /*chiplet=*/shard);
-    }
+    }  // one chiplet, nothing to place
   }
   return buf;
 }
@@ -273,8 +262,17 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
       hnd_block_copy_lists(layers, block_ids[u], staged, lo, hi, slots, blocks);
       at::_foreach_copy_(slots, blocks);
 
-      // The bytes are token-major after this; the tensor's shape has to say so.
-      swap_in_place(staged, 2 * nl, g.heads, g.block_size, g.head_size);
+      // In place: the program reads the buffer head-major and writes it back
+      // token-major. The tensor's shape has to follow the bytes.
+      const int64_t rows = 2 * nl;
+      at::Tensor token_major_view =
+          staged.view({rows, g.block_size, g.heads, g.head_size});
+      TORCH_CHECK(
+          swap_view_op().call(staged.view({rows, g.heads, g.block_size,
+                                           g.head_size})
+                                  .permute({0, 2, 1, 3}),
+                              token_major_view, /*inplace=*/true),
+          "copy_strided_view declined the gather swap");
       at::Tensor token_major =
           staged.view({2, nl, g.block_size, g.heads * g.head_size});
 
@@ -314,8 +312,16 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
                            regions, pieces);
       at::_foreach_copy_(pieces, regions);
 
-      // The bytes are head-major now; the tensor's shape has to say so too.
-      swap_in_place(staged, 2 * nl, g.block_size, g.heads, g.head_size);
+      // In place, the other way round: token-major in, head-major out.
+      const int64_t rows = 2 * nl;
+      at::Tensor head_major_view =
+          staged.view({rows, g.heads, g.block_size, g.head_size});
+      TORCH_CHECK(
+          swap_view_op().call(staged.view({rows, g.block_size, g.heads,
+                                           g.head_size})
+                                  .permute({0, 2, 1, 3}),
+                              head_major_view, /*inplace=*/true),
+          "copy_strided_view declined the scatter swap");
       at::Tensor head_major =
           staged.view({2, nl, g.heads, g.block_size, g.head_size});
       std::vector<at::Tensor> slots, blocks;
