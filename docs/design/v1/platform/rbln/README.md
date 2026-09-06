@@ -214,6 +214,26 @@ chain behind it on the main stream, the host copy's event chains behind the
 swaps, and the host issues a block and moves on to the next. The pace is then
 the device's own -- the D2D plus the swaps -- with the host copy underneath.
 
+Two more costs sat on that path and had to go with it. torch-rbln kept one
+compiled swap program per staging address in `len(seen) % 8` slots, so the
+pipeline's 16 addresses (two slots, four shards, two directions) shared
+programs and rebound one on every block -- and a rebind re-uploads the
+program's instruction streams through an allocator that first waits for every
+transfer in flight, which is the pipeline's overlap: 24.5 / 16.7 GB/s sharded
+against 35.0 / 36.3 with enough slots. The slots are now an LRU of 64. And the
+runtime's copy planner walked every relocation of the KV layer's head-sharded
+transform (thousands) for every piece of the 224-piece gather; sampled in the
+worker it was 60% of the host's time. It now searches a sorted index.
+
+Measured (Qwen3-1.7B, 8 blocks, pinned, sharded over 4 chiplets): 17.2 / 19.7
+GB/s (gather / scatter) before any of this, 36.7 / 37.8 with the non-blocking
+D2D and the slots, 38.4 / 38.1 with the planner's index. What sets the pace
+now is the device: the gather D2D of a block is 896 descriptors (each 2 MiB
+(kv, layer) piece is four 512 KiB chiplet pieces under the head sharding), and
+the four shards' swaps read three of them over the die-to-die links. The same
+bytes copied staging-to-staging in 56 pieces take 0.55 ms; the paged gather
+takes about three times that.
+
 ### One buffer, swapped in place
 
 The swap between the two layouts is a compiled device program, and torch-rbln's
