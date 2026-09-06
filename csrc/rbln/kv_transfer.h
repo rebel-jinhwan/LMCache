@@ -47,4 +47,8 @@ void scatter_chunks_to_blocks_mla(const std::vector<at::Tensor>& layers,
 // the program permutes it in its own storage) or "two-buffer".
 std::string staging_swap_mode();
 
+// How many layer groups the HND staging is split into, one per chiplet
+// (LMCACHE_RBLN_STAGING_SPLIT); needs a device tensor to ask the device.
+int64_t staging_split_groups(const at::Tensor& any_device_tensor);
+
 }  // namespace lmcache::rbln
