@@ -173,3 +173,27 @@ Both layouts require the engine's KV caches to be real device tensors
 allocation the per-layer tensors are `meta`, and any transfer -- this
 backend's or the shared path's -- dies at the first host copy with "Cannot
 copy out of meta tensor".
+
+## Staging buffers
+
+The native transfer (`csrc/rbln/kv_transfer.cpp`) moves each block through
+device staging: the block is gathered head-major (`[2, L, H, BS, D]`) and the
+host wants it token-major (`[2, L, BS, H, D]`), or the reverse on retrieve. The
+swap between the two layouts is a compiled device program, and torch-rbln's
+`torch_rbln::copy_strided_view_inplace` runs it with the output aliasing the
+input, so a direction needs **one buffer, not a landing and a swap buffer**:
+on Qwen3-1.7B (117.44 MB per block) 235 MB per thread instead of 470.
+
+`copy_` cannot be used for this -- ATen refuses partially overlapping pairs --
+so the transfer calls the op directly. Correctness rests on the compiled
+schedule finishing its reads of a region before writing it, which is the
+compiler's tiling rather than anything this code controls; torch-rbln therefore
+checks each geometry once against an out-of-place copy (measured bit-exact on
+ten geometries: heads 2--16, tokens 16--256, head size 64/128, rows 2--72) and
+raises if the check fails, and the transfer falls back to two buffers when the
+op is missing. `LMCACHE_RBLN_STAGING_INPLACE=0` forces the two-buffer path;
+`rbln_ops.staging_swap_mode()` reports which is in effect.
+
+The buffers are `thread_local`, so every thread that transfers holds its own
+set: store runs on the engine-driven commit pool (4 workers by default),
+retrieve on the caller's thread.
