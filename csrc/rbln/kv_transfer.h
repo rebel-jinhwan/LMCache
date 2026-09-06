@@ -11,15 +11,19 @@ namespace lmcache::rbln {
 
 // Gather whole paged blocks into token-major chunks [2, L, T, H*D]: D2D gather
 // into device staging, head<->token swap on the device, D2H of each chunk's
-// bytes, one block at a time. `layers` are per-layer HND tensors
-// [2, NB, NH, BS, HS].
+// bytes, one block at a time, the host copies overlapping the next block's
+// device work. `layers` are per-layer HND tensors [2, NB, NH, BS, HS]. The
+// chunks are complete on return.
 void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
                                  const std::vector<int64_t>& block_ids,
                                  const std::vector<at::Tensor>& chunks,
                                  int64_t blocks_per_chunk);
 
 // Mirror of the gather; `skip_prefix_n_blocks` leading blocks are left
-// untouched.
+// untouched. The host copies are complete on return; the last block's device
+// copy into the paged blocks is dispatched in order on the device's current
+// stream, so work on that stream, and a host read of the blocks, see it
+// complete.
 void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
                                   const std::vector<int64_t>& block_ids,
                                   const std::vector<at::Tensor>& chunks,

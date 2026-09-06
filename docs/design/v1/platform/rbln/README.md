@@ -142,19 +142,21 @@ exercise the kernels without hardware.
   the whole block into device staging, the swap as a permuted `copy_` that
   torch-rbln runs as a compiled program, and a D2H of the chunk's bytes --
   one descriptor per whole chunk when `chunk_size == block_size`, one per
-  (kv, layer) otherwise. Scatter is the mirror. Sequential, one block at a
-  time, and the boundary copies are blocking: a non-blocking D2H followed by
-  the next block's swap into the same output buffer is a real race on a
-  runtime that routes async host copies to a second UMD context.
+  (kv, layer) otherwise. Scatter is the mirror. Block after block, and
+  nothing in the loop waits for the device: the D2D is dispatched
+  non-blocking on the main stream, the swap programs chain behind it, and
+  the host copy runs on a second stream fenced by events per block (see
+  [Staging buffers](#staging-buffers)).
 - **Staging slots, per thread, reused.** `staging()` in `kv_transfer.cpp`
-  keeps one device buffer per `(thread, slot)`; gather and scatter own
-  separate slots so a round trip on one thread never fights over a buffer,
-  and separate threads (the multiprocess server's pool) never share one.
-  Buffers are reused across calls rather than freshly allocated: torch-rbln
-  keys compiled device programs on the buffer's address, and a model's
-  geometry is fixed after load, so a slot is only reallocated on the rare
-  call whose shape doesn't match. HND owns four slots (gather landing and
-  swap output, the same pair for scatter), MLA two.
+  keeps one device buffer per `(thread, slot, shard, pipeline slot)`; a
+  thread's gather and scatter share the HND staging (a thread runs one
+  transfer at a time; the same bytes are viewed head-major by one and
+  token-major by the other), and separate threads (the multiprocess server's
+  pool) never share one. Buffers are reused across calls rather than freshly
+  allocated: torch-rbln keys compiled device programs on the buffer's
+  address, and a model's geometry is fixed after load, so a slot is only
+  reallocated on the rare call whose shape doesn't match. HND owns two
+  pipeline slots of `shards` buffers per thread, MLA two buffers.
 - **MLA: one chunk at a time.** Gather: `_foreach_copy_` of the chunk's whole
   `[BS, HS]` blocks into their token windows of the `[L, bpc*BS, HS]` staging
   buffer (D2D, direct `memcpy_v2v`, no index tensor), then the chunk's bytes
@@ -185,11 +187,32 @@ host wants it token-major (`[2, L, BS, H, D]`), or the reverse on retrieve.
 The host copies run on their own stream, so a block's copy overlaps the next
 block's gather and swap; events order the two streams per block -- not by
 draining the copy stream, which would serialise exactly what the pipeline is
-for. That needs **two staging sets per direction**, taken in turn by block: in
-place, the buffer a block's host copy is still reading is the buffer the next
-block wants to gather into, so with one set the swap would have to wait. The
-second set is sharded like the first, so it costs `block/shards` on a chiplet
-rather than a whole block.
+for. That needs **two staging sets**, taken in turn by block: in place, the
+buffer a block's host copy is still reading is the buffer the next block wants
+to gather into, so with one set the swap would have to wait. The second set is
+sharded like the first, so it costs `block/shards` on a chiplet rather than a
+whole block, and both directions of a thread share the two sets: a shard is
+kept as `[2*nl, H*BS, D]`, from which the gather's head-major and the
+scatter's token-major layout are each one reshape -- a view chain the compiled
+copy replays from the buffer it is bound to, where a buffer kept in one
+direction's shape could not be re-viewed for the other.
+
+### Nothing waits on the host
+
+The device-to-device gather of a block (224 pieces of 512 KB on Qwen3-1.7B,
+1.9 ms) used to be a synchronous call: the host sat in it until the copy
+landed, and only then dispatched the swaps, built the host copy's descriptors
+and issued it -- about 1 ms of host work per block that ran *after* the copy
+instead of *under* it. Measured with every call timed inside the pipeline
+(sharded, pinned, 8 blocks): 2.95 ms per block, of which the D2D was 1.95 and
+the host's own work the rest; the same pipeline with the host copy removed ran
+at 2.45 ms per block, so the device was idle for the difference.
+
+The D2D is now dispatched non-blocking (`_foreach_copy_(..., non_blocking=
+true)`, which torch-rbln turns into a stream-ordered batch): the swap programs
+chain behind it on the main stream, the host copy's event chains behind the
+swaps, and the host issues a block and moves on to the next. The pace is then
+the device's own -- the D2D plus the swaps -- with the host copy underneath.
 
 ### One buffer, swapped in place
 
@@ -197,10 +220,9 @@ The swap between the two layouts is a compiled device program, and torch-rbln's
 `torch_rbln::copy_strided_view(src, out, inplace=True)` runs it with the output
 aliasing the input, so a direction needs **one buffer, not a landing and a swap
 buffer**:
-on Qwen3-1.7B (117.44 MB per block) 235 MB per thread instead of 470. A second
-buffer buys nothing at this stage -- a block is swapped and copied out before
-the next one starts -- and would only pay off in a pipeline that overlaps a
-block's host copy with the next block's swap.
+on Qwen3-1.7B (117.44 MB per block) 235 MB per thread instead of 470. The
+second buffer that is worth having is the pipeline's second slot above, not a
+swap output.
 
 `copy_` cannot be used for this -- ATen refuses partially overlapping pairs --
 so the transfer calls the op directly. Correctness rests on the compiled
@@ -256,17 +278,18 @@ peak counters, as the delta over the pre-transfer level:
 | two buffers, one chiplet (before) | 352.9 MB | 705.7 MB | 1411.5 MB | 2822.9 MB |
 | in place, one chiplet | 352.9 | 588.3 | 941.7 | 1883.4 |
 | **in place, sharded over 4 chiplets** | **146.9** | **293.8** | **352.6** | **470.0** |
+| in place, sharded, pipelined over two slots shared by both directions | 117.9 | 236.3 | 117.9 | 236.3 |
 
 Six times less on the busiest chiplet for the four-thread round trip, and the
 sharding flattens the thread scaling: the staging is
 `threads x shards x block/shards` either way, but only `1/shards` of it lands on
-any one chiplet.
-
-What remains on chiplet 0 is mostly **not** staging. Each compiled swap program
-allocates an output-sized buffer of its own at load, even though the transfer
-hands it the staging buffer to write (`run(out=)`), and those buffers stay on
-chiplet 0: 8 of them (torch-rbln compiles one program per source buffer, capped
-at 8 slots), so `8 x block/shards` = 235 MB of the 470 above.
+any one chiplet. With the pipeline's two slots shared by a thread's gather and
+scatter, a round trip holds what a gather holds, and the four-thread round trip
+is `4 x 2 x block/shards` = 235 MB a chiplet -- all of it staging: the compiled
+swap programs allocate no output of their own (the runtime allocates an
+executor output only for a run that does not supply one), and the twelve-fold
+reduction against the two-buffer, one-chiplet starting point (2822.9 MB) holds
+with the pipeline.
 
 Correctness under threads is its own gate: the bench's `--verify` drives one
 thread, so it cannot see two threads swapping each other's staging. The

@@ -205,6 +205,38 @@ def test_round_trip_restores_the_paged_cache() -> None:
 
 
 @needs_extension
+def test_scatter_then_gather_on_one_thread_is_exact() -> None:
+    """A thread's scatter and gather stage in the same buffers, viewed
+    token-major by one and head-major by the other; a gather right after a
+    scatter must read what the paged cache holds, not what the scatter left
+    behind in the staging."""
+    src = _paged_layers(fill_random=True)
+    dst = _paged_layers()
+    chunks = _chunks()
+    _transfer(src, chunks, TransferDirection.D2H)
+    _transfer(dst, chunks, TransferDirection.H2D)
+    other = _paged_layers(fill_random=True)
+    for layer in other:
+        layer.mul_(-1)  # a distinct pattern from what the scatter staged
+    again = _chunks()
+    _transfer(other, again, TransferDirection.D2H)
+    reference = _chunks()
+    multi_layer_block_kv_transfer(
+        squeeze_singleton_axis(other),
+        reference,
+        list(range(NUM_BLOCKS)),
+        torch.device("cpu"),
+        TransferDirection.D2H,
+        _shape_desc(),
+        CHUNK_TOKENS,
+        EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
+        0,
+    )
+    for got, expected in zip(again, reference, strict=True):
+        assert torch.equal(got, expected)
+
+
+@needs_extension
 @pytest.mark.parametrize("skip", [1, 2, 3])
 def test_prefix_skip_leaves_leading_blocks_untouched(skip: int) -> None:
     """A whole-block prefix skip is neither read nor written."""

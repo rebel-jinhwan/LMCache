@@ -18,15 +18,16 @@ namespace lmcache::rbln {
 namespace {
 
 // Staging slots: one device buffer per thread per slot -- per layer group, see
-// staging(). Gather and scatter never share a slot, so a round trip on one
-// thread cannot fight over a buffer. Buffers are reused across calls rather
+// staging(). A thread runs one transfer at a time, so its gather and its scatter
+// share the HND staging: the same bytes, viewed head-major by one and token-major
+// by the other. Sharing halves what a thread holds, and halves the buffer addresses
+// torch-rbln keeps a compiled program for. Buffers are reused across calls rather
 // than freshly allocated: torch-rbln keys compiled device programs (the HND
-// permute) on the buffer's address and rebinding a new one costs milliseconds,
-// and a model's geometry is fixed after load, so a slot is only reallocated on
-// the rare call whose shape doesn't match.
+// permute) on the buffer's address, and rebinding one to another buffer costs it
+// a wait for every transfer in flight; a model's geometry is fixed after load, so
+// a slot is only reallocated on the rare call whose shape doesn't match.
 enum Slot : int {
-  kHndGather,
-  kHndScatter,
+  kHndStaging,
   kMlaGather,
   kMlaScatter,
   kSlotCount
@@ -42,10 +43,14 @@ constexpr int64_t kPipelineSlots = 2;
 // The host copies run on their own stream, and events order the two streams.
 // The waits are per block, never "everything queued on the copy stream": the
 // pipeline issues the next block's host copy before the current block's swap,
-// so a blanket wait would serialise them.
+// so a blanket wait would serialise them. CPU tensors -- the extension's own
+// tests run the kernel on them -- have no events and one stream, on which the
+// copies simply run in order, which is what the events establish anyway; a
+// fence recorded there is empty and waiting on it is a no-op.
 using Fence = std::optional<c10::Event>;
 
 Fence record(const c10::Stream& stream) {
+  if (stream.device_type() == c10::DeviceType::CPU) return std::nullopt;
   Fence fence(std::in_place, stream.device_type());
   fence->record(stream);
   return fence;
@@ -185,6 +190,19 @@ Geometry geometry(const std::vector<at::Tensor>& layers) {
 
 // ── HND ──────────────────────────────────────────────────────────────
 
+// The HND staging of a shard: `nl` layers of the block, shared by the gather
+// (which stages it head-major, [2, nl, H, BS, D]) and the scatter (token-major,
+// [2, nl, BS, H, D]). It is kept as [2*nl, H*BS, D]: both layouts are one split
+// of its middle dim, which is a view chain torch-rbln's compiled copy can
+// replay from the buffer it is bound to. A buffer kept in one direction's 5-D
+// shape cannot be re-viewed for the other -- that reshape is not one the copy
+// classifies -- and a flat one cannot be viewed for either.
+at::Tensor hnd_staging(const Geometry& g, int64_t nl, int64_t shard,
+                       int64_t shards, int64_t pslot) {
+  return staging({2 * nl, g.heads * g.block_size, g.head_size}, g.dtype,
+                 g.device, kHndStaging, shard, shards, pslot);
+}
+
 // Pair every staging slot [half, layer - lo] with its whole paged block, for
 // layers [lo, hi).
 void hnd_block_copy_lists(const std::vector<at::Tensor>& layers, int64_t block,
@@ -291,15 +309,23 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
   // block, not per shard: one _foreach_copy_ carries every shard's pieces, because
   // a copy call costs the host whatever it carries plus a fixed amount, and four
   // calls of a quarter each measured 0.7 ms per block worse than one.
+  //
+  // Nothing in the loop waits for the device. The device-to-device gather is
+  // dispatched non-blocking, so it is ordered on the main stream like the swap
+  // programs after it rather than waited for on the host: a synchronous gather
+  // held the host for the copy's 1.9 ms per block, and everything else the host
+  // does for a block (the swap dispatches, the host copy's descriptors, these
+  // lists) then ran after it instead of under it. Per block the host now issues
+  // and moves on, and the device's own time is what sets the pace.
   const int64_t shards = std::min(staging_shards(layers[0]), g.layers);
   std::vector<int64_t> lo(shards), hi(shards);
   for (int64_t shard = 0; shard < shards; ++shard) {
     shard_layers(g.layers, shards, shard, lo[shard], hi[shard]);
   }
   auto staged_at = [&](int64_t shard, int64_t pslot) {
-    return staging({2, hi[shard] - lo[shard], g.heads, g.block_size,
-                    g.head_size},
-                   g.dtype, g.device, kHndGather, shard, shards, pslot);
+    const int64_t nl = hi[shard] - lo[shard];
+    return hnd_staging(g, nl, shard, shards, pslot)
+        .view({2, nl, g.heads, g.block_size, g.head_size});
   };
   c10::impl::VirtualGuardImpl guard_impl(g.device.type());
   const c10::Stream main = guard_impl.getStream(g.device);
@@ -317,7 +343,7 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
       hnd_block_copy_lists(layers, block_ids[u], staged[shard], lo[shard],
                            hi[shard], slots, blocks);
     }
-    at::_foreach_copy_(slots, blocks);
+    at::_foreach_copy_(slots, blocks, /*non_blocking=*/true);
 
     std::vector<at::Tensor> regions, pieces;
     for (int64_t shard = 0; shard < shards; ++shard) {
@@ -367,9 +393,9 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
     shard_layers(g.layers, shards, shard, lo[shard], hi[shard]);
   }
   auto staged_at = [&](int64_t shard, int64_t pslot) {
-    return staging({2, hi[shard] - lo[shard], g.block_size, g.heads,
-                    g.head_size},
-                   g.dtype, g.device, kHndScatter, shard, shards, pslot);
+    const int64_t nl = hi[shard] - lo[shard];
+    return hnd_staging(g, nl, shard, shards, pslot)
+        .view({2, nl, g.block_size, g.heads, g.head_size});
   };
   c10::impl::VirtualGuardImpl guard_impl(g.device.type());
   const c10::Stream main = guard_impl.getStream(g.device);
@@ -425,7 +451,11 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
                                         g.head_size}),
                            lo[shard], hi[shard], slots, blocks);
     }
-    at::_foreach_copy_(blocks, slots);
+    // Non-blocking, like the gather's: the paged blocks are complete for work
+    // on the main stream, and the next H2D into these buffers waits for it
+    // through `scattered`. A host that reads the blocks reads behind it too --
+    // the runtime orders a synchronous copy behind the transfers touching it.
+    at::_foreach_copy_(blocks, slots, /*non_blocking=*/true);
     scattered[u] = record(main);
   }
   guard_impl.synchronizeStream(copy);
