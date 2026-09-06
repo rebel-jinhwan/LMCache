@@ -3,8 +3,14 @@
 
 #include <ATen/core/dispatch/Dispatcher.h>
 
+#include <c10/core/Event.h>
+#include <c10/core/StreamGuard.h>
+#include <c10/core/impl/VirtualGuardImpl.h>
+
 #include <algorithm>
 #include <map>
+#include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -26,14 +32,35 @@ enum Slot : int {
   kSlotCount
 };
 
+// Two staging sets per direction, alternating by block, so a block's host copy
+// overlaps the next block's gather and swap. One set would serialise them: in
+// place, the buffer a block's host copy is still reading is the buffer the next
+// block wants to gather into.
+constexpr int64_t kPipelineSlots = 2;
+
+// The host copies run on their own stream, and events order the two streams.
+// The waits are per block, never "everything queued on the copy stream": the
+// pipeline issues the next block's host copy before the current block's swap,
+// so a blanket wait would serialise them.
+using Fence = std::optional<c10::Event>;
+
+Fence record(const c10::Stream& stream) {
+  Fence fence(std::in_place, stream.device_type());
+  fence->record(stream);
+  return fence;
+}
+
+void wait(Fence& fence, const c10::Stream& stream) {
+  if (fence.has_value()) fence->block(stream);
+}
+
 // The head<->token swap is the compiled view copy run in place (its output
 // aliasing its input), so it permutes the staging buffer in the buffer's own
 // storage (torch-rbln verifies each geometry once against a host reference).
 // One staging buffer per direction rather than a landing and a swap buffer --
-// on Qwen3-1.7B, 117.44 MB per block, 235 MB per thread instead of 470. A
-// second buffer buys nothing here: a block is swapped and copied out before
-// the next one starts. It would buy something to a pipeline that overlaps a
-// block's host copy with the next block's swap, and that is where it belongs.
+// on Qwen3-1.7B, 117.44 MB per block, 235 MB per thread instead of 470. The
+// pipeline below takes two such buffers per direction, which is where the
+// second one earns its memory.
 //
 // This branch is built against a torch-rbln whose copy_strided_view takes the
 // flag; the dispatcher says so plainly if it does not.
@@ -85,10 +112,10 @@ void shard_layers(int64_t layers, int64_t shards, int64_t shard, int64_t& lo,
 // the thing the sharding exists to avoid.
 at::Tensor staging(at::IntArrayRef shape, at::ScalarType dtype,
                    const at::Device& device, Slot slot, int64_t shard,
-                   int64_t shards) {
-  using Key = std::pair<int, int64_t>;
+                   int64_t shards, int64_t pipeline_slot = 0) {
+  using Key = std::tuple<int, int64_t, int64_t>;
   thread_local std::map<Key, at::Tensor> buffers;
-  at::Tensor& buf = buffers[Key{slot, shard}];
+  at::Tensor& buf = buffers[Key{slot, shard, pipeline_slot}];
   if (!buf.defined() || buf.sizes() != shape || buf.scalar_type() != dtype ||
       buf.device() != device) {
     buf = at::empty(shape, at::TensorOptions().dtype(dtype).device(device));
@@ -249,15 +276,24 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
   // Sharded by layer: each shard of the block is gathered, swapped and read
   // out on its own staging buffer, which lives on its own chiplet.
   const int64_t shards = std::min(staging_shards(layers[0]), g.layers);
+  c10::impl::VirtualGuardImpl guard_impl(g.device.type());
+  const c10::Stream main = guard_impl.getStream(g.device);
+  const c10::Stream copy = guard_impl.getNewStream(g.device);
+  std::vector<Fence> d2h_done(n * shards);
   for (int64_t u = 0; u < n; ++u) {
+    const int64_t pslot = u % kPipelineSlots;
     for (int64_t shard = 0; shard < shards; ++shard) {
       int64_t lo, hi;
       shard_layers(g.layers, shards, shard, lo, hi);
       const int64_t nl = hi - lo;
       const std::vector<int64_t> shape{2, nl, g.heads, g.block_size,
                                        g.head_size};
-      at::Tensor staged =
-          staging(shape, g.dtype, g.device, kHndGather, shard, shards);
+      at::Tensor staged = staging(shape, g.dtype, g.device, kHndGather, shard,
+                                  shards, pslot);
+      // The block that last used this pipeline slot is still reading it out.
+      if (u >= kPipelineSlots) {
+        wait(d2h_done[(u - kPipelineSlots) * shards + shard], main);
+      }
       std::vector<at::Tensor> slots, blocks;
       hnd_block_copy_lists(layers, block_ids[u], staged, lo, hi, slots, blocks);
       at::_foreach_copy_(slots, blocks);
@@ -279,9 +315,16 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
       std::vector<at::Tensor> regions, pieces;
       hnd_chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, lo, hi,
                            regions, pieces);
-      at::_foreach_copy_(regions, pieces);
+      Fence swapped = record(main);
+      wait(swapped, copy);
+      {
+        c10::StreamGuard guard(copy);
+        at::_foreach_copy_(regions, pieces, /*non_blocking=*/true);
+      }
+      d2h_done[u * shards + shard] = record(copy);
     }
   }
+  guard_impl.synchronizeStream(copy);
 }
 
 void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
@@ -296,21 +339,56 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
   check_chunks(chunks, /*token_dim=*/2, bpc, g.block_size, n);
   // Sharded by layer, as in the gather.
   const int64_t shards = std::min(staging_shards(layers[0]), g.layers);
-  for (int64_t u = start; u < n; ++u) {
+  const int64_t m = n - start;  // blocks in this transfer
+  c10::impl::VirtualGuardImpl guard_impl(g.device.type());
+  const c10::Stream main = guard_impl.getStream(g.device);
+  const c10::Stream copy = guard_impl.getNewStream(g.device);
+  std::vector<Fence> h2d_done(m * shards), scattered(m * shards);
+
+  auto shard_shape = [&](int64_t shard, int64_t& lo, int64_t& hi) {
+    shard_layers(g.layers, shards, shard, lo, hi);
+    return std::vector<int64_t>{2, hi - lo, g.block_size, g.heads, g.head_size};
+  };
+  // Fill block u's landing buffers from the host, on the copy stream.
+  auto issue_copy = [&](int64_t u) {
     for (int64_t shard = 0; shard < shards; ++shard) {
       int64_t lo, hi;
-      shard_layers(g.layers, shards, shard, lo, hi);
-      const int64_t nl = hi - lo;
-      const std::vector<int64_t> shape{2, nl, g.block_size, g.heads,
-                                       g.head_size};
-      at::Tensor staged =
-          staging(shape, g.dtype, g.device, kHndScatter, shard, shards);
+      const auto shape = shard_shape(shard, lo, hi);
+      at::Tensor staged = staging(shape, g.dtype, g.device, kHndScatter, shard,
+                                  shards, u % kPipelineSlots);
       at::Tensor token_major =
-          staged.view({2, nl, g.block_size, g.heads * g.head_size});
+          staged.view({2, hi - lo, g.block_size, g.heads * g.head_size});
       std::vector<at::Tensor> regions, pieces;
-      hnd_chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, lo, hi,
-                           regions, pieces);
-      at::_foreach_copy_(pieces, regions);
+      hnd_chunk_copy_lists(chunks, token_major, start + u, bpc, g.block_size, lo,
+                           hi, regions, pieces);
+      {
+        c10::StreamGuard guard(copy);
+        at::_foreach_copy_(pieces, regions, /*non_blocking=*/true);
+      }
+      h2d_done[u * shards + shard] = record(copy);
+    }
+  };
+
+  if (m > 0) issue_copy(0);
+  for (int64_t u = 0; u < m; ++u) {
+    if (u + 1 < m) {
+      // That H2D refills the buffers the block a pipeline slot back swapped and
+      // scattered out of -- in place, the same buffers.
+      if (u >= kPipelineSlots - 1) {
+        for (int64_t shard = 0; shard < shards; ++shard) {
+          wait(scattered[(u - (kPipelineSlots - 1)) * shards + shard], copy);
+        }
+      }
+      issue_copy(u + 1);
+    }
+    for (int64_t shard = 0; shard < shards; ++shard) {
+      int64_t lo, hi;
+      const auto shape = shard_shape(shard, lo, hi);
+      const int64_t nl = hi - lo;
+      at::Tensor staged = staging(shape, g.dtype, g.device, kHndScatter, shard,
+                                  shards, u % kPipelineSlots);
+      // This block's H2D, not the ones issued after it.
+      wait(h2d_done[u * shards + shard], main);
 
       // In place, the other way round: token-major in, head-major out.
       const int64_t rows = 2 * nl;
@@ -325,11 +403,13 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
       at::Tensor head_major =
           staged.view({2, nl, g.heads, g.block_size, g.head_size});
       std::vector<at::Tensor> slots, blocks;
-      hnd_block_copy_lists(layers, block_ids[u], head_major, lo, hi, slots,
-                           blocks);
+      hnd_block_copy_lists(layers, block_ids[start + u], head_major, lo, hi,
+                           slots, blocks);
       at::_foreach_copy_(blocks, slots);
+      scattered[u * shards + shard] = record(main);
     }
   }
+  guard_impl.synchronizeStream(copy);
 }
 
 void gather_blocks_to_chunks_mla(const std::vector<at::Tensor>& layers,

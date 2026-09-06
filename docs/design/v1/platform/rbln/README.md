@@ -180,6 +180,17 @@ The native transfer (`csrc/rbln/kv_transfer.cpp`) moves each block through
 device staging: the block is gathered head-major (`[2, L, H, BS, D]`) and the
 host wants it token-major (`[2, L, BS, H, D]`), or the reverse on retrieve.
 
+### Pipelined over two slots
+
+The host copies run on their own stream, so a block's copy overlaps the next
+block's gather and swap; events order the two streams, per block and per shard
+rather than by draining the copy stream (a blanket wait would serialise exactly
+what the pipeline is for). That needs **two staging sets per direction**, taken
+in turn by block: in place, the buffer a block's host copy is still reading is
+the buffer the next block wants to gather into, so with one set the swap would
+have to wait. Two sets on a sharded staging is `2 x block/shards` per direction
+per thread -- 59 MB on Qwen3-1.7B -- against `2 x block` (235 MB) unsharded.
+
 ### One buffer, swapped in place
 
 The swap between the two layouts is a compiled device program, and torch-rbln's
