@@ -19,11 +19,7 @@ PYBIND11_MODULE(rbln_ops, m) {
         &lmcache::rbln::scatter_chunks_to_blocks_mla, py::arg("paged_layers"),
         py::arg("block_ids"), py::arg("chunks"), py::arg("blocks_per_chunk"),
         py::arg("skip_prefix_n_blocks") = 0);
-  m.def("staging_swap_mode", &lmcache::rbln::staging_swap_mode,
-        "How the head<->token swap is staged: 'inplace' or 'two-buffer' "
-        "(LMCACHE_RBLN_STAGING_INPLACE, and whether torch-rbln has the op)");
-  m.def("staging_split_groups", &lmcache::rbln::staging_split_groups,
+  m.def("staging_shard_count", &lmcache::rbln::staging_shard_count,
         py::arg("any_device_tensor"),
-        "How many layer groups the HND staging is split into, one per chiplet "
-        "(LMCACHE_RBLN_STAGING_SPLIT)");
+        "How many shards the HND staging is cut into, one per chiplet");
 }

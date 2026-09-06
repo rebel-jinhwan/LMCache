@@ -178,11 +178,17 @@ copy out of meta tensor".
 
 The native transfer (`csrc/rbln/kv_transfer.cpp`) moves each block through
 device staging: the block is gathered head-major (`[2, L, H, BS, D]`) and the
-host wants it token-major (`[2, L, BS, H, D]`), or the reverse on retrieve. The
-swap between the two layouts is a compiled device program, and torch-rbln's
+host wants it token-major (`[2, L, BS, H, D]`), or the reverse on retrieve.
+
+### One buffer, swapped in place
+
+The swap between the two layouts is a compiled device program, and torch-rbln's
 `torch_rbln::copy_strided_view_inplace` runs it with the output aliasing the
 input, so a direction needs **one buffer, not a landing and a swap buffer**:
-on Qwen3-1.7B (117.44 MB per block) 235 MB per thread instead of 470.
+on Qwen3-1.7B (117.44 MB per block) 235 MB per thread instead of 470. A second
+buffer buys nothing at this stage -- a block is swapped and copied out before
+the next one starts -- and would only pay off in a pipeline that overlaps a
+block's host copy with the next block's swap.
 
 `copy_` cannot be used for this -- ATen refuses partially overlapping pairs --
 so the transfer calls the op directly. Correctness rests on the compiled
@@ -190,15 +196,13 @@ schedule finishing its reads of a region before writing it, which is the
 compiler's tiling rather than anything this code controls; torch-rbln therefore
 checks each geometry once against an out-of-place copy (measured bit-exact on
 ten geometries: heads 2--16, tokens 16--256, head size 64/128, rows 2--72) and
-raises if the check fails, and the transfer falls back to two buffers when the
-op is missing. `LMCACHE_RBLN_STAGING_INPLACE=0` forces the two-buffer path;
-`rbln_ops.staging_swap_mode()` reports which is in effect.
+raises if the check fails.
 
 The buffers are `thread_local`, so every thread that transfers holds its own
 set: store runs on the engine-driven commit pool (4 workers by default),
 retrieve on the caller's thread.
 
-### Where the staging lives
+### Sharded over the chiplets
 
 RBLN device DRAM is one pool per chiplet (32 GiB each on RBLN-CR13) and the
 runtime pins an allocation to the chiplet it names, without spilling. Every
@@ -207,25 +211,18 @@ thread would all sit on chiplet 0's pool next to that chiplet's share of the
 model. The KV cache itself is split over the chiplets **by head** (heads
 `[2k, 2k+1]` of every layer and block live on chiplet `k` on this geometry).
 
-The staging is split **by layer** instead: layer group `g` of the block stages
-on chiplet `g` (`torch.rbln.bind_device_memory(t, chiplet=g)` through the
-dispatcher op), is swapped there in place, and its `(kv, layer)` rows are what
-the host chunk holds contiguously, so the per-chiplet host copies are the same
-2 MiB rows as before. A head split would have matched the paged blocks but the
-host wants every head of a token together, so it would have needed a
-token-granular merge (512 B pieces) on the device or a change of the host
-layout. Measured, device-to-device and host DMA cost the same from any chiplet;
-the swap program runs on chiplet 0 and reads the other chiplets over the
-die-to-die links, which is the one cost of the split (+0.2--0.5 ms per block
-before pipelining).
-
-| `LMCACHE_RBLN_STAGING_SPLIT` | staging per direction per thread on chiplet 0 |
-|---|---|
-| `chiplets` (default) | one layer group of `L / chiplets`: 29 MB on Qwen3-1.7B, the other chiplets 29 MB each |
-| `none` | the whole block: 117 MB |
-
-`rbln_ops.staging_split_groups(t)` reports the group count in effect. A
-torch-rbln without the placement op falls back to one group with a warning once.
+The staging is therefore **sharded by layer**, one shard per chiplet: shard `s`
+holds a contiguous run of layers, stages on chiplet `s`
+(`torch.rbln.bind_device_memory(t, chiplet=s)` through the dispatcher op), is
+swapped there in place, and its `(kv, layer)` rows are what the host chunk holds
+contiguously -- so the host copies are the same 2 MiB rows as before.
+Head-shaped shards would have matched the paged blocks, but the host wants every
+head of a token together, so they would have needed a token-granular merge
+(512 B pieces) on the device or a change of the host layout. Measured,
+device-to-device and host DMA cost the same from any chiplet; the swap program
+runs on chiplet 0 and reads the other chiplets over the die-to-die links, which
+is the one cost of the sharding. `rbln_ops.staging_shard_count(t)` reports how
+many shards are in use.
 
 ### What it costs a chiplet
 
@@ -236,21 +233,20 @@ peak counters, as the delta over the pre-transfer level:
 
 | staging | 1 thread, gather | 1 thread, round trip | 4 threads, gather | 4 threads, round trip |
 |---|---|---|---|---|
-| two buffers, one chiplet | 352.9 MB | 705.7 MB | 1411.5 MB | 2822.9 MB |
+| two buffers, one chiplet (before) | 352.9 MB | 705.7 MB | 1411.5 MB | 2822.9 MB |
 | in place, one chiplet | 352.9 | 588.3 | 941.7 | 1883.4 |
-| **in place, split over 4 chiplets** | **146.9** | **293.8** | **352.6** | **470.0** |
+| **in place, sharded over 4 chiplets** | **146.9** | **293.8** | **352.6** | **470.0** |
 
 Six times less on the busiest chiplet for the four-thread round trip, and the
-split flattens the thread scaling: the staging is `threads x groups x block/groups`
-either way, but only `1/chiplets` of it lands on any one chiplet.
+sharding flattens the thread scaling: the staging is
+`threads x shards x block/shards` either way, but only `1/shards` of it lands on
+any one chiplet.
 
 What remains on chiplet 0 is mostly **not** staging. Each compiled swap program
 allocates an output-sized buffer of its own at load, even though the transfer
 hands it the staging buffer to write (`run(out=)`), and those buffers stay on
 chiplet 0: 8 of them (torch-rbln compiles one program per source buffer, capped
-at 8 slots), so `8 x block/groups` = 235 MB of the 470 above. Making a program's
-output buffer lazy -- allocated only when a run does not supply one -- would take
-the four-thread round trip to ~235 MB.
+at 8 slots), so `8 x block/shards` = 235 MB of the 470 above.
 
 Correctness under threads is its own gate: the bench's `--verify` drives one
 thread, so it cannot see two threads swapping each other's staging. The
