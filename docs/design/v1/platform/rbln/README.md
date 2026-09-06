@@ -226,3 +226,34 @@ before pipelining).
 
 `rbln_ops.staging_split_groups(t)` reports the group count in effect. A
 torch-rbln without the placement op falls back to one group with a warning once.
+
+### What it costs a chiplet
+
+A device runs out of memory on its heaviest chiplet, so that is the number to
+watch: the high-water mark of one chiplet's allocated bytes over a transfer.
+Measured on Qwen3-1.7B (117.44 MB per block) with the allocator's per-chiplet
+peak counters, as the delta over the pre-transfer level:
+
+| staging | 1 thread, gather | 1 thread, round trip | 4 threads, gather | 4 threads, round trip |
+|---|---|---|---|---|
+| two buffers, one chiplet | 352.9 MB | 705.7 MB | 1411.5 MB | 2822.9 MB |
+| in place, one chiplet | 352.9 | 588.3 | 941.7 | 1883.4 |
+| **in place, split over 4 chiplets** | **146.9** | **293.8** | **352.6** | **470.0** |
+
+Six times less on the busiest chiplet for the four-thread round trip, and the
+split flattens the thread scaling: the staging is `threads x groups x block/groups`
+either way, but only `1/chiplets` of it lands on any one chiplet.
+
+What remains on chiplet 0 is mostly **not** staging. Each compiled swap program
+allocates an output-sized buffer of its own at load, even though the transfer
+hands it the staging buffer to write (`run(out=)`), and those buffers stay on
+chiplet 0: 8 of them (torch-rbln compiles one program per source buffer, capped
+at 8 slots), so `8 x block/groups` = 235 MB of the 470 above. Making a program's
+output buffer lazy -- allocated only when a run does not supply one -- would take
+the four-thread round trip to ~235 MB.
+
+Correctness under threads is its own gate: the bench's `--verify` drives one
+thread, so it cannot see two threads swapping each other's staging. The
+multi-threaded check (4 threads, distinct per-block patterns, gather compared on
+the host and scatter compared back on the device) is what caught the eager
+out-tensor binding being process-wide rather than per thread, in the runtime.
