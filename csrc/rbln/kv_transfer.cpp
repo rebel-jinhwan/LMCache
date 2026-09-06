@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "kv_transfer.h"
 
+#include <ATen/core/dispatch/Dispatcher.h>
+
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace lmcache::rbln {
@@ -25,6 +29,45 @@ enum Slot : int {
   kMlaScatter,
   kSlotCount
 };
+
+// The head<->token swap is a compiled device program. torch-rbln's
+// copy_strided_view_inplace runs it with the output aliasing the input -- the
+// program permutes the buffer in its own storage, and torch-rbln checks each
+// geometry once against an out-of-place copy -- so a direction holds one
+// staging buffer instead of a landing and a swap buffer (the kHnd*Out slots
+// stay empty): on Qwen3-1.7B, 117.44 MB per block, 235 MB per thread rather
+// than 470. The transfer keeps the two-buffer path for
+// LMCACHE_RBLN_STAGING_INPLACE=0 and for a torch-rbln without the op (warned
+// once).
+bool inplace_swap() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("LMCACHE_RBLN_STAGING_INPLACE");
+    if (value != nullptr && std::strcmp(value, "0") == 0) return false;
+    const bool has_op = c10::Dispatcher::singleton()
+                            .findSchema({"torch_rbln::copy_strided_view_inplace", ""})
+                            .has_value();
+    if (!has_op) {
+      TORCH_WARN_ONCE(
+          "this torch-rbln has no torch_rbln::copy_strided_view_inplace; the KV "
+          "transfer keeps a separate swap buffer per staging slot");
+    }
+    return has_op;
+  }();
+  return enabled;
+}
+
+// buf holds rows x [a, b, d]; afterwards it holds rows x [b, a, d].
+void swap_in_place(at::Tensor& buf, int64_t rows, int64_t a, int64_t b,
+                   int64_t d) {
+  static const auto op =
+      c10::Dispatcher::singleton()
+          .findSchemaOrThrow("torch_rbln::copy_strided_view_inplace", "")
+          .typed<bool(const at::Tensor&, at::Tensor&)>();
+  at::Tensor src = buf.view({rows, a, b, d}).permute({0, 2, 1, 3});
+  at::Tensor out = buf.view({rows, b, a, d});
+  TORCH_CHECK(op.call(src, out),
+              "copy_strided_view_inplace declined the swap view");
+}
 
 at::Tensor staging(at::IntArrayRef shape, at::ScalarType dtype,
                    const at::Device& device, Slot slot) {
@@ -158,6 +201,10 @@ void mla_chunk_copy_lists(const at::Tensor& chunk, const at::Tensor& staged,
 
 }  // namespace
 
+std::string staging_swap_mode() {
+  return inplace_swap() ? "inplace" : "two-buffer";
+}
+
 void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
                                  const std::vector<int64_t>& block_ids,
                                  const std::vector<at::Tensor>& chunks,
@@ -172,19 +219,25 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
   const std::vector<int64_t> out_shape{2, g.layers, g.block_size, g.heads,
                                        g.head_size};
   const int64_t rows = 2 * g.layers;
+  const bool inplace = inplace_swap();
   at::Tensor in = staging(in_shape, g.dtype, g.device, kHndGatherIn);
-  at::Tensor out = staging(out_shape, g.dtype, g.device, kHndGatherOut);
   for (int64_t u = 0; u < n; ++u) {
     std::vector<at::Tensor> slots, blocks;
     hnd_block_copy_lists(layers, block_ids[u], in, slots, blocks);
     at::_foreach_copy_(slots, blocks);
 
-    // A permuted device copy: torch-rbln runs it as a compiled program.
-    out.view({rows, g.block_size, g.heads, g.head_size})
-        .copy_(in.view({rows, g.heads, g.block_size, g.head_size})
-                   .permute({0, 2, 1, 3}));
-    at::Tensor token_major =
-        out.view({2, g.layers, g.block_size, g.heads * g.head_size});
+    at::Tensor token_major;
+    if (inplace) {
+      swap_in_place(in, rows, g.heads, g.block_size, g.head_size);
+      token_major = in.view({2, g.layers, g.block_size, g.heads * g.head_size});
+    } else {
+      at::Tensor out = staging(out_shape, g.dtype, g.device, kHndGatherOut);
+      // A permuted device copy: torch-rbln runs it as a compiled program.
+      out.view({rows, g.block_size, g.heads, g.head_size})
+          .copy_(in.view({rows, g.heads, g.block_size, g.head_size})
+                     .permute({0, 2, 1, 3}));
+      token_major = out.view({2, g.layers, g.block_size, g.heads * g.head_size});
+    }
 
     std::vector<at::Tensor> regions, pieces;
     hnd_chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, regions,
@@ -208,8 +261,8 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
   const std::vector<int64_t> out_shape{2, g.layers, g.heads, g.block_size,
                                        g.head_size};
   const int64_t rows = 2 * g.layers;
+  const bool inplace = inplace_swap();
   at::Tensor in = staging(in_shape, g.dtype, g.device, kHndScatterIn);
-  at::Tensor out = staging(out_shape, g.dtype, g.device, kHndScatterOut);
   for (int64_t u = start; u < n; ++u) {
     at::Tensor token_major =
         in.view({2, g.layers, g.block_size, g.heads * g.head_size});
@@ -218,12 +271,19 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
                          pieces);
     at::_foreach_copy_(pieces, regions);
 
-    out.view({rows, g.heads, g.block_size, g.head_size})
-        .copy_(in.view({rows, g.block_size, g.heads, g.head_size})
-                   .permute({0, 2, 1, 3}));
-
+    at::Tensor head_major;
+    if (inplace) {
+      // The bytes are head-major now; the tensor's shape has to say so too.
+      swap_in_place(in, rows, g.block_size, g.heads, g.head_size);
+      head_major = in.view(out_shape);
+    } else {
+      head_major = staging(out_shape, g.dtype, g.device, kHndScatterOut);
+      head_major.view({rows, g.heads, g.block_size, g.head_size})
+          .copy_(in.view({rows, g.block_size, g.heads, g.head_size})
+                     .permute({0, 2, 1, 3}));
+    }
     std::vector<at::Tensor> slots, blocks;
-    hnd_block_copy_lists(layers, block_ids[u], out, slots, blocks);
+    hnd_block_copy_lists(layers, block_ids[u], head_major, slots, blocks);
     at::_foreach_copy_(blocks, slots);
   }
 }

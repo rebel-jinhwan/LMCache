@@ -4,6 +4,7 @@
 #include <ATen/ATen.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace lmcache::rbln {
@@ -41,5 +42,9 @@ void scatter_chunks_to_blocks_mla(const std::vector<at::Tensor>& layers,
                                   const std::vector<at::Tensor>& chunks,
                                   int64_t blocks_per_chunk,
                                   int64_t skip_prefix_n_blocks);
+
+// How the head<->token swap is staged: "inplace" (one buffer per direction,
+// the program permutes it in its own storage) or "two-buffer".
+std::string staging_swap_mode();
 
 }  // namespace lmcache::rbln
