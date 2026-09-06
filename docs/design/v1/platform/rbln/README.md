@@ -197,3 +197,32 @@ op is missing. `LMCACHE_RBLN_STAGING_INPLACE=0` forces the two-buffer path;
 The buffers are `thread_local`, so every thread that transfers holds its own
 set: store runs on the engine-driven commit pool (4 workers by default),
 retrieve on the caller's thread.
+
+### Where the staging lives
+
+RBLN device DRAM is one pool per chiplet (32 GiB each on RBLN-CR13) and the
+runtime pins an allocation to the chiplet it names, without spilling. Every
+torch allocation names chiplet 0, so a block of staging per direction per
+thread would all sit on chiplet 0's pool next to that chiplet's share of the
+model. The KV cache itself is split over the chiplets **by head** (heads
+`[2k, 2k+1]` of every layer and block live on chiplet `k` on this geometry).
+
+The staging is split **by layer** instead: layer group `g` of the block stages
+on chiplet `g` (`torch.rbln.bind_device_memory(t, chiplet=g)` through the
+dispatcher op), is swapped there in place, and its `(kv, layer)` rows are what
+the host chunk holds contiguously, so the per-chiplet host copies are the same
+2 MiB rows as before. A head split would have matched the paged blocks but the
+host wants every head of a token together, so it would have needed a
+token-granular merge (512 B pieces) on the device or a change of the host
+layout. Measured, device-to-device and host DMA cost the same from any chiplet;
+the swap program runs on chiplet 0 and reads the other chiplets over the
+die-to-die links, which is the one cost of the split (+0.2--0.5 ms per block
+before pipelining).
+
+| `LMCACHE_RBLN_STAGING_SPLIT` | staging per direction per thread on chiplet 0 |
+|---|---|
+| `chiplets` (default) | one layer group of `L / chiplets`: 29 MB on Qwen3-1.7B, the other chiplets 29 MB each |
+| `none` | the whole block: 117 MB |
+
+`rbln_ops.staging_split_groups(t)` reports the group count in effect. A
+torch-rbln without the placement op falls back to one group with a warning once.

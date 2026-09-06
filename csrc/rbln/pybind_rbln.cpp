@@ -22,4 +22,8 @@ PYBIND11_MODULE(rbln_ops, m) {
   m.def("staging_swap_mode", &lmcache::rbln::staging_swap_mode,
         "How the head<->token swap is staged: 'inplace' or 'two-buffer' "
         "(LMCACHE_RBLN_STAGING_INPLACE, and whether torch-rbln has the op)");
+  m.def("staging_split_groups", &lmcache::rbln::staging_split_groups,
+        py::arg("any_device_tensor"),
+        "How many layer groups the HND staging is split into, one per chiplet "
+        "(LMCACHE_RBLN_STAGING_SPLIT)");
 }

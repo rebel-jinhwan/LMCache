@@ -4,9 +4,10 @@
 #include <ATen/core/dispatch/Dispatcher.h>
 
 #include <algorithm>
-#include <array>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <utility>
 #include <vector>
 
 namespace lmcache::rbln {
@@ -69,13 +70,69 @@ void swap_in_place(at::Tensor& buf, int64_t rows, int64_t a, int64_t b,
               "copy_strided_view_inplace declined the swap view");
 }
 
+// Where the staging lives. RBLN device DRAM is one pool per chiplet and an
+// allocation is pinned to the chiplet it names, without spilling; every torch
+// allocation names chiplet 0 unless told otherwise, so a whole block of staging
+// per direction per thread would sit on chiplet 0 next to that chiplet's share
+// of the model. The KV cache itself is split over the chiplets by head, but the
+// host wants every head of a token together, so a head-split staging would need
+// a token-granular merge; a layer split needs none: layer group g of the block
+// stages on chiplet g, is swapped there, and its (kv, layer) rows are already
+// what the host chunk holds contiguously. D2D and host DMA cost the same from
+// any chiplet (measured); the swap program runs on chiplet 0 and reads the other
+// chiplets over the die-to-die links, which is the one cost of the split.
+// LMCACHE_RBLN_STAGING_SPLIT: "chiplets" (default) -- as many layer groups as
+// the device has chiplets; "none" -- one group, on chiplet 0. Placement goes
+// through torch-rbln's dispatcher ops so this extension keeps linking only ATen;
+// a torch-rbln without them falls back to one group with a warning once.
+int64_t staging_groups(const at::Tensor& any_device_tensor) {
+  static const int64_t groups = [&] {
+    const char* value = std::getenv("LMCACHE_RBLN_STAGING_SPLIT");
+    if (value != nullptr && std::strcmp(value, "none") == 0) return int64_t{1};
+    TORCH_CHECK(value == nullptr || std::strcmp(value, "chiplets") == 0,
+                "LMCACHE_RBLN_STAGING_SPLIT must be 'chiplets' or 'none', got '",
+                value, "'");
+    const auto count = c10::Dispatcher::singleton().findSchema(
+        {"torch_rbln::chiplet_count", ""});
+    const auto bind = c10::Dispatcher::singleton().findSchema(
+        {"torch_rbln::bind_device_memory_at", ""});
+    if (!count.has_value() || !bind.has_value()) {
+      TORCH_WARN_ONCE(
+          "this torch-rbln cannot place a tensor on a chiplet "
+          "(torch_rbln::bind_device_memory_at); the KV transfer stages every "
+          "layer on the default chiplet");
+      return int64_t{1};
+    }
+    return std::max<int64_t>(
+        count->typed<int64_t(const at::Tensor&)>().call(any_device_tensor), 1);
+  }();
+  return groups;
+}
+
+// Layers [lo, hi) of group g out of `groups`, in contiguous runs of ceil(L/groups).
+void layer_range(int64_t layers, int64_t groups, int64_t g, int64_t& lo,
+                 int64_t& hi) {
+  const int64_t per = (layers + groups - 1) / groups;
+  lo = std::min(g * per, layers);
+  hi = std::min(lo + per, layers);
+}
+
 at::Tensor staging(at::IntArrayRef shape, at::ScalarType dtype,
-                   const at::Device& device, Slot slot) {
-  thread_local std::array<at::Tensor, kSlotCount> buffers;
-  at::Tensor& buf = buffers[slot];
+                   const at::Device& device, Slot slot, int64_t group,
+                   int64_t groups) {
+  using Key = std::pair<int, int64_t>;
+  thread_local std::map<Key, at::Tensor> buffers;
+  at::Tensor& buf = buffers[Key{slot, group}];
   if (!buf.defined() || buf.sizes() != shape || buf.scalar_type() != dtype ||
       buf.device() != device) {
     buf = at::empty(shape, at::TensorOptions().dtype(dtype).device(device));
+    if (groups > 1) {
+      static const auto bind =
+          c10::Dispatcher::singleton()
+              .findSchemaOrThrow("torch_rbln::bind_device_memory_at", "")
+              .typed<void(at::Tensor&, int64_t)>();
+      bind.call(buf, group);
+    }
   }
   return buf;
 }
@@ -122,39 +179,48 @@ Geometry geometry(const std::vector<at::Tensor>& layers) {
 
 // ── HND ──────────────────────────────────────────────────────────────
 
-// Pair every staging slot [half, layer] with its whole paged block.
+// Pair every staging slot [half, layer - lo] with its whole paged block, for
+// layers [lo, hi).
 void hnd_block_copy_lists(const std::vector<at::Tensor>& layers, int64_t block,
-                          const at::Tensor& staged,
+                          const at::Tensor& staged, int64_t lo, int64_t hi,
                           std::vector<at::Tensor>& slots,
                           std::vector<at::Tensor>& blocks) {
-  for (size_t l = 0; l < layers.size(); ++l) {
+  for (int64_t l = lo; l < hi; ++l) {
     for (int64_t half = 0; half < 2; ++half) {
-      slots.push_back(staged[half][static_cast<int64_t>(l)]);
-      blocks.push_back(layers[l][half][block]);
+      slots.push_back(staged[half][l - lo]);
+      blocks.push_back(layers[static_cast<size_t>(l)][half][block]);
     }
   }
 }
 
-// Pair the chunk region holding `pos` with its token-major staging piece. A
-// block that is a whole chunk (chunk_size == block_size, the configuration
-// this path optimizes) crosses the host boundary as one descriptor; a chunk
-// that holds several blocks costs one per (kv, layer).
+// Pair the chunk region holding `pos` with its token-major staging piece, for
+// layers [lo, hi). A block that is a whole chunk (chunk_size == block_size, the
+// configuration this path optimizes) crosses the host boundary as one
+// descriptor per (kv, layer run) -- one when the group is the whole block; a
+// chunk that holds several blocks costs one per (kv, layer).
 void hnd_chunk_copy_lists(const std::vector<at::Tensor>& chunks,
                           const at::Tensor& token_major, int64_t pos,
-                          int64_t bpc, int64_t block_size,
-                          std::vector<at::Tensor>& regions,
+                          int64_t bpc, int64_t block_size, int64_t lo,
+                          int64_t hi, std::vector<at::Tensor>& regions,
                           std::vector<at::Tensor>& pieces) {
   const at::Tensor& chunk = chunks[pos / bpc];
   if (bpc == 1) {
-    regions.push_back(chunk);
-    pieces.push_back(token_major);
+    if (lo == 0 && hi == chunk.size(1)) {
+      regions.push_back(chunk);
+      pieces.push_back(token_major);
+      return;
+    }
+    for (int64_t half = 0; half < 2; ++half) {
+      regions.push_back(chunk[half].slice(0, lo, hi));
+      pieces.push_back(token_major[half]);
+    }
     return;
   }
-  const int64_t lo = (pos % bpc) * block_size;
+  const int64_t tok = (pos % bpc) * block_size;
   for (int64_t half = 0; half < 2; ++half) {
-    for (int64_t l = 0; l < chunk.size(1); ++l) {
-      regions.push_back(chunk[half][l].slice(0, lo, lo + block_size));
-      pieces.push_back(token_major[half][l]);
+    for (int64_t l = lo; l < hi; ++l) {
+      regions.push_back(chunk[half][l].slice(0, tok, tok + block_size));
+      pieces.push_back(token_major[half][l - lo]);
     }
   }
 }
@@ -205,6 +271,10 @@ std::string staging_swap_mode() {
   return inplace_swap() ? "inplace" : "two-buffer";
 }
 
+int64_t staging_split_groups(const at::Tensor& any_device_tensor) {
+  return staging_groups(any_device_tensor);
+}
+
 void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
                                  const std::vector<int64_t>& block_ids,
                                  const std::vector<at::Tensor>& chunks,
@@ -214,35 +284,42 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
   const Geometry g = geometry(layers);
   TORCH_CHECK(g.kv == 2, "HND transfer needs [2, NB, NH, BS, HS] layers");
   check_chunks(chunks, /*token_dim=*/2, bpc, g.block_size, n);
-  const std::vector<int64_t> in_shape{2, g.layers, g.heads, g.block_size,
-                                      g.head_size};
-  const std::vector<int64_t> out_shape{2, g.layers, g.block_size, g.heads,
-                                       g.head_size};
-  const int64_t rows = 2 * g.layers;
   const bool inplace = inplace_swap();
-  at::Tensor in = staging(in_shape, g.dtype, g.device, kHndGatherIn);
+  const int64_t groups = std::min(staging_groups(layers[0]), g.layers);
   for (int64_t u = 0; u < n; ++u) {
-    std::vector<at::Tensor> slots, blocks;
-    hnd_block_copy_lists(layers, block_ids[u], in, slots, blocks);
-    at::_foreach_copy_(slots, blocks);
+    for (int64_t grp = 0; grp < groups; ++grp) {
+      int64_t lo, hi;
+      layer_range(g.layers, groups, grp, lo, hi);
+      const int64_t nl = hi - lo, rows = 2 * nl;
+      const std::vector<int64_t> in_shape{2, nl, g.heads, g.block_size,
+                                          g.head_size};
+      const std::vector<int64_t> out_shape{2, nl, g.block_size, g.heads,
+                                           g.head_size};
+      at::Tensor in = staging(in_shape, g.dtype, g.device, kHndGatherIn, grp,
+                              groups);
+      std::vector<at::Tensor> slots, blocks;
+      hnd_block_copy_lists(layers, block_ids[u], in, lo, hi, slots, blocks);
+      at::_foreach_copy_(slots, blocks);
 
-    at::Tensor token_major;
-    if (inplace) {
-      swap_in_place(in, rows, g.heads, g.block_size, g.head_size);
-      token_major = in.view({2, g.layers, g.block_size, g.heads * g.head_size});
-    } else {
-      at::Tensor out = staging(out_shape, g.dtype, g.device, kHndGatherOut);
-      // A permuted device copy: torch-rbln runs it as a compiled program.
-      out.view({rows, g.block_size, g.heads, g.head_size})
-          .copy_(in.view({rows, g.heads, g.block_size, g.head_size})
-                     .permute({0, 2, 1, 3}));
-      token_major = out.view({2, g.layers, g.block_size, g.heads * g.head_size});
+      at::Tensor token_major;
+      if (inplace) {
+        swap_in_place(in, rows, g.heads, g.block_size, g.head_size);
+        token_major = in.view({2, nl, g.block_size, g.heads * g.head_size});
+      } else {
+        at::Tensor out =
+            staging(out_shape, g.dtype, g.device, kHndGatherOut, grp, groups);
+        // A permuted device copy: torch-rbln runs it as a compiled program.
+        out.view({rows, g.block_size, g.heads, g.head_size})
+            .copy_(in.view({rows, g.heads, g.block_size, g.head_size})
+                       .permute({0, 2, 1, 3}));
+        token_major = out.view({2, nl, g.block_size, g.heads * g.head_size});
+      }
+
+      std::vector<at::Tensor> regions, pieces;
+      hnd_chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, lo, hi,
+                           regions, pieces);
+      at::_foreach_copy_(regions, pieces);
     }
-
-    std::vector<at::Tensor> regions, pieces;
-    hnd_chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, regions,
-                         pieces);
-    at::_foreach_copy_(regions, pieces);
   }
 }
 
@@ -256,35 +333,43 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
   const Geometry g = geometry(layers);
   TORCH_CHECK(g.kv == 2, "HND transfer needs [2, NB, NH, BS, HS] layers");
   check_chunks(chunks, /*token_dim=*/2, bpc, g.block_size, n);
-  const std::vector<int64_t> in_shape{2, g.layers, g.block_size, g.heads,
-                                      g.head_size};
-  const std::vector<int64_t> out_shape{2, g.layers, g.heads, g.block_size,
-                                       g.head_size};
-  const int64_t rows = 2 * g.layers;
   const bool inplace = inplace_swap();
-  at::Tensor in = staging(in_shape, g.dtype, g.device, kHndScatterIn);
+  const int64_t groups = std::min(staging_groups(layers[0]), g.layers);
   for (int64_t u = start; u < n; ++u) {
-    at::Tensor token_major =
-        in.view({2, g.layers, g.block_size, g.heads * g.head_size});
-    std::vector<at::Tensor> regions, pieces;
-    hnd_chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, regions,
-                         pieces);
-    at::_foreach_copy_(pieces, regions);
+    for (int64_t grp = 0; grp < groups; ++grp) {
+      int64_t lo, hi;
+      layer_range(g.layers, groups, grp, lo, hi);
+      const int64_t nl = hi - lo, rows = 2 * nl;
+      const std::vector<int64_t> in_shape{2, nl, g.block_size, g.heads,
+                                          g.head_size};
+      const std::vector<int64_t> out_shape{2, nl, g.heads, g.block_size,
+                                           g.head_size};
+      at::Tensor in = staging(in_shape, g.dtype, g.device, kHndScatterIn, grp,
+                              groups);
+      at::Tensor token_major =
+          in.view({2, nl, g.block_size, g.heads * g.head_size});
+      std::vector<at::Tensor> regions, pieces;
+      hnd_chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, lo, hi,
+                           regions, pieces);
+      at::_foreach_copy_(pieces, regions);
 
-    at::Tensor head_major;
-    if (inplace) {
-      // The bytes are head-major now; the tensor's shape has to say so too.
-      swap_in_place(in, rows, g.block_size, g.heads, g.head_size);
-      head_major = in.view(out_shape);
-    } else {
-      head_major = staging(out_shape, g.dtype, g.device, kHndScatterOut);
-      head_major.view({rows, g.heads, g.block_size, g.head_size})
-          .copy_(in.view({rows, g.block_size, g.heads, g.head_size})
-                     .permute({0, 2, 1, 3}));
+      at::Tensor head_major;
+      if (inplace) {
+        // The bytes are head-major now; the tensor's shape has to say so too.
+        swap_in_place(in, rows, g.block_size, g.heads, g.head_size);
+        head_major = in.view(out_shape);
+      } else {
+        head_major =
+            staging(out_shape, g.dtype, g.device, kHndScatterOut, grp, groups);
+        head_major.view({rows, g.heads, g.block_size, g.head_size})
+            .copy_(in.view({rows, g.block_size, g.heads, g.head_size})
+                       .permute({0, 2, 1, 3}));
+      }
+      std::vector<at::Tensor> slots, blocks;
+      hnd_block_copy_lists(layers, block_ids[u], head_major, lo, hi, slots,
+                           blocks);
+      at::_foreach_copy_(blocks, slots);
     }
-    std::vector<at::Tensor> slots, blocks;
-    hnd_block_copy_lists(layers, block_ids[u], head_major, slots, blocks);
-    at::_foreach_copy_(blocks, slots);
   }
 }
 
@@ -298,7 +383,7 @@ void gather_blocks_to_chunks_mla(const std::vector<at::Tensor>& layers,
   TORCH_CHECK(g.kv == 1, "MLA transfer needs contiguous [NB, BS, HS] layers");
   check_chunks(chunks, /*token_dim=*/1, bpc, g.block_size, n);
   at::Tensor staged = staging({g.layers, bpc * g.block_size, g.head_size},
-                              g.dtype, g.device, kMlaGather);
+                              g.dtype, g.device, kMlaGather, 0, 1);
   for (int64_t c = 0; c * bpc < n; ++c) {
     const int64_t first = c * bpc;
     const int64_t held = std::min(n, first + bpc) - first;
@@ -326,7 +411,7 @@ void scatter_chunks_to_blocks_mla(const std::vector<at::Tensor>& layers,
   TORCH_CHECK(g.kv == 1, "MLA transfer needs contiguous [NB, BS, HS] layers");
   check_chunks(chunks, /*token_dim=*/1, bpc, g.block_size, n);
   at::Tensor staged = staging({g.layers, bpc * g.block_size, g.head_size},
-                              g.dtype, g.device, kMlaScatter);
+                              g.dtype, g.device, kMlaScatter, 0, 1);
   for (int64_t c = start / bpc; c * bpc < n; ++c) {
     const int64_t first = c * bpc;
     const int64_t lo = std::max(start, first) - first;
