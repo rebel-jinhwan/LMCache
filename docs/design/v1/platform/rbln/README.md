@@ -119,6 +119,32 @@ does one direction, so it holds:
 |---|---|---|
 | two slots x (landing, swap) | 4 | 470 MB |
 | x 4 store workers + 1 retrieve caller | 20 | 2.35 GB |
+| **swap in place (default)**: two slots x landing | 2 | 235 MB |
+| x 4 store workers + 1 retrieve caller | 10 | 1.17 GB |
+
+### In place
+
+The swap is a compiled device program, and torch-rbln's
+`torch_rbln::copy_strided_view_inplace` runs it with the output aliasing the
+input: the program reads the buffer head-major and writes it back token-major
+(or the reverse) in its own storage, so a slot needs one buffer, not a landing
+and a swap buffer. `copy_` cannot be used for this -- ATen refuses partially
+overlapping pairs -- so the transfer calls the op directly. Correctness rests on
+the compiled schedule finishing its reads of a region before writing it, which
+is the compiler's tiling rather than anything this code controls; torch-rbln
+therefore checks each geometry once against an out-of-place copy (measured
+bit-exact on ten geometries: heads 2--16, tokens 16--256, head size 64/128,
+rows 2--72) and raises if the check fails, and the transfer falls back to two
+buffers when the op is missing. `LMCACHE_RBLN_STAGING_INPLACE=0` forces the
+two-buffer path; `rbln_ops.staging_swap_mode()` reports which is in effect.
+
+The one buffer is the block's DMA endpoint as well as the permute's operand, so
+it stays on chiplet 0 (see below): chiplet 0 holds the same bytes as with two
+buffers under `spread`, and the other chiplets hold none.
+
+The fences move with the buffer: gather waits for the D2H that read a slot
+before gathering into it again, and scatter waits for the D2D into the paged
+blocks -- not only the swap -- before the next H2D lands in that slot.
 
 Measured (`rbln-stat`, one process): +322 MB after one thread's gather, +966 MB
 after two, +1933 MB after four -- linear in the thread count, and a scatter on a

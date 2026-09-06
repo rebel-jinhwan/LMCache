@@ -31,8 +31,9 @@ namespace {
 // the head-major one is gather's device-filled landing but scatter's D2D
 // source, and those want different chiplets, so a thread doing both holds two.
 // In the serve a thread does one direction (store on the commit pool, retrieve
-// on its caller), so it holds 4 buffers -- 470 MB on this geometry -- and the
-// buffers are thread_local, so that multiplies by the pool's thread count.
+// on its caller), so it holds 4 buffers -- 470 MB on this geometry -- or 2 when
+// the swap runs in place (below), and the buffers are thread_local, so that
+// multiplies by the pool's thread count.
 // Where a staging buffer lives on the device. RBLN DRAM is one pool per chiplet
 // and an allocation is pinned to the chiplet it lands on -- the runtime does not
 // spill -- and every torch allocation lands on chiplet 0 unless told otherwise.
@@ -158,6 +159,47 @@ void wait(Fence& fence, const c10::Stream& stream) {
   if (fence.has_value()) fence->block(stream);
 }
 
+// The head<->token swap is a compiled device program. torch-rbln's
+// copy_strided_view_inplace runs it with the output aliasing the input -- the
+// program permutes the buffer in its own storage, and torch-rbln checks each
+// geometry once against an out-of-place copy -- so a slot holds one buffer
+// instead of a landing and a swap buffer: 2 per thread rather than 4, 235 MB
+// on Qwen3-1.7B. The price is placement: the one buffer is the block's DMA
+// endpoint as well as the permute's operand, so it stays on chiplet 0, where
+// the two-buffer path could float gather's landing buffer to another chiplet.
+// Chiplet 0 holds the same bytes either way; the other chiplets hold none.
+// LMCACHE_RBLN_STAGING_INPLACE=0 keeps the two-buffer path (a torch-rbln
+// without the op does too, with a warning once).
+bool inplace_swap() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("LMCACHE_RBLN_STAGING_INPLACE");
+    if (value != nullptr && std::strcmp(value, "0") == 0) return false;
+    const bool has_op = c10::Dispatcher::singleton()
+                            .findSchema({"torch_rbln::copy_strided_view_inplace", ""})
+                            .has_value();
+    if (!has_op) {
+      TORCH_WARN_ONCE(
+          "this torch-rbln has no torch_rbln::copy_strided_view_inplace; the KV "
+          "transfer keeps a separate swap buffer per staging slot");
+    }
+    return has_op;
+  }();
+  return enabled;
+}
+
+// buf holds rows x [a, b, d]; afterwards it holds rows x [b, a, d].
+void swap_in_place(at::Tensor& buf, int64_t rows, int64_t a, int64_t b,
+                   int64_t d) {
+  static const auto op =
+      c10::Dispatcher::singleton()
+          .findSchemaOrThrow("torch_rbln::copy_strided_view_inplace", "")
+          .typed<bool(const at::Tensor&, at::Tensor&)>();
+  at::Tensor src = buf.view({rows, a, b, d}).permute({0, 2, 1, 3});
+  at::Tensor out = buf.view({rows, b, a, d});
+  TORCH_CHECK(op.call(src, out),
+              "copy_strided_view_inplace declined the swap view");
+}
+
 struct Geometry {
   int64_t layers, heads, block_size, head_size;
   at::ScalarType dtype;
@@ -224,6 +266,10 @@ void check_chunks(const std::vector<at::Tensor>& chunks, int64_t bpc,
 
 }  // namespace
 
+std::string staging_swap_mode() {
+  return inplace_swap() ? "inplace" : "two-buffer";
+}
+
 std::string staging_placement_name() {
   const StagingPlacement& placement = staging_placement();
   switch (placement.policy) {
@@ -255,23 +301,34 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
   c10::impl::VirtualGuardImpl guard_impl(g.device.type());
   const c10::Stream main = guard_impl.getStream(g.device);
   const c10::Stream copy = guard_impl.getNewStream(g.device);
+  const bool inplace = inplace_swap();
   std::vector<Fence> d2h_done(n);
   for (int64_t u = 0; u < n; ++u) {
     const int slot = static_cast<int>(u % 2);
-    at::Tensor in = staging(in_shape, g.dtype, g.device, slot, Role::kDeviceFilled);
+    // In place, the landing buffer is also the D2H source (a DMA endpoint), and
+    // the D2H of the block two back read this very buffer.
+    at::Tensor in = staging(in_shape, g.dtype, g.device, slot,
+                            inplace ? Role::kDmaEndpoint : Role::kDeviceFilled);
+    if (inplace && u >= 2) wait(d2h_done[u - 2], main);
     std::vector<at::Tensor> slots, blocks;
     block_copy_lists(layers, block_ids[u], in, slots, blocks);
     at::_foreach_copy_(slots, blocks, false);
 
-    at::Tensor out = staging(out_shape, g.dtype, g.device, slot, Role::kDmaEndpoint);
-    // That block's D2H read the output slot this swap is about to overwrite.
-    if (u >= 2) wait(d2h_done[u - 2], main);
-    // A permuted device copy: torch-rbln runs it as a compiled program.
-    out.view({rows, g.block_size, g.heads, g.head_size})
-        .copy_(in.view({rows, g.heads, g.block_size, g.head_size})
-                   .permute({0, 2, 1, 3}));
-    at::Tensor token_major =
-        out.view({2, g.layers, g.block_size, g.heads * g.head_size});
+    at::Tensor token_major;
+    if (inplace) {
+      swap_in_place(in, rows, g.heads, g.block_size, g.head_size);
+      token_major = in.view({2, g.layers, g.block_size, g.heads * g.head_size});
+    } else {
+      at::Tensor out =
+          staging(out_shape, g.dtype, g.device, slot, Role::kDmaEndpoint);
+      // That block's D2H read the output slot this swap is about to overwrite.
+      if (u >= 2) wait(d2h_done[u - 2], main);
+      // A permuted device copy: torch-rbln runs it as a compiled program.
+      out.view({rows, g.block_size, g.heads, g.head_size})
+          .copy_(in.view({rows, g.heads, g.block_size, g.head_size})
+                     .permute({0, 2, 1, 3}));
+      token_major = out.view({2, g.layers, g.block_size, g.heads * g.head_size});
+    }
 
     std::vector<at::Tensor> regions, pieces;
     chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, regions,
@@ -310,7 +367,10 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
     return staging(in_shape, g.dtype, g.device, static_cast<int>(u % 2),
                    Role::kDmaEndpoint);
   };
-  std::vector<Fence> h2d_done(m), swapped(m);
+  const bool inplace = inplace_swap();
+  // Per block: its H2D; the swap that read its landing buffer; the D2D into
+  // the paged blocks that read the swapped buffer (in place, the same buffer).
+  std::vector<Fence> h2d_done(m), swapped(m), scattered(m);
   auto issue_copy = [&](int64_t u) {
     at::Tensor in = landing(u);
     at::Tensor token_major =
@@ -328,23 +388,33 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
   if (m > 0) issue_copy(0);
   for (int64_t u = 0; u < m; ++u) {
     if (u + 1 < m) {
-      // That H2D overwrites the landing slot the swap two blocks back read.
-      if (u >= 1) wait(swapped[u - 1], copy);
+      // That H2D overwrites the landing slot the block before last used: read
+      // by its swap, and in place by its D2D into the paged blocks as well.
+      if (u >= 1) wait(inplace ? scattered[u - 1] : swapped[u - 1], copy);
       issue_copy(u + 1);
     }
     at::Tensor in = landing(u);
     const int slot = static_cast<int>(u % 2);
-    at::Tensor out = staging(out_shape, g.dtype, g.device, slot, Role::kDmaEndpoint);
     // This block's H2D, not the ones issued after it.
     wait(h2d_done[u], main);
-    out.view({rows, g.heads, g.block_size, g.head_size})
-        .copy_(in.view({rows, g.block_size, g.heads, g.head_size})
-                   .permute({0, 2, 1, 3}));
+    at::Tensor head_major;
+    if (inplace) {
+      // The bytes are head-major now; the tensor's shape has to say so too.
+      swap_in_place(in, rows, g.block_size, g.heads, g.head_size);
+      head_major = in.view(out_shape);
+    } else {
+      head_major =
+          staging(out_shape, g.dtype, g.device, slot, Role::kDmaEndpoint);
+      head_major.view({rows, g.heads, g.block_size, g.head_size})
+          .copy_(in.view({rows, g.block_size, g.heads, g.head_size})
+                     .permute({0, 2, 1, 3}));
+    }
     swapped[u] = record(main);
 
     std::vector<at::Tensor> slots, blocks;
-    block_copy_lists(layers, block_ids[start + u], out, slots, blocks);
+    block_copy_lists(layers, block_ids[start + u], head_major, slots, blocks);
     at::_foreach_copy_(blocks, slots, false);
+    scattered[u] = record(main);
   }
   guard_impl.synchronizeStream(copy);
 }

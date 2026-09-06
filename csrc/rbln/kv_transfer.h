@@ -30,4 +30,8 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
 // once): "spread", "spread-all", "main" or "chiplet:<n>".
 std::string staging_placement_name();
 
+// How the head<->token swap is staged: "inplace" (one buffer per slot, the
+// program permutes it in its own storage) or "two-buffer".
+std::string staging_swap_mode();
+
 }  // namespace lmcache::rbln
