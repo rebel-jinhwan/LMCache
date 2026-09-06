@@ -257,41 +257,48 @@ void gather_blocks_to_chunks_hnd(const std::vector<at::Tensor>& layers,
   const Geometry g = geometry(layers);
   TORCH_CHECK(g.kv == 2, "HND transfer needs [2, NB, NH, BS, HS] layers");
   check_chunks(chunks, /*token_dim=*/2, bpc, g.block_size, n);
-  // Sharded by layer: each shard of the block is gathered, swapped and read
-  // out on its own staging buffer, which lives on its own chiplet.
+  // Sharded by layer: each shard of the block gathers, swaps and reads out on its
+  // own staging buffer, which lives on its own chiplet. The copies are issued per
+  // block, not per shard: one _foreach_copy_ carries every shard's pieces, because
+  // a copy call costs the host whatever it carries plus a fixed amount, and four
+  // calls of a quarter each measured 0.7 ms per block worse than one.
   const int64_t shards = std::min(staging_shards(layers[0]), g.layers);
+  std::vector<at::Tensor> staged(shards);
+  std::vector<int64_t> lo(shards), hi(shards);
+  for (int64_t shard = 0; shard < shards; ++shard) {
+    shard_layers(g.layers, shards, shard, lo[shard], hi[shard]);
+    staged[shard] = staging({2, hi[shard] - lo[shard], g.heads, g.block_size,
+                             g.head_size},
+                            g.dtype, g.device, kHndGather, shard, shards);
+  }
   for (int64_t u = 0; u < n; ++u) {
+    std::vector<at::Tensor> slots, blocks;
     for (int64_t shard = 0; shard < shards; ++shard) {
-      int64_t lo, hi;
-      shard_layers(g.layers, shards, shard, lo, hi);
-      const int64_t nl = hi - lo;
-      const std::vector<int64_t> shape{2, nl, g.heads, g.block_size,
-                                       g.head_size};
-      at::Tensor staged =
-          staging(shape, g.dtype, g.device, kHndGather, shard, shards);
-      std::vector<at::Tensor> slots, blocks;
-      hnd_block_copy_lists(layers, block_ids[u], staged, lo, hi, slots, blocks);
-      at::_foreach_copy_(slots, blocks);
+      hnd_block_copy_lists(layers, block_ids[u], staged[shard], lo[shard],
+                           hi[shard], slots, blocks);
+    }
+    at::_foreach_copy_(slots, blocks);
 
+    std::vector<at::Tensor> regions, pieces;
+    for (int64_t shard = 0; shard < shards; ++shard) {
+      const int64_t nl = hi[shard] - lo[shard], rows = 2 * nl;
       // In place: the program reads the buffer head-major and writes it back
       // token-major. The tensor's shape has to follow the bytes.
-      const int64_t rows = 2 * nl;
       at::Tensor token_major_view =
-          staged.view({rows, g.block_size, g.heads, g.head_size});
-      TORCH_CHECK(
-          ops().swap.call(staged.view({rows, g.heads, g.block_size,
-                                           g.head_size})
-                                  .permute({0, 2, 1, 3}),
-                              token_major_view, /*inplace=*/true),
-          "copy_strided_view declined the gather swap");
-      at::Tensor token_major =
-          staged.view({2, nl, g.block_size, g.heads * g.head_size});
-
-      std::vector<at::Tensor> regions, pieces;
-      hnd_chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, lo, hi,
-                           regions, pieces);
-      at::_foreach_copy_(regions, pieces);
+          staged[shard].view({rows, g.block_size, g.heads, g.head_size});
+      TORCH_CHECK(ops().swap.call(staged[shard]
+                                      .view({rows, g.heads, g.block_size,
+                                             g.head_size})
+                                      .permute({0, 2, 1, 3}),
+                                  token_major_view, /*inplace=*/true),
+                  "copy_strided_view declined the gather swap");
+      hnd_chunk_copy_lists(chunks,
+                           staged[shard].view({2, nl, g.block_size,
+                                               g.heads * g.head_size}),
+                           u, bpc, g.block_size, lo[shard], hi[shard], regions,
+                           pieces);
     }
+    at::_foreach_copy_(regions, pieces);
   }
 }
 
@@ -305,41 +312,46 @@ void scatter_chunks_to_blocks_hnd(const std::vector<at::Tensor>& layers,
   const Geometry g = geometry(layers);
   TORCH_CHECK(g.kv == 2, "HND transfer needs [2, NB, NH, BS, HS] layers");
   check_chunks(chunks, /*token_dim=*/2, bpc, g.block_size, n);
-  // Sharded by layer, as in the gather.
+  // Sharded by layer, and issued per block, as in the gather.
   const int64_t shards = std::min(staging_shards(layers[0]), g.layers);
+  std::vector<at::Tensor> staged(shards);
+  std::vector<int64_t> lo(shards), hi(shards);
+  for (int64_t shard = 0; shard < shards; ++shard) {
+    shard_layers(g.layers, shards, shard, lo[shard], hi[shard]);
+    staged[shard] = staging({2, hi[shard] - lo[shard], g.block_size, g.heads,
+                             g.head_size},
+                            g.dtype, g.device, kHndScatter, shard, shards);
+  }
   for (int64_t u = start; u < n; ++u) {
+    std::vector<at::Tensor> regions, pieces;
     for (int64_t shard = 0; shard < shards; ++shard) {
-      int64_t lo, hi;
-      shard_layers(g.layers, shards, shard, lo, hi);
-      const int64_t nl = hi - lo;
-      const std::vector<int64_t> shape{2, nl, g.block_size, g.heads,
-                                       g.head_size};
-      at::Tensor staged =
-          staging(shape, g.dtype, g.device, kHndScatter, shard, shards);
-      at::Tensor token_major =
-          staged.view({2, nl, g.block_size, g.heads * g.head_size});
-      std::vector<at::Tensor> regions, pieces;
-      hnd_chunk_copy_lists(chunks, token_major, u, bpc, g.block_size, lo, hi,
-                           regions, pieces);
-      at::_foreach_copy_(pieces, regions);
-
-      // In place, the other way round: token-major in, head-major out.
-      const int64_t rows = 2 * nl;
-      at::Tensor head_major_view =
-          staged.view({rows, g.heads, g.block_size, g.head_size});
-      TORCH_CHECK(
-          ops().swap.call(staged.view({rows, g.block_size, g.heads,
-                                           g.head_size})
-                                  .permute({0, 2, 1, 3}),
-                              head_major_view, /*inplace=*/true),
-          "copy_strided_view declined the scatter swap");
-      at::Tensor head_major =
-          staged.view({2, nl, g.heads, g.block_size, g.head_size});
-      std::vector<at::Tensor> slots, blocks;
-      hnd_block_copy_lists(layers, block_ids[u], head_major, lo, hi, slots,
-                           blocks);
-      at::_foreach_copy_(blocks, slots);
+      const int64_t nl = hi[shard] - lo[shard];
+      hnd_chunk_copy_lists(chunks,
+                           staged[shard].view({2, nl, g.block_size,
+                                               g.heads * g.head_size}),
+                           u, bpc, g.block_size, lo[shard], hi[shard], regions,
+                           pieces);
     }
+    at::_foreach_copy_(pieces, regions);
+
+    std::vector<at::Tensor> slots, blocks;
+    for (int64_t shard = 0; shard < shards; ++shard) {
+      const int64_t nl = hi[shard] - lo[shard], rows = 2 * nl;
+      // In place, the other way round: token-major in, head-major out.
+      at::Tensor head_major_view =
+          staged[shard].view({rows, g.heads, g.block_size, g.head_size});
+      TORCH_CHECK(ops().swap.call(staged[shard]
+                                      .view({rows, g.block_size, g.heads,
+                                             g.head_size})
+                                      .permute({0, 2, 1, 3}),
+                                  head_major_view, /*inplace=*/true),
+                  "copy_strided_view declined the scatter swap");
+      hnd_block_copy_lists(layers, block_ids[u],
+                           staged[shard].view({2, nl, g.heads, g.block_size,
+                                               g.head_size}),
+                           lo[shard], hi[shard], slots, blocks);
+    }
+    at::_foreach_copy_(blocks, slots);
   }
 }
 
