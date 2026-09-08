@@ -9,7 +9,7 @@ Rebellions NPUs. The engine is
 | path | supported | how it gets there |
 |---|---|---|
 | multiprocess, engine-driven | yes | `gather_paged_kv_to_cpu` / `scatter_cpu_to_paged_kv`, dispatching to `RblnDeviceOps.multi_layer_block_kv_transfer` |
-| multiprocess, LMCache-driven | **no** | refused up front |
+| multiprocess, LMCache-driven | **scaffolded, gated off** | `RblnEventIPCBackend` (host sync) + `RblnIPCWrapper` (dma-buf, stub); `is_handle_transfer_available()` stays `False` |
 | in-process | not yet | `CreateGPUConnector` still raises for `rbln`; a follow-up adds the connector |
 
 Multiprocess is the mode that matters first, and it is self-contained: the MP
@@ -20,15 +20,26 @@ path builds no GPU connector at all, resolving layouts through
 [torch-rbln](https://github.com/RBLN-SW/torch-rbln) through a torch backend
 entry point, so it is visible on a bare `import torch` -- LMCache never imports
 it explicitly. It provides device discovery, `set_device()` and `synchronize()`,
-but no `Stream` / `Event` types. The LMCache-driven path publishes KV buffers
-across processes by exporting a device IPC handle and ordering the handoff with
-a cross-process event, which cannot be expressed without an event type.
-`RblnDeviceSpec` therefore overrides `is_handle_transfer_available()` to `False`
-and leaves `ipc_wrapper_cls` / `event_ipc_backend` at their `None` defaults, so
-`mp_transfer_mode=lmcache_driven` fails at its documented validation point
-instead of crashing later on an attribute lookup. `mp_transfer_mode=auto`
-already routes every non-CUDA device to the engine-driven context, so the
-default needs no special casing.
+and in-process `Stream` / `Event`. An RBLN event is a `(RblnContext, job seq)`
+pair; the seq is only meaningful inside the submitting context, so there is no
+cross-process event handle.
+
+### LMCache-driven path (scaffold)
+
+The LMCache-driven path publishes KV buffers across processes by exporting a
+device IPC handle and ordering the handoff with a cross-process event. RBLN
+maps the two building blocks as follows:
+
+| building block | RBLN implementation | status |
+|---|---|---|
+| event IPC (`event_ipc_backend`) | `RblnEventIPCBackend`: `export_event` host-syncs and returns `b""`; imported events are already complete. Correct because LMCache always does `record -> export -> message -> import -> wait`, so the message itself carries completion. Costs overlap at the export point. | done (no driver work) |
+| memory handle (`ipc_wrapper_cls`) | `RblnIPCWrapper`: dma-buf fd via `rblnExportMemoryByDva` / `rblnImportBoMemory`. Needs `num_task == 1`, `DRAM && PRIVATE`, kernel >= 6.2, fd passing via `SCM_RIGHTS`. | stub |
+| cache context (`create_cache_context`) | staging buffers + streams on the server side | not started |
+
+`is_handle_transfer_available()` stays `False` until the wrapper and cache
+context land, so `mp_transfer_mode=lmcache_driven` fails at its documented
+validation point. `mp_transfer_mode=auto` already routes every non-CUDA device
+to the engine-driven context, so the default needs no special casing.
 
 ## The 6-D KV cache
 

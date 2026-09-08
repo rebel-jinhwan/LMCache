@@ -7,14 +7,15 @@ to the CPU stub.  ``torch.rbln`` is contributed by the ``torch_rbln``
 package through a torch backend entry point, so it is visible on a bare
 ``import torch`` -- no explicit ``import torch_rbln`` is required here.
 
-Scope: **engine-driven** multiprocess (MP) transfer only.  ``torch.rbln``
-exposes device discovery and ``synchronize()`` but no ``Stream`` / ``Event``
-types, so the LMCache-driven path (which needs cross-process event IPC and
-an IPC handle wrapper) cannot be supported.  The spec therefore reports
-:meth:`RblnDeviceSpec.is_handle_transfer_available` as ``False`` and leaves
-``ipc_wrapper_cls`` / ``event_ipc_backend`` at their ``None`` defaults, so
-requesting ``mp_transfer_mode=lmcache_driven`` fails fast with a clear
-error rather than crashing deeper in the transfer path.
+Scope: **engine-driven** multiprocess (MP) transfer is supported.  The
+**LMCache-driven** path is scaffolded but not yet enabled: the event IPC
+backend (:mod:`lmcache.v1.platform.rbln.event_ipc`, host-synchronizing) and
+the dma-buf IPC wrapper (:mod:`lmcache.v1.platform.rbln.ipc_wrapper`, stub)
+are registered on the spec, while
+:meth:`RblnDeviceSpec.is_handle_transfer_available` stays ``False`` until
+the wrapper can actually export/import device memory.  Requesting
+``mp_transfer_mode=lmcache_driven`` therefore still fails fast at its
+documented validation point.
 
 See ``docs/design/v1/platform/rbln/README.md`` for the full contract.
 """
@@ -31,6 +32,8 @@ from lmcache.v1.platform.base.device_spec import DeviceSpec
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.platform.base.device_ops import DeviceOps
+    from lmcache.v1.platform.base.event_ipc import EventIPCBackend
+    from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
 
 # ---------------------------------------------------------------------------
 # Device detection registry entry
@@ -39,6 +42,8 @@ if TYPE_CHECKING:
 
 class RblnDeviceSpec(DeviceSpec):
     """RBLN device specification for the detection registry."""
+
+    _event_backend_cache: "EventIPCBackend | None" = None
 
     @property
     def device_type(self) -> str:
@@ -79,16 +84,34 @@ class RblnDeviceSpec(DeviceSpec):
             return False
 
     def is_handle_transfer_available(self) -> bool:
-        """Report that RBLN cannot ship KV tensors as IPC handles.
+        """Report that RBLN cannot yet ship KV tensors as IPC handles.
 
-        The base class defaults to ``True``; RBLN overrides it to ``False``
-        because ``torch.rbln`` exposes no ``Event`` type, so the ordered
-        cross-process publication the LMCache-driven path depends on cannot
-        be expressed.  Returning ``False`` keeps
-        ``mp_transfer_mode=lmcache_driven`` failing at its documented
-        validation point instead of at an attribute lookup later on.
+        Flip to ``True`` once :class:`~lmcache.v1.platform.rbln.ipc_wrapper.
+        RblnIPCWrapper` implements dma-buf export/import.  Until then,
+        ``mp_transfer_mode=lmcache_driven`` fails at its documented
+        validation point instead of at ``NotImplementedError`` later on.
 
         Returns:
             bool: Always ``False``.
         """
         return False
+
+    @property
+    def event_ipc_backend(self) -> "EventIPCBackend":
+        """Return the host-synchronizing RBLN event IPC backend."""
+        backend = self._event_backend_cache
+        if backend is None:
+            # First Party
+            from lmcache.v1.platform.rbln.event_ipc import RblnEventIPCBackend
+
+            backend = RblnEventIPCBackend()
+            self._event_backend_cache = backend
+        return backend
+
+    @property
+    def ipc_wrapper_cls(self) -> "type[DeviceIPCWrapper]":
+        """Return the dma-buf IPC wrapper class (export/import still stubbed)."""
+        # First Party
+        from lmcache.v1.platform.rbln.ipc_wrapper import RblnIPCWrapper
+
+        return RblnIPCWrapper
