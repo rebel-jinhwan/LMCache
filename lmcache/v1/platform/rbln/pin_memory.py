@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RBLN host-memory backend: ``torch.rbln.register_host_memory`` (cudaHostRegister's
+"""RBLN host-memory backend: ``torch.rbln.host_register`` (cudaHostRegister's
 counterpart). Pages are pinned once and later copies inside the range skip the
 per-command-buffer pin; the region's contents are untouched.
 """
@@ -23,14 +23,17 @@ logger = init_logger(__name__)
 class RblnPinMemoryBackend(PinMemoryBackend):
     """Pin host memory for RBLN DMA by registering it with the runtime.
 
+    A range is registered on the current device only, as ``host_register``
+    does; :meth:`unpin_memory` unregisters it on that same device.
+
     Attributes:
-        _registered: Start addresses this backend registered, so
-            :meth:`unpin_memory` only hands back pins it took.
+        _registered: Start address -> device index of every range this backend
+            registered, so :meth:`unpin_memory` only hands back pins it took.
     """
 
     def __init__(self) -> None:
         """Create the backend; it needs nothing beyond ``torch.rbln``."""
-        self._registered: set[int] = set()
+        self._registered: dict[int, int] = {}
         self._lock = threading.Lock()
 
     def pin_memory(self, ptr: int, size: int, flags: int = 0) -> bool:
@@ -46,26 +49,25 @@ class RblnPinMemoryBackend(PinMemoryBackend):
 
         Returns:
             True when the range is registered, False when the range is empty
-            or the runtime refused it (an overlap with a live registration, a
-            UMD without ``rblnRegisterHostMemory``).  A False leaves the region
-            usable, just on the per-copy pin path.
+            or ``host_register`` declined it (no RBLN device, an overlap with a
+            live registration, a UMD without ``rblnRegisterHostMemory``).  A
+            False leaves the region usable, just on the per-copy pin path.
         """
         del flags
         if ptr <= 0 or size <= 0:
             return False
-        try:
-            torch.rbln.register_host_memory(ptr, size)
-        except Exception as exc:
+        device = torch.rbln.current_device()
+        if not torch.rbln.host_register(ptr, size, device=device):
             logger.warning(
-                "RblnPinMemoryBackend: register_host_memory(ptr=%#x, size=%d) "
-                "failed: %s",
+                "RblnPinMemoryBackend: host_register(ptr=%#x, size=%d, device=%d) "
+                "declined; the range stays on the per-copy pin path",
                 ptr,
                 size,
-                exc,
+                device,
             )
             return False
         with self._lock:
-            self._registered.add(ptr)
+            self._registered[ptr] = device
         return True
 
     def unpin_memory(self, ptr: int) -> bool:
@@ -81,17 +83,16 @@ class RblnPinMemoryBackend(PinMemoryBackend):
             registered it or the runtime refused.
         """
         with self._lock:
-            registered = ptr in self._registered
-            self._registered.discard(ptr)
-        if not registered:
+            device = self._registered.pop(ptr, None)
+        if device is None:
             return False
         try:
-            torch.rbln.unregister_host_memory(ptr)
-        except Exception as exc:
-            logger.warning(
-                "RblnPinMemoryBackend: unregister_host_memory(ptr=%#x) failed: %s",
+            torch.rbln.host_unregister(ptr, device=device)
+        except RuntimeError:
+            logger.exception(
+                "RblnPinMemoryBackend: host_unregister(ptr=%#x, device=%d) failed",
                 ptr,
-                exc,
+                device,
             )
             return False
         return True

@@ -4,9 +4,10 @@
 The backend's contract, per
 ``docs/design/v1/platform/rbln/README.md`` and its own docstrings:
 
-- With torch-rbln's ``register_host_memory`` available, ``pin_memory`` registers
-  the range and ``unpin_memory`` unregisters exactly what was registered; a
-  refused registration is reported as False, never as a pretend pin.
+- With torch-rbln's ``host_register`` available, ``pin_memory`` registers the
+  range on the current device and ``unpin_memory`` unregisters exactly what was
+  registered, on that device; a declined registration is reported as False,
+  never as a pretend pin.
 - Without it the surface reports "unsupported" rather than raising.
 
 torch-rbln is replaced by a fake registrar so the suite runs on any host.
@@ -32,37 +33,42 @@ REGION_PAGES = 3
 SENTINEL = b"lmcache-rbln-pin"
 
 
-class FakeRegistrar:
-    """Stands in for ``torch.rbln.register_host_memory`` / ``unregister_host_memory``.
+DEVICE = 2
 
-    Records every call and can be told to refuse, so the tests can see which
+
+class FakeRegistrar:
+    """Stands in for ``torch.rbln.host_register`` / ``host_unregister``.
+
+    Records every call and can be told to decline, so the tests can see which
     strategy the backend took.
     """
 
     def __init__(self, refuse: bool = False) -> None:
         self.refuse = refuse
-        self.registered: list[tuple[int, int]] = []
-        self.unregistered: list[int] = []
+        self.registered: list[tuple[int, int, int]] = []
+        self.unregistered: list[tuple[int, int]] = []
 
-    def register(self, ptr: int, size: int) -> None:
+    def register(self, ptr: int, nbytes: int, device: int) -> bool:
         if self.refuse:
-            raise RuntimeError("register_host_memory: overlaps a registered range")
-        self.registered.append((ptr, size))
+            return False
+        self.registered.append((ptr, nbytes, device))
+        return True
 
-    def unregister(self, ptr: int) -> None:
-        if ptr not in {p for p, _ in self.registered}:
-            raise RuntimeError("unregister_host_memory: not a registration")
-        self.unregistered.append(ptr)
+    def unregister(self, ptr: int, device: int) -> None:
+        if (ptr, device) not in {(p, d) for p, _, d in self.registered}:
+            raise RuntimeError("host_unregister: not a registration")
+        self.unregistered.append((ptr, device))
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, fake: FakeRegistrar) -> None:
-    """Point ``torch.rbln``'s register/unregister_host_memory at ``fake``."""
+    """Point ``torch.rbln``'s host_register/host_unregister at ``fake``."""
     rbln = getattr(torch, "rbln", None)
     if rbln is None:
         rbln = types.SimpleNamespace()
         monkeypatch.setattr(torch, "rbln", rbln, raising=False)
-    monkeypatch.setattr(rbln, "register_host_memory", fake.register, raising=False)
-    monkeypatch.setattr(rbln, "unregister_host_memory", fake.unregister, raising=False)
+    monkeypatch.setattr(rbln, "current_device", lambda: DEVICE, raising=False)
+    monkeypatch.setattr(rbln, "host_register", fake.register, raising=False)
+    monkeypatch.setattr(rbln, "host_unregister", fake.unregister, raising=False)
 
 
 @pytest.fixture
@@ -112,30 +118,30 @@ def test_pin_registers_with_torch_rbln(
 
     assert backend.is_pin_supported is True
     assert backend.pin_memory(ptr, size) is True
-    assert registrar.registered == [(ptr, size)]
+    assert registrar.registered == [(ptr, size, DEVICE)]
     assert _read(ptr, len(SENTINEL)) == SENTINEL
 
 
 def test_unpin_unregisters_what_pin_registered(
     registrar: FakeRegistrar, region: tuple[int, int]
 ) -> None:
-    """Unpinning hands the pin back exactly once."""
+    """Unpinning hands the pin back exactly once, on the registering device."""
     ptr, size = region
     backend = RblnPinMemoryBackend()
     backend.pin_memory(ptr, size)
 
     assert backend.unpin_memory(ptr) is True
-    assert registrar.unregistered == [ptr]
+    assert registrar.unregistered == [(ptr, DEVICE)]
     # A second unpin has nothing registered to release and must not reach the
     # runtime again.
     assert backend.unpin_memory(ptr) is False
-    assert registrar.unregistered == [ptr]
+    assert registrar.unregistered == [(ptr, DEVICE)]
 
 
 def test_refused_registration_reports_false(
     monkeypatch: pytest.MonkeyPatch, region: tuple[int, int]
 ) -> None:
-    """A registrar that refuses makes pin_memory False, with the data intact."""
+    """A declined registration makes pin_memory False, with the data intact."""
     fake = FakeRegistrar(refuse=True)
     _install(monkeypatch, fake)
     ptr, size = region

@@ -18,7 +18,7 @@ error rather than crashing deeper in the transfer path.
 
 Host memory is the one capability the spec does add:
 :class:`~lmcache.v1.platform.rbln.pin_memory.RblnPinMemoryBackend` registers a
-host region with the runtime through ``torch.rbln.register_host_memory`` -- the
+host region with the runtime through ``torch.rbln.host_register`` -- the
 RBLN counterpart of ``cudaHostRegister`` -- so copies into it reuse one pin.
 
 See ``docs/design/v1/platform/rbln/README.md`` for the full contract.
@@ -88,7 +88,7 @@ class RblnDeviceSpec(DeviceSpec):
     def pin_memory_backend(self) -> type[PinMemoryBackend] | None:
         """Return the backend that pins host memory for RBLN DMA.
 
-        It registers the range through ``torch.rbln.register_host_memory``;
+        It registers the range through ``torch.rbln.host_register``;
         see :mod:`lmcache.v1.platform.rbln.pin_memory`.
 
         Returns:
