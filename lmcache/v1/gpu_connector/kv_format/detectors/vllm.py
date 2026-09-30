@@ -86,6 +86,16 @@ class VLLM_Detector(EngineDetector):
             and first_tensor.shape[3] == 1
         ):
             return lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS, kv_caches
+        # vLLM-RBLN blocks-first (#1114): the same cache with num_blocks ahead
+        # of the K/V axis. At num_blocks == 2 the shape is also the layout
+        # above, which is read first.
+        if (
+            list_depth == 1
+            and tensor_ndim == 6
+            and first_tensor.shape[1] == 2
+            and first_tensor.shape[3] == 1
+        ):
+            return lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS, kv_caches
         if list_depth == 1 and tensor_ndim == 5:
             if first_tensor.shape[0] == 2:  # K/V axis first
                 if is_hnd:

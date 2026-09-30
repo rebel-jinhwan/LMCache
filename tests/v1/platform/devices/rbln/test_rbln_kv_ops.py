@@ -353,6 +353,46 @@ def test_mla_round_trip_restores_the_paged_cache() -> None:
     chunks = _mla_chunks()
     _mla_transfer(src, chunks, TransferDirection.D2H)
     _mla_transfer(dst, chunks, TransferDirection.H2D)
+
+
+# ---------------------------------------------------------------------------
+# Blocks-first layout (vLLM-RBLN #1114)
+# ---------------------------------------------------------------------------
+
+
+def _blocks_first(layers: list[torch.Tensor]) -> list[torch.Tensor]:
+    """The same KV rewritten blocks-first, ``[NB, 2, NH, 1, BS, HS]``."""
+    return [layer.transpose(0, 1).contiguous() for layer in layers]
+
+
+def test_blocks_first_chunks_match_the_kv_first_ones() -> None:
+    """A block's bytes land in the chunk the same way whichever axis leads.
+
+    The layout is an engine-side allocation detail; the chunk is the wire
+    format, so the same KV must produce byte-identical chunks either way.
+    """
+    layers = _paged_layers()
+    kv_first = _chunks()
+    blocks_first = _chunks()
+    _transfer(layers, kv_first, TransferDirection.D2H)
+    _transfer(
+        _blocks_first(layers),
+        blocks_first,
+        TransferDirection.D2H,
+        engine_kv_format=EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS,
+    )
+    for got, expected in zip(blocks_first, kv_first, strict=True):
+        assert torch.equal(got, expected)
+
+
+def test_blocks_first_round_trip_restores_the_paged_cache() -> None:
+    """Gather then scatter over the blocks-first layout reproduces the source."""
+    src = _blocks_first(_paged_layers())
+    dst = _blocks_first(_paged_layers(fill_random=False))
+    chunks = _chunks()
+    fmt = EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS
+    _transfer(src, chunks, TransferDirection.D2H, engine_kv_format=fmt)
+    _transfer(dst, chunks, TransferDirection.H2D, engine_kv_format=fmt)
     for got, expected in zip(dst, src, strict=True):
         assert torch.equal(got, expected)
 
@@ -401,4 +441,15 @@ def test_mla_rejects_wrong_rank_layers() -> None:
             CHUNK_TOKENS,
             EngineKVFormat.NL_X_NB_BS_HS,
             0,
+        )
+
+
+def test_blocks_first_format_rejects_a_kv_first_cache() -> None:
+    """The format names the layout; a cache that does not match fails loudly."""
+    with pytest.raises(ValueError, match=r"\[NB, 2, NH, 1, BS, HS\]"):
+        _transfer(
+            [torch.zeros(2, NUM_BLOCKS, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE)],
+            _chunks(),
+            TransferDirection.D2H,
+            engine_kv_format=EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS,
         )

@@ -15,6 +15,14 @@ with no K/V split and no head axis, which the vLLM detector classifies as
 :func:`validate_mla_layers` only pins the rank so a layout drift fails loudly
 at the transfer boundary instead of mis-addressing bytes.
 
+Since vLLM-RBLN #1114, attention on ``rbln_custom_ops`` allocates the attention
+layer blocks-first instead, ``[num_blocks, 2, num_kv_heads, 1, block_size,
+head_size]`` (``EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS``). Squeezing and
+swapping the two leading axes gives the same ``[2, NB, NH, BS, HS]`` view,
+strided rather than contiguous, in which ``layer[kv, block]`` is still one
+contiguous ``[NH, BS, HS]`` run -- the unit the transfer copies -- so the
+transfer code addresses both layouts through :func:`two_major_views`.
+
 Detection does not squeeze: the layout is registered as its own
 ``EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS``, so the vLLM detector classifies
 what vLLM-RBLN actually allocated and holds no RBLN knowledge beyond that
@@ -126,3 +134,40 @@ def validate_mla_layers(
                 + str(tuple(tensor.stride()))
             )
     return list(kv_caches)
+
+
+def two_major_views(
+    kv_caches: Sequence[torch.Tensor], blocks_first: bool
+) -> list[torch.Tensor]:
+    """Return ``[2, NB, NH, BS, HS]`` views of either native RBLN KV layout.
+
+    Args:
+        kv_caches: Per-layer tensors, ``[NB, 2, NH, 1, BS, HS]`` when
+            ``blocks_first`` else ``[2, NB, NH, 1, BS, HS]``.
+        blocks_first: Whether the caches use the blocks-first layout. Taken
+            from the detected format, not the shape: at ``NB == 2`` the two
+            layouts have the same shape.
+
+    Returns:
+        list[torch.Tensor]: Views sharing storage with the inputs; contiguous
+        for the K/V-first layout, strided for the blocks-first one.
+
+    Raises:
+        ValueError: If a tensor is not 6-D with the K/V pair on the axis the
+            layout names and a singleton at axis 3.
+    """
+    if not blocks_first:
+        return squeeze_singleton_axis(kv_caches)
+    views: list[torch.Tensor] = []
+    for tensor in kv_caches:
+        if not (
+            tensor.ndim == RBLN_KV_NDIM
+            and tensor.shape[1] == 2
+            and tensor.shape[RBLN_SINGLETON_AXIS] == 1
+        ):
+            raise ValueError(
+                "blocks-first RBLN KV caches must be [NB, 2, NH, 1, BS, HS]; got "
+                + str(tuple(tensor.shape))
+            )
+        views.append(tensor.squeeze(RBLN_SINGLETON_AXIS).transpose(0, 1))
+    return views

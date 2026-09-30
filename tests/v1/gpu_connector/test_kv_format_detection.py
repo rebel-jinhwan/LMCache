@@ -76,6 +76,18 @@ def test_vllm_rbln_native_singleton_axis(monkeypatch, hint):
     assert out[0].data_ptr() == kv[0].data_ptr()
 
 
+@pytest.mark.parametrize("hint", [{}, {"kv_layout": "NHD"}, {"kv_layout": "HND"}])
+def test_vllm_rbln_blocks_first_singleton_axis(monkeypatch, hint):
+    # vLLM-RBLN #1114 puts num_blocks ahead of the K/V axis; the 6-D shape with
+    # the singleton at axis 3 still identifies it, whatever the hint says.
+    monkeypatch.setattr(_VLLM_DEV, "cuda")
+    kv = [_t(NB, 2, NH, 1, BS, HS) for _ in range(NL)]
+    fmt, out = detect_format(kv, EngineType.VLLM, hint)
+    assert fmt == F.NL_X_NB_TWO_NH_ONE_BS_HS
+    assert tuple(out[0].shape) == (NB, 2, NH, 1, BS, HS)
+    assert out[0].data_ptr() == kv[0].data_ptr()
+
+
 def test_vllm_blocks_first_fused_num_heads_2(monkeypatch):
     # Raw 4-D [NB, NH, BS, 2*HS] with NH == 2 (a common GQA config): a 5-D
     # split would make the K/V axis and the head axis both equal 2, ambiguous

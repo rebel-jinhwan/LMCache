@@ -47,7 +47,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.platform.base.device_ops import DeviceOps
 from lmcache.v1.platform.devices.rbln.kv_layout import (
-    squeeze_singleton_axis,
+    two_major_views,
     validate_mla_layers,
 )
 from lmcache.v1.platform.devices.rbln.kv_ops import (
@@ -65,6 +65,11 @@ logger = init_logger(__name__)
 #: vLLM-RBLN per-layer HND format the vLLM detector reports for an RBLN
 #: attention KV cache.
 _HND_FORMAT = lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS
+
+#: The same cache blocks-first (``[NB, 2, NH, 1, BS, HS]``), which vLLM-RBLN
+#: allocates since #1114 when attention runs on rbln_custom_ops. Read K/V-first
+#: through ``two_major_views``, so the HND op sequence moves it unchanged.
+_BLOCKS_FIRST_FORMAT = lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS
 
 #: The MLA layout vLLM-RBLN's MLA attention backend allocates
 #: (``[NB, BS, HS]``). Moved by its own functional op sequence -- see the
@@ -91,7 +96,8 @@ class RblnDeviceOps(DeviceOps):
 
         Args:
             paged_buffer_ptrs_tensor: Native per-layer KV tensors --
-                ``[2, NB, NH, 1, BS, HS]`` (HND attention) or
+                ``[2, NB, NH, 1, BS, HS]`` or blocks-first
+                ``[NB, 2, NH, 1, BS, HS]`` (HND attention), or
                 ``[NB, BS, HS]`` (MLA).
             lmcache_objects_ptrs: Staging chunks in the canonical token-major
                 layout -- ``[2, L, T, H*D]`` (HND) or ``[L, T, HS]`` (MLA).
@@ -101,12 +107,13 @@ class RblnDeviceOps(DeviceOps):
             direction: ``D2H`` to store, ``H2D`` to retrieve.
             shape_desc: Paged-buffer shape descriptor.
             lmcache_chunk_size: Tokens per staging chunk.
-            engine_kv_format: Engine KV layout; must be the HND or MLA format.
+            engine_kv_format: Engine KV layout; must be one of the HND formats
+                or the MLA format.
             skip_prefix_n_blocks: Leading blocks neither read nor written.
 
         Raises:
             ValueError: If the operands are not tensor lists, the format is
-                neither the validated HND nor the MLA layout, a paged tensor
+                none of the validated HND and MLA layouts, a paged tensor
                 does not match its format's native shape, or the direction is
                 unknown.
         """
@@ -129,24 +136,29 @@ class RblnDeviceOps(DeviceOps):
                     "RBLN block transfer supports only the "
                     f"{_MLA_FORMAT.name} MLA layout; got {engine_kv_format!r}"
                 )
-        elif int(engine_kv_format) != int(_HND_FORMAT):
+        elif int(engine_kv_format) not in (
+            int(_HND_FORMAT),
+            int(_BLOCKS_FIRST_FORMAT),
+        ):
             raise ValueError(
                 "RBLN block transfer supports only "
-                f"{_HND_FORMAT.name} and {_MLA_FORMAT.name}; "
-                f"got {engine_kv_format!r}"
+                f"{_HND_FORMAT.name}, {_BLOCKS_FIRST_FORMAT.name} and "
+                f"{_MLA_FORMAT.name}; got {engine_kv_format!r}"
             )
 
         # Per-format addressing only; the chunk/block bookkeeping below is
         # shared. HND keeps the singleton axis the RBLN attention backend
-        # requires -- drop it here, where the bytes are actually addressed.
-        # MLA has nothing to squeeze; its rank is pinned instead.
+        # requires -- drop it here, where the bytes are actually addressed,
+        # and read the blocks-first layout K/V-first. MLA has nothing to
+        # squeeze; its rank is pinned instead.
         if is_mla:
             paged_layers = validate_mla_layers(
                 cast("list[torch.Tensor]", list(paged_buffer_ptrs_tensor))
             )
         else:
-            paged_layers = squeeze_singleton_axis(
-                cast("list[torch.Tensor]", list(paged_buffer_ptrs_tensor))
+            paged_layers = two_major_views(
+                cast("list[torch.Tensor]", list(paged_buffer_ptrs_tensor)),
+                int(engine_kv_format) == int(_BLOCKS_FIRST_FORMAT),
             )
         chunks = cast("list[torch.Tensor]", list(lmcache_objects_ptrs))
         flat_blocks = (

@@ -48,6 +48,16 @@ Axis 3 is always 1, so the tensor is byte- and stride-identical to a 5-D
 vLLM-RBLN actually allocated instead of reshaping a device's KV cache to fit
 another format's rank.
 
+Since vLLM-RBLN #1114, attention on `rbln_custom_ops` (its default) allocates
+the same cache **blocks-first**, `[NB, 2, NH, 1, BS, HS]`, so each block's K and
+V are one contiguous run. It is registered the same way, as
+`EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS` (19; 17 and 18 are taken upstream).
+The transfer reads it through `kv_layout.two_major_views`, which squeezes the
+singleton and swaps the two leading axes -- a strided `[2, NB, NH, BS, HS]` view
+in which `layer[kv, block]` is still one contiguous `[NH, BS, HS]` run, so the
+op sequence and the chunks are those of format 15. At `NB == 2` the two shapes
+coincide and detection keeps reading format 15.
+
 The alternative -- squeezing the axis during discovery so it classifies as the
 existing `NL_X_TWO_NB_NH_BS_HS` (6) -- was rejected. Reshaping inside detection
 requires a device hook, which makes discovery depend on process-global device

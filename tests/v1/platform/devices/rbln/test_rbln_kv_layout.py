@@ -37,6 +37,7 @@ from lmcache.v1.gpu_connector.utils import (
 from lmcache.v1.platform.devices.rbln.kv_layout import (
     is_rbln_kv_layout,
     squeeze_singleton_axis,
+    two_major_views,
 )
 import lmcache.lmcache_native as lmcache_native
 
@@ -214,3 +215,55 @@ def test_validate_mla_layers_rejects_a_non_contiguous_layer() -> None:
     permuted = torch.zeros(8, 4, 16).permute(1, 0, 2)  # still rank 3
     with pytest.raises(ValueError, match="contiguous"):
         validate_mla_layers([permuted])
+
+
+# ---------------------------------------------------------------------------
+# Blocks-first layout (vLLM-RBLN #1114)
+# ---------------------------------------------------------------------------
+
+_BLOCKS_FIRST_FORMAT = lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS
+
+
+def _blocks_first_kv() -> list[torch.Tensor]:
+    """Per-layer tensors in vLLM-RBLN's blocks-first 6-D layout."""
+    torch.manual_seed(5)
+    shape = (NUM_BLOCKS, 2, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE)
+    return [torch.randn(shape) for _ in range(NUM_LAYERS)]
+
+
+def test_blocks_first_layout_is_its_own_format() -> None:
+    """Blocks-first 6-D input resolves to its own format, rank intact."""
+    fmt, normalized = _discover(_blocks_first_kv())
+    assert int(fmt) == int(_BLOCKS_FIRST_FORMAT)
+    assert [t.ndim for t in normalized] == [6] * NUM_LAYERS
+
+
+def test_blocks_first_geometry_reads_past_the_singleton() -> None:
+    """The spec reports the real dims with num_blocks leading."""
+    fmt, normalized = _discover(_blocks_first_kv())
+    assert get_num_layers(normalized, fmt) == NUM_LAYERS
+    assert get_num_heads(normalized, fmt) == NUM_HEADS
+    assert get_block_size(normalized, fmt) == BLOCK_SIZE
+    assert get_head_size(normalized, fmt) == HEAD_SIZE
+
+
+def test_two_major_views_read_blocks_first_kv_first() -> None:
+    """The view is free and indexes like the K/V-first layout."""
+    blocks_first = _blocks_first_kv()
+    for view, tensor in zip(
+        two_major_views(blocks_first, blocks_first=True), blocks_first, strict=True
+    ):
+        assert view.data_ptr() == tensor.data_ptr()
+        assert tuple(view.shape) == (2, NUM_BLOCKS, NUM_HEADS, BLOCK_SIZE, HEAD_SIZE)
+        assert torch.equal(view[1, 3], tensor[3, 1, :, 0])
+        # The unit the transfer copies stays one contiguous run.
+        assert view[1, 3].is_contiguous()
+
+
+def test_two_major_views_reject_a_kv_first_cache() -> None:
+    """Asked for blocks-first, a K/V-first cache fails loudly."""
+    with pytest.raises(ValueError, match=r"\[NB, 2, NH, 1, BS, HS\]"):
+        two_major_views(
+            [torch.zeros(2, NUM_BLOCKS, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE)],
+            blocks_first=True,
+        )
