@@ -22,14 +22,16 @@ the preflight before pytest can skip the real-device tests.
 
 1. Configure the Buildkite Kubernetes controller to watch `rbln-queue`, and make
    the `npu1` ResourceClaimTemplate available in its job namespace.
-2. Provide a CI image in the **internal registry**, accessible only from the
-   Rebellions worker network. Configure registry authentication on the job
-   service account (`imagePullSecrets`) or controller `pod-spec-patch`. Registry
-   credentials and kubeconfig are not needed in this repository or Buildkite YAML.
-3. In the `rbln-mp-test` pipeline environment, set `RBLN_CI_IMAGE` to the full
-   internal image reference with an immutable tag or digest. There is no default
-   public image or image publishing step. The registry/network policy enforces
-   where the image can be pulled; the queue routes jobs to those workers.
+2. Allow the Rebellions worker nodes to pull
+   `ghcr.io/rebellions-sw/rbln-test:latest`. If the package is private, configure
+   GHCR authentication on the job service account (`imagePullSecrets`) or
+   controller `pod-spec-patch`. Keep pull credentials in Kubernetes; the image
+   address alone does not grant access or restrict pulls to these workers.
+3. The test image defaults to `ghcr.io/rebellions-sw/rbln-test:latest`.
+   Optionally set `RBLN_CI_IMAGE` in the pipeline environment to select a specific
+   tag, digest, or internal mirror. `imagePullPolicy: Always` checks the registry
+   on each Pod start so updates to `latest` are used. The queue routes image pulls
+   and test execution to the Rebellions workers.
 4. Paste `buildkite-pipeline.yml` into the pipeline's Steps editor. The upload
    job uses the controller's default image and needs Bash, Git and Buildkite
    agent, but no NPU. It uses the shared PR-base merge/path-filter helper.
@@ -41,10 +43,10 @@ If the controller actually watches `rbln-npu`, change the bootstrap queue in
 `buildkite-pipeline.yml` and set `RBLN_CI_QUEUE=rbln-npu` in the pipeline
 environment. Both upload and test jobs must reach the same infrastructure.
 
-For example, a pipeline environment can contain:
+For example, to select the image explicitly:
 
 ```text
-RBLN_CI_IMAGE=registry.internal.example/ci/lmcache-rbln@sha256:<image-digest>
+RBLN_CI_IMAGE=ghcr.io/rebellions-sw/rbln-test:latest
 RBLN_CI_QUEUE=rbln-queue
 ```
 
@@ -54,8 +56,7 @@ documentation for the controller configuration.
 
 ## Image contract
 
-The infrastructure team builds and pins the image against the worker's driver.
-It must contain:
+The selected image must be compatible with the worker's driver and contain:
 
 - Python 3.12 with `pip`; compatible pinned `torch`, `torch-rbln` and
   `rebel-compiler`, with automatic `torch.rbln` registration.

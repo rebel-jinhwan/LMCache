@@ -1,5 +1,5 @@
 # The controller and registry access are provided by Rebellions infrastructure.
-# RBLN_CI_IMAGE has no public fallback. Pull credentials live in Kubernetes.
+# RBLN_CI_IMAGE can override the default test image. Pull credentials live in Kubernetes.
 env:
   LMCACHE_TRACK_USAGE: "false"
   TORCH_RBLN_EAGER_MALLOC: "1"
@@ -23,7 +23,7 @@ steps:
                 resourceClaimTemplateName: npu1
             containers:
               - name: container-0
-                image: "${RBLN_CI_IMAGE?Set RBLN_CI_IMAGE to the internal CI image}"
+                image: "${RBLN_CI_IMAGE:-ghcr.io/rebellions-sw/rbln-test:latest}"
                 imagePullPolicy: Always
                 resources:
                   requests:
