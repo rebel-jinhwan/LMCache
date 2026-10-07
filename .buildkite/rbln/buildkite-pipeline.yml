@@ -1,0 +1,10 @@
+# Paste into rbln-mp-test's Steps editor. Configure RBLN_CI_IMAGE in the
+# pipeline environment before running; the upload job needs no NPU/image.
+agents:
+  queue: rbln-queue
+
+steps:
+  - label: ":pipeline: Upload RBLN pipeline"
+    command: |
+      : "${RBLN_CI_IMAGE:?Set RBLN_CI_IMAGE to the internal CI image with a pinned tag or digest}"
+      bash .buildkite/k3_tests/common_scripts/upload-pipeline.sh .buildkite/rbln/pipeline.yml

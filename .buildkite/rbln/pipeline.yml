@@ -1,0 +1,67 @@
+# The controller and registry access are provided by Rebellions infrastructure.
+# RBLN_CI_IMAGE has no public fallback. Pull credentials live in Kubernetes.
+env:
+  LMCACHE_TRACK_USAGE: "false"
+  TORCH_RBLN_EAGER_MALLOC: "1"
+  LMCACHE_RBLN_UPSTREAM_PATCHES: "0"
+
+steps:
+  - label: "RBLN hardware smoke"
+    key: rbln_hw_smoke
+    agents:
+      queue: "${RBLN_CI_QUEUE:-rbln-queue}"
+    command: bash .buildkite/rbln/run.sh hw-smoke
+    timeout_in_minutes: 30
+    concurrency: 1
+    concurrency_group: lmcache/rbln-npu
+    artifact_paths: "rbln-ci-artifacts/hw-smoke/**/*"
+    plugins: &rbln_runtime
+      - kubernetes:
+          podSpec:
+            resourceClaims:
+              - name: npu
+                resourceClaimTemplateName: npu1
+            containers:
+              - name: container-0
+                image: "${RBLN_CI_IMAGE?Set RBLN_CI_IMAGE to the internal CI image}"
+                imagePullPolicy: Always
+                resources:
+                  requests:
+                    cpu: "8"
+                    memory: 32Gi
+                  limits:
+                    memory: 32Gi
+                  claims:
+                    - name: npu
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 8Gi
+
+  - label: "RBLN smoke (PR)"
+    key: rbln_smoke
+    if: build.pull_request.id != null
+    agents:
+      queue: "${RBLN_CI_QUEUE:-rbln-queue}"
+    command: bash .buildkite/rbln/run.sh smoke
+    timeout_in_minutes: 30
+    concurrency: 1
+    concurrency_group: lmcache/rbln-npu
+    artifact_paths: "rbln-ci-artifacts/smoke/**/*"
+    plugins: *rbln_runtime
+
+  - label: "RBLN unit tests (non-PR)"
+    key: rbln_unit
+    if: build.pull_request.id == null
+    agents:
+      queue: "${RBLN_CI_QUEUE:-rbln-queue}"
+    command: bash .buildkite/rbln/run.sh unit
+    timeout_in_minutes: 60
+    concurrency: 1
+    concurrency_group: lmcache/rbln-npu
+    artifact_paths: "rbln-ci-artifacts/unit/**/*"
+    plugins: *rbln_runtime
