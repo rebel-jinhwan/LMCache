@@ -30,9 +30,6 @@ a persistent device staging buffer with one batch of contiguous block copies
 (direct ``memcpy_v2v``, no index tensor, no fallback path) and crosses the
 device boundary with one DMA per chunk.
 
-Any other layout has no tuned sequence and is delegated to the shared torch
-path rather than refused, as on other non-CUDA devices.
-
 All layouts require the engine's KV caches to be real device tensors
 (vLLM-RBLN: ``VLLM_RBLN_USE_DEVICE_TENSOR=1``). With the default compile-mode
 allocation the per-layer tensors are ``meta`` and any transfer -- this
@@ -88,20 +85,17 @@ class RblnDeviceOps(DeviceOps):
     ) -> None:
         """Move whole paged blocks between RBLN KV and token-major chunks.
 
-        Layouts with an RBLN-tuned op sequence are picked by their
-        ``KVFormatSpec`` layout facts; any other layout is delegated to the
-        shared torch path.
+        The layout is picked by its ``KVFormatSpec`` layout facts.
 
         Args:
             paged_buffer_ptrs_tensor: Per-layer KV tensors --
                 ``[NB, 2, NH, 1, BS, HS]`` (HND), ``[2, NB, NH, 1, BS, HS]``
-                (K/V-first HND), ``[NB, BS, HS]`` (MLA), or any layout the
-                shared torch path supports.
+                (K/V-first HND), or ``[NB, BS, HS]`` (MLA).
             lmcache_objects_ptrs: Staging chunks in the canonical token-major
                 layout -- ``[2, L, T, H*D]`` (HND) or ``[L, T, HS]`` (MLA).
             block_ids: Flat paged-block IDs in chunk-token order.
-            device: Device the transfer runs on. Unused by the tuned
-                sequences, which take it from the tensors.
+            device: Device the transfer runs on. Unused; taken from the
+                tensors.
             direction: ``D2H`` to store, ``H2D`` to retrieve.
             shape_desc: Paged-buffer shape descriptor.
             lmcache_chunk_size: Tokens per staging chunk.
@@ -109,10 +103,12 @@ class RblnDeviceOps(DeviceOps):
             skip_prefix_n_blocks: Leading blocks neither read nor written.
 
         Raises:
-            ValueError: If the operands are not tensor lists, a paged tensor
-                does not match its tuned layout's shape, the chunk size is not
-                a block multiple, or the direction is unknown.
+            ValueError: If the operands are not tensor lists, the format's
+                layout facts match none of the supported layouts, a paged
+                tensor does not match its layout's shape, the chunk size is
+                not a block multiple, or the direction is unknown.
         """
+        del device  # taken from the operands
         if isinstance(paged_buffer_ptrs_tensor, torch.Tensor) or not all(
             isinstance(obj, torch.Tensor) for obj in lmcache_objects_ptrs
         ):
@@ -126,6 +122,7 @@ class RblnDeviceOps(DeviceOps):
         # ``lmcache.device_ops`` -- still being resolved to this module while
         # ``lmcache`` initializes on an RBLN host (an ImportError otherwise).
         # First Party
+        from lmcache.v1.gpu_connector.kv_format.specs.base import describe_shape
         from lmcache.v1.gpu_connector.kv_format.specs.registry import (
             get_spec_class,
         )
@@ -161,18 +158,11 @@ class RblnDeviceOps(DeviceOps):
                     scatter_chunk_to_blocks_hnd,
                 )
         else:
-            super().multi_layer_block_kv_transfer(
-                paged_buffer_ptrs_tensor,
-                lmcache_objects_ptrs,
-                block_ids,
-                device,
-                direction,
-                shape_desc,
-                lmcache_chunk_size,
-                engine_kv_format,
-                skip_prefix_n_blocks,
+            raise ValueError(
+                "RBLN block transfer supports only per-layer [NB, BS, HS] MLA "
+                "and per-layer HND layouts; got "
+                f"{engine_kv_format!r} ({describe_shape(engine_kv_format)})"
             )
-            return
 
         # The chunk/block bookkeeping below is shared by every tuned layout.
         paged_layers = prepare(
