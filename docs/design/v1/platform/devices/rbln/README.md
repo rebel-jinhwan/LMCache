@@ -33,130 +33,96 @@ needs no special casing.
 
 ## The 6-D KV cache
 
-This is what makes RBLN unusual. With `rbln_triton_ops`, vllm-rbln allocates
-each layer as (the default kernels use the blocks-first variant described
-below)
+This is what makes RBLN unusual. Since
+[vllm-rbln#1114](https://github.com/RBLN-SW/vllm-rbln/pull/1114), vllm-rbln's
+default attention kernels (`rbln_custom_ops`) allocate each layer as
 
 ```
-[2, num_blocks, num_kv_heads, 1, block_size, head_size]
+[num_blocks, 2, num_kv_heads, 1, block_size, head_size]
 ```
 
--- HND with an **extra singleton axis between heads and block tokens**, which
-the RBLN attention backend requires. Every other supported engine hands
-LMCache a 5-D (or 4-D / 3-D) per-layer tensor.
+-- blocks-first HND with an **extra singleton axis between heads and block
+tokens**, which the RBLN attention backend requires. Every other supported
+engine hands LMCache a 5-D (or 4-D / 3-D) per-layer tensor.
+
+The older K/V-first allocation `[2, num_blocks, num_kv_heads, 1, block_size,
+head_size]`, used only by the `rbln_triton_ops` kernels, is **not supported**.
+Its format (`NL_X_TWO_NB_NH_ONE_BS_HS`, 15) was removed rather than carried
+next to this one: keeping both doubled the RBLN transfer code and made
+`num_blocks == 2` ambiguous (`[2, 2, NH, 1, BS, HS]` fits both).
 
 Axis 3 is always 1, so the tensor is byte- and stride-identical to a 5-D
-`[2, NB, NH, BS, HS]` layout. It is nonetheless **registered as its own
-`EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS` (15)**, so detection reports what
+`[NB, 2, NH, BS, HS]` layout. It is nonetheless **registered as its own
+`EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS` (19)**, so detection reports what
 vLLM-RBLN actually allocated instead of reshaping a device's KV cache to fit
 another format's rank.
 
 The alternative -- squeezing the axis during discovery so it classifies as the
-existing `NL_X_TWO_NB_NH_BS_HS` (6) -- was rejected. Reshaping inside detection
-requires a device hook, which makes discovery depend on process-global device
-state rather than being a pure function of `(kv_caches, layout_hints)`, and it
-forces a second device-specific rule (the HND override below) for a format that
-is HND by definition. Registering the format removes both.
+existing `NL_X_NB_TWO_NH_BS_HS` (7) -- was rejected. Reshaping a device's KV
+cache inside a detector puts device knowledge in engine discovery, and the
+format is HND by definition, so it needs no layout hint either. Registering the
+format keeps the detector to a shape check.
 
 Consequences of the format being first-class:
 
 - **Detection is device-independent.** The 6-D branch in `detectors/vllm.py`
-  keys off the shape signature alone (`ndim == 6`, `shape[0] == 2`,
+  keys off the shape signature alone (`ndim == 6`, `shape[1] == 2`,
   `shape[3] == 1`), so the same input classifies identically on any host, and
   the detector needs no `rbln` entry in its device table.
 
   ```python
   if (list_depth == 1 and tensor_ndim == 6
-          and first_tensor.shape[0] == 2 and first_tensor.shape[3] == 1):
-      return lmc_ops.EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS, kv_caches
+          and first_tensor.shape[1] == 2 and first_tensor.shape[3] == 1):
+      return lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS, kv_caches
   ```
 
 - **The reported layout is never consulted.** vllm-rbln does not set vLLM's KV
   cache layout, so `get_kv_cache_layout()` returns the NHD default, which under
   the shared 5-D format would have classified the cache as
-  `NL_X_TWO_NB_BS_NH_HS` -- the wrong axis order for every transfer. Format 15
+  `NL_X_NB_TWO_BS_NH_HS` -- the wrong axis order for every transfer. Format 19
   is HND by definition, so the hint plays no part. `detectors/vllm.py` still
   forces HND for `cpu` (vLLM's CPU attention backend misreports its layout),
-  but that table no longer has an `rbln` entry.
+  but that table has no `rbln` entry.
 
 - **The squeeze happens where bytes move.** `RblnDeviceOps.multi_layer_block_kv_transfer`
   classifies the format by its `KVFormatSpec` layout facts, not its enum
-  value: a per-layer two-major HND layout (`is_layer_list`, `is_hnd`,
-  `is_two_major`, not `is_fused_packed`) takes the HND sequence, and a
-  per-layer `[NB, BS, HS]` MLA layout (`is_layer_list`, `is_mla`, not
-  `is_pbs_fused` / `is_kv_second_tuple`) takes the MLA one (below). A
-  per-layer HND layout that is not two-major takes the blocks-first sequence,
-  and every other layout goes to the shared torch path (both below). The HND
-  side applies `squeeze_singleton_axis` at entry, so `kv_ops.py` keeps
-  indexing a 5-D tensor. `kv_layout.py` therefore exports the strict squeeze
-  plus the `is_rbln_kv_layout` predicate -- no tolerant pass-through variant.
-  `NL_X_TWO_NB_NH_BS_HS` (6) shares format 15's layout facts (the singleton
+  value: a per-layer blocks-first HND layout (`is_layer_list`, `is_hnd`, not
+  `is_two_major`, not `is_fused_packed`) takes the HND sequence, a per-layer
+  `[NB, BS, HS]` MLA layout (`is_layer_list`, `is_mla`, not `is_pbs_fused` /
+  `is_kv_second_tuple`) takes the MLA one (below), and every other layout
+  goes to the shared torch path (below). The HND side applies
+  `squeeze_singleton_axis` at entry, so `kv_ops.py` indexes a 5-D tensor.
+  `kv_layout.py` therefore exports the strict squeeze plus the
+  `is_rbln_kv_layout` predicate -- no tolerant pass-through variant.
+  `NL_X_NB_TWO_NH_BS_HS` (7) shares format 19's layout facts (the singleton
   axis is the only difference), but vLLM-RBLN never allocates it, so a 5-D
   cache fails loudly in the squeeze rather than being accepted.
 
   ```python
   spec = get_spec_class(engine_kv_format)
-  is_hnd = spec.is_layer_list and spec.is_hnd and spec.is_two_major and not spec.is_fused_packed
+  is_hnd = (spec.is_layer_list and spec.is_hnd
+            and not spec.is_two_major and not spec.is_fused_packed)
   ```
 
-- **No transfer kernel handles format 15.** RBLN has no compiled
+- **No transfer kernel handles format 19.** RBLN has no compiled
   block-transfer extension in tree, and the CUDA / SYCL kernels never see an
   RBLN cache, so their `default:` arm rejecting the format is correct rather
   than a gap. `csrc` therefore carries only the enum value, its
-  `is_layer_list` classification, and the two pybind registrations.
+  `is_layer_list` / `is_hnd` classification, and the pybind registration.
 
 The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
 never touch a connector -- which is why the format must be recognised by
 detection rather than by a connector.
 
-## The blocks-first 6-D KV cache
-
-Since [vllm-rbln#1114](https://github.com/RBLN-SW/vllm-rbln/pull/1114), the
-default attention kernels (`rbln_custom_ops`, `use_custom_kernel=False`)
-allocate each layer **blocks-first**:
-
-```
-new (default):              [num_blocks, 2, num_kv_heads, 1, block_size, head_size]
-old (rbln_triton_ops only): [2, num_blocks, num_kv_heads, 1, block_size, head_size]
-```
-
-Axis 3 is again always 1, and the layout is handled exactly like format 15:
-it is **registered as its own `EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS` (19)**
-rather than squeezed onto the existing `NL_X_NB_TWO_NH_BS_HS` (7) during
-discovery, so `detectors/vllm.py` only classifies the shape and reshapes
-nothing, and the format is HND by definition, so the NHD hint is never read:
-
-```python
-if (list_depth == 1 and tensor_ndim == 6
-        and first_tensor.shape[1] == 2 and first_tensor.shape[3] == 1):
-    return lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS, kv_caches
-```
-
-As with format 15, `csrc` carries only the enum value, its `is_layer_list` /
-`is_hnd` classification, and the pybind registration; no compiled kernel
-handles it.
-
-**`num_blocks == 2` is ambiguous.** `[2, 2, NH, 1, BS, HS]` fits both layouts.
-The K/V-first branch is checked first, so it keeps that reading; a layout hint
-from vLLM-RBLN would be needed to tell them apart.
-
-**Transfer.** By layout facts, a per-layer HND layout that is *not*
-two-major (`is_layer_list`, `is_hnd`, not `is_two_major`, not
-`is_fused_packed`) -- format 19 -- takes the same HND op sequence as format
-15 (`gather_blocks_to_chunk_hnd_blocks_first` /
-`scatter_chunk_to_blocks_hnd_blocks_first`). The only difference
-is the pairing of device and host views: `layer[block]` is one contiguous
-`[2, NH, BS, HS]` run holding K and V together, so each (block, layer) is a
-single direct copy -- half the copies of the K/V-first layout, still batched
-into one `torch._foreach_copy_`. The host staging buffer, the host-side
-head<->token transpose, and the chunk layout are unchanged, so for the same KV
-both layouts produce **byte-identical chunks**; caches stored before and after
-the vllm-rbln change stay interchangeable.
-`squeeze_blocks_first_singleton_axis` drops the singleton at the transfer
-boundary and pins rank, the K/V axis, the singleton, and contiguity, so
-`NL_X_NB_TWO_NH_BS_HS` (7), which shares format 19's layout facts but is never
-allocated by vLLM-RBLN, fails loudly there like format 6 does.
+**Transfer.** `gather_blocks_to_chunk_hnd` / `scatter_chunk_to_blocks_hnd`
+pair each `layer[block]` -- one contiguous `[2, NH, BS, HS]` run holding K and
+V together -- with its slot in a per-thread host staging buffer laid out
+`[B, L, 2, H, BS, D]`, so each (block, layer) is a single direct copy, all
+batched into one `torch._foreach_copy_`. The head<->token transpose into the
+canonical `[2, L, T, H*D]` chunk then runs on the host.
+`squeeze_singleton_axis` pins rank, the K/V axis, the singleton, and
+contiguity at the transfer boundary.
 
 ## Untuned layouts
 

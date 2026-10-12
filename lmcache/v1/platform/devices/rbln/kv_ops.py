@@ -7,13 +7,11 @@ stored from an RBLN cache can be restored into a non-RBLN one and back. What
 is RBLN-specific here is the sequence of torch ops used to get there, not the
 layout that comes out.
 
-RBLN stores heads before block tokens (HND), either K/V-first
-(``[2, NB, H, BS, D]``) or blocks-first (``[NB, 2, H, BS, D]``), so writing a
-token-major chunk needs a head<->token transpose. It runs on the host, against
-host memory bandwidth, rather than as part of the device<->host copy: folding
-it in there would leave every copy across that boundary strided instead of
-contiguous.
-The HND staging buffer is therefore host memory.
+RBLN stores heads before block tokens (HND, ``[NB, 2, H, BS, D]`` per layer),
+so writing a token-major chunk needs a head<->token transpose. It runs on the
+host, against host memory bandwidth, rather than as part of the device<->host
+copy: folding it in there would leave every copy across that boundary strided
+instead of contiguous. The HND staging buffer is therefore host memory.
 
 The MLA layout (``[NB, BS, HS]`` per layer, chunk ``[L, T, HS]``) has no
 transpose: the chunk is the blocks laid end to end. What costs there is the
@@ -33,7 +31,7 @@ Implemented with torch ops only -- no compiled extension.
 from __future__ import annotations
 
 # Standard
-from typing import Callable, Sequence
+from typing import Sequence
 import threading
 
 # Third Party
@@ -74,43 +72,18 @@ def _host_staging(
     return buf[:n_blocks]
 
 
-#: Pairs each contiguous run of the paged blocks with its host staging slot,
-#: returning ``(paged, host)`` views in matching order.
-_BlockPairer = Callable[
-    [Sequence[torch.Tensor], Sequence[int], torch.Tensor],
-    tuple[list[torch.Tensor], list[torch.Tensor]],
-]
-
-
-def _kv_first_pairs(
-    paged_layers: Sequence[torch.Tensor],
-    block_ids: Sequence[int],
-    staged: torch.Tensor,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Pair ``[2, NB, H, BS, D]`` blocks with ``[B, L, 2, H, BS, D]`` slots.
-
-    ``layer[:, block]`` spans both halves of the layer and is not contiguous,
-    so K and V are paired separately as ``layer[kv, block]``.
-    """
-    paged: list[torch.Tensor] = []
-    host: list[torch.Tensor] = []
-    for position, block in enumerate(block_ids):
-        for layer_idx, layer in enumerate(paged_layers):
-            for kv in (0, 1):
-                paged.append(layer[kv, block])
-                host.append(staged[position, layer_idx, kv])
-    return paged, host
-
-
-def _blocks_first_pairs(
+def _hnd_block_pairs(
     paged_layers: Sequence[torch.Tensor],
     block_ids: Sequence[int],
     staged: torch.Tensor,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Pair ``[NB, 2, H, BS, D]`` blocks with ``[B, L, 2, H, BS, D]`` slots.
 
-    ``layer[block]`` already holds K and V back to back, so each
-    (block, layer) is one run -- half the copies of the K/V-first layout.
+    ``layer[block]`` holds K and V back to back, so each (block, layer) is
+    one contiguous run on both sides -- a single direct copy.
+
+    Returns:
+        tuple: ``(paged, host)`` in matching order, for ``torch._foreach_copy_``.
     """
     paged: list[torch.Tensor] = []
     host: list[torch.Tensor] = []
@@ -126,90 +99,18 @@ def gather_blocks_to_chunk_hnd(
     block_ids: Sequence[int],
     dst: torch.Tensor,
 ) -> None:
-    """Gather whole K/V-first paged blocks into a token-major chunk.
+    """Gather whole HND paged blocks into a token-major chunk.
 
     Args:
-        paged_layers: Per-layer HND KV tensors, each ``[2, NB, NH, BS, HS]``.
+        paged_layers: Per-layer HND KV tensors, each contiguous
+            ``[NB, 2, NH, BS, HS]``.
         block_ids: Blocks to gather, in chunk-token order.
         dst: Chunk shaped ``[2, L, T, H*D]``. Only its leading
             ``len(block_ids) * BS`` tokens are written, so a trailing chunk
             holding fewer blocks than it was sized for is fine. May be on
             device (D2D) or host (D2H); ``copy_`` handles the transfer.
     """
-    _gather_hnd(paged_layers, block_ids, dst, _kv_first_pairs)
-
-
-def gather_blocks_to_chunk_hnd_blocks_first(
-    paged_layers: Sequence[torch.Tensor],
-    block_ids: Sequence[int],
-    dst: torch.Tensor,
-) -> None:
-    """Gather whole blocks-first paged blocks into a token-major chunk.
-
-    Produces the same chunk bytes as :func:`gather_blocks_to_chunk_hnd` for
-    the same KV.
-
-    Args:
-        paged_layers: Per-layer HND KV tensors, each contiguous
-            ``[NB, 2, NH, BS, HS]``.
-        block_ids: Blocks to gather, in chunk-token order.
-        dst: Chunk shaped ``[2, L, T, H*D]``; see
-            :func:`gather_blocks_to_chunk_hnd`.
-    """
-    _gather_hnd(paged_layers, block_ids, dst, _blocks_first_pairs)
-
-
-def scatter_chunk_to_blocks_hnd(
-    paged_layers: Sequence[torch.Tensor],
-    block_ids: Sequence[int],
-    src: torch.Tensor,
-    skip_prefix_n_blocks: int = 0,
-) -> None:
-    """Scatter a token-major chunk back into whole K/V-first paged blocks.
-
-    Args:
-        paged_layers: Per-layer HND KV tensors, each ``[2, NB, NH, BS, HS]``.
-        block_ids: Destination blocks, in chunk-token order.
-        src: Chunk shaped ``[2, L, T, H*D]``. Only the token windows the
-            blocks map to are read, so a trailing chunk holding fewer blocks
-            than it was sized for is fine.
-        skip_prefix_n_blocks: Leading blocks already present in the KV cache;
-            neither read from ``src`` nor written.
-    """
-    _scatter_hnd(paged_layers, block_ids, src, skip_prefix_n_blocks, _kv_first_pairs)
-
-
-def scatter_chunk_to_blocks_hnd_blocks_first(
-    paged_layers: Sequence[torch.Tensor],
-    block_ids: Sequence[int],
-    src: torch.Tensor,
-    skip_prefix_n_blocks: int = 0,
-) -> None:
-    """Scatter a token-major chunk back into whole blocks-first paged blocks.
-
-    Args:
-        paged_layers: Per-layer HND KV tensors, each contiguous
-            ``[NB, 2, NH, BS, HS]``.
-        block_ids: Destination blocks, in chunk-token order.
-        src: Chunk shaped ``[2, L, T, H*D]``; see
-            :func:`scatter_chunk_to_blocks_hnd`.
-        skip_prefix_n_blocks: Leading blocks already present in the KV cache;
-            neither read from ``src`` nor written.
-    """
-    _scatter_hnd(
-        paged_layers, block_ids, src, skip_prefix_n_blocks, _blocks_first_pairs
-    )
-
-
-def _gather_hnd(
-    paged_layers: Sequence[torch.Tensor],
-    block_ids: Sequence[int],
-    dst: torch.Tensor,
-    pair_blocks: _BlockPairer,
-) -> None:
-    """Gather HND paged blocks into ``dst`` via the host staging buffer."""
-    # Both HND layouts carry NH, BS, HS on their trailing three axes.
-    num_heads, block_size, head_size = paged_layers[0].shape[2:]
+    _nb, _kv, num_heads, block_size, head_size = paged_layers[0].shape
     n_blocks = len(block_ids)
     # Each staging slot matches one contiguous run of a paged layer, so every
     # copy is a direct run and nothing is gathered on the device.
@@ -218,7 +119,7 @@ def _gather_hnd(
         (len(paged_layers), 2, num_heads, block_size, head_size),
         paged_layers[0].dtype,
     )
-    paged, host = pair_blocks(paged_layers, block_ids, staged)
+    paged, host = _hnd_block_pairs(paged_layers, block_ids, staged)
     torch._foreach_copy_(host, paged)
     # Both splits stay views; reshape() would not, and would rebuild the very
     # chunk-sized temporary this buffer exists to avoid.
@@ -230,15 +131,25 @@ def _gather_hnd(
     by_block.copy_(staged.permute(2, 1, 0, 4, 3, 5))
 
 
-def _scatter_hnd(
+def scatter_chunk_to_blocks_hnd(
     paged_layers: Sequence[torch.Tensor],
     block_ids: Sequence[int],
     src: torch.Tensor,
-    skip_prefix_n_blocks: int,
-    pair_blocks: _BlockPairer,
+    skip_prefix_n_blocks: int = 0,
 ) -> None:
-    """Scatter ``src`` into HND paged blocks via the host staging buffer."""
-    num_heads, block_size, head_size = paged_layers[0].shape[2:]
+    """Scatter a token-major chunk back into whole HND paged blocks.
+
+    Args:
+        paged_layers: Per-layer HND KV tensors, each contiguous
+            ``[NB, 2, NH, BS, HS]``.
+        block_ids: Destination blocks, in chunk-token order.
+        src: Chunk shaped ``[2, L, T, H*D]``. Only the token windows the
+            blocks map to are read, so a trailing chunk holding fewer blocks
+            than it was sized for is fine.
+        skip_prefix_n_blocks: Leading blocks already present in the KV cache;
+            neither read from ``src`` nor written.
+    """
+    _nb, _kv, num_heads, block_size, head_size = paged_layers[0].shape
     n_blocks = len(block_ids)
     start = min(skip_prefix_n_blocks, n_blocks)
     if start >= n_blocks:
@@ -259,7 +170,9 @@ def _scatter_hnd(
     # staged [B, L, 2, H, BS, D] -> [2, L, B, BS, H, D], matching by_block.
     staged.permute(2, 1, 0, 4, 3, 5).copy_(by_block)
 
-    paged, host = pair_blocks(paged_layers, list(block_ids)[start:n_blocks], staged)
+    paged, host = _hnd_block_pairs(
+        paged_layers, list(block_ids)[start:n_blocks], staged
+    )
     torch._foreach_copy_(paged, host)
 
 

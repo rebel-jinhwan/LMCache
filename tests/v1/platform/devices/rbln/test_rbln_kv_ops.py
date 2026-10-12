@@ -47,7 +47,7 @@ DTYPE = torch.float32
 def _paged_layers(fill_random: bool = True) -> list[torch.Tensor]:
     """Per-layer HND KV in the native 6-D layout the detector reports."""
     torch.manual_seed(11)
-    shape = (2, NUM_BLOCKS, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE)
+    shape = (NUM_BLOCKS, 2, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE)
     factory = torch.randn if fill_random else torch.zeros
     return [factory(shape, dtype=DTYPE) for _ in range(NUM_LAYERS)]
 
@@ -78,7 +78,7 @@ def _transfer(
     chunks: list[torch.Tensor],
     direction: TransferDirection,
     skip_prefix_n_blocks: int = 0,
-    engine_kv_format: EngineKVFormat = EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
+    engine_kv_format: EngineKVFormat = EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS,
 ) -> None:
     """Run the RBLN block transfer over every block."""
     RblnDeviceOps().multi_layer_block_kv_transfer(
@@ -108,7 +108,7 @@ def test_chunk_is_canonical_token_major() -> None:
     assert all(
         torch.equal(
             chunks[0][kv, li, ti],
-            layers[li][kv, ti // BLOCK_SIZE, :, 0, ti % BLOCK_SIZE, :].reshape(
+            layers[li][ti // BLOCK_SIZE, kv, :, 0, ti % BLOCK_SIZE, :].reshape(
                 NUM_HEADS * HEAD_SIZE
             ),
         )
@@ -121,8 +121,9 @@ def test_chunk_is_canonical_token_major() -> None:
 def test_chunk_matches_the_canonical_torch_path() -> None:
     """RBLN chunks are byte-identical to the shared torch HND path's.
 
-    The RBLN layout is the 5-D HND format plus a singleton axis, so the shared
-    path fed the squeezed tensors must produce exactly the same bytes. This is
+    The RBLN layout is the 5-D blocks-first HND format plus a singleton axis,
+    so the shared path fed the squeezed tensors must produce exactly the same
+    bytes. This is
     what makes a chunk written on RBLN readable by another device.
     """
     layers = _paged_layers()
@@ -138,7 +139,7 @@ def test_chunk_matches_the_canonical_torch_path() -> None:
         TransferDirection.D2H,
         _shape_desc(),
         CHUNK_TOKENS,
-        EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
+        EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
         0,
     )
 
@@ -166,8 +167,8 @@ def test_prefix_skip_leaves_leading_blocks_untouched() -> None:
     _transfer(dst, chunks, TransferDirection.H2D, skip_prefix_n_blocks=1)
 
     for got, expected in zip(dst, src, strict=True):
-        assert torch.count_nonzero(got[:, 0]) == 0
-        assert torch.equal(got[:, 1:], expected[:, 1:])
+        assert torch.count_nonzero(got[0]) == 0
+        assert torch.equal(got[1:], expected[1:])
 
 
 def test_trailing_partial_chunk_is_handled() -> None:
@@ -189,13 +190,13 @@ def test_trailing_partial_chunk_is_handled() -> None:
             direction,
             _shape_desc(),
             CHUNK_TOKENS,
-            EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
+            EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS,
             0,
         )
 
     for got, expected in zip(dst, src, strict=True):
-        assert torch.equal(got[:, :partial], expected[:, :partial])
-        assert torch.count_nonzero(got[:, partial:]) == 0
+        assert torch.equal(got[:partial], expected[:partial])
+        assert torch.count_nonzero(got[partial:]) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -239,13 +240,20 @@ def test_untuned_format_is_served_by_the_shared_path() -> None:
 
 def test_hnd_without_the_singleton_axis_is_refused() -> None:
     """A 5-D HND cache passes the layout check but fails the strict squeeze."""
-    with pytest.raises(ValueError, match=r"\[2, NB, NH, 1, BS, HS\]"):
+    with pytest.raises(ValueError, match=r"\[NB, 2, NH, 1, BS, HS\]"):
         _transfer(
             squeeze_singleton_axis(_paged_layers()),
             _chunks(),
             TransferDirection.D2H,
-            engine_kv_format=EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
+            engine_kv_format=EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
         )
+
+
+def test_non_contiguous_layer_is_refused() -> None:
+    """A permuted view would break the whole-block copies; fail loudly."""
+    permuted = [t.transpose(0, 1).contiguous().transpose(0, 1) for t in _paged_layers()]
+    with pytest.raises(ValueError, match="contiguous"):
+        _transfer(permuted, _chunks(), TransferDirection.D2H)
 
 
 def test_pointer_operands_are_refused() -> None:
@@ -259,7 +267,7 @@ def test_pointer_operands_are_refused() -> None:
             TransferDirection.D2H,
             _shape_desc(),
             CHUNK_TOKENS,
-            EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
+            EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS,
             0,
         )
 
@@ -275,109 +283,9 @@ def test_chunk_size_must_be_a_block_multiple() -> None:
             TransferDirection.D2H,
             _shape_desc(),
             BLOCK_SIZE + 1,
-            EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
+            EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS,
             0,
         )
-
-
-# ---------------------------------------------------------------------------
-# Blocks-first HND (NL_X_NB_TWO_NH_ONE_BS_HS): vLLM-RBLN's default attention
-# kernels allocate [NB, 2, NH, 1, BS, HS].
-# ---------------------------------------------------------------------------
-
-_BLOCKS_FIRST_FORMAT = EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS
-
-
-def _blocks_first_layers(fill_random: bool = True) -> list[torch.Tensor]:
-    """Blocks-first layers holding the same KV as ``_paged_layers``."""
-    return [layer.transpose(0, 1).contiguous() for layer in _paged_layers(fill_random)]
-
-
-def _blocks_first_transfer(
-    layers: list[torch.Tensor],
-    chunks: list[torch.Tensor],
-    direction: TransferDirection,
-    skip_prefix_n_blocks: int = 0,
-) -> None:
-    """Run the RBLN block transfer over blocks-first layers."""
-    _transfer(
-        layers,
-        chunks,
-        direction,
-        skip_prefix_n_blocks=skip_prefix_n_blocks,
-        engine_kv_format=_BLOCKS_FIRST_FORMAT,
-    )
-
-
-def test_blocks_first_chunk_matches_the_canonical_torch_path() -> None:
-    """Blocks-first chunks are byte-identical to the shared torch path's.
-
-    The shared path has no 6-D format, so it moves the squeezed view as the
-    5-D ``NL_X_NB_TWO_NH_BS_HS`` it is byte-identical to.
-    """
-    layers = _blocks_first_layers()
-    ours = _chunks()
-    theirs = _chunks()
-
-    _blocks_first_transfer(layers, ours, TransferDirection.D2H)
-    multi_layer_block_kv_transfer(
-        [layer.squeeze(3) for layer in layers],
-        theirs,
-        list(range(NUM_BLOCKS)),
-        torch.device("cpu"),
-        TransferDirection.D2H,
-        _shape_desc(),
-        CHUNK_TOKENS,
-        EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
-        0,
-    )
-
-    for got, expected in zip(ours, theirs, strict=True):
-        assert torch.equal(got, expected)
-
-
-def test_blocks_first_chunk_matches_the_kv_first_layout() -> None:
-    """The same KV stored from either RBLN layout yields the same chunk bytes.
-
-    This keeps caches stored before and after vLLM-RBLN's layout change
-    interchangeable.
-    """
-    blocks_first = _chunks()
-    kv_first = _chunks()
-    _blocks_first_transfer(_blocks_first_layers(), blocks_first, TransferDirection.D2H)
-    _transfer(_paged_layers(), kv_first, TransferDirection.D2H)
-
-    for got, expected in zip(blocks_first, kv_first, strict=True):
-        assert torch.equal(got, expected)
-
-
-def test_blocks_first_round_trip_with_prefix_skip() -> None:
-    """Gather then scatter restores every block past the skipped prefix."""
-    src = _blocks_first_layers()
-    dst = _blocks_first_layers(fill_random=False)
-    chunks = _chunks()
-    _blocks_first_transfer(src, chunks, TransferDirection.D2H)
-    _blocks_first_transfer(dst, chunks, TransferDirection.H2D, skip_prefix_n_blocks=3)
-
-    for got, expected in zip(dst, src, strict=True):
-        assert torch.count_nonzero(got[:3]) == 0
-        assert torch.equal(got[3:], expected[3:])
-
-
-def test_blocks_first_without_the_singleton_axis_is_refused() -> None:
-    """A 5-D blocks-first cache is not what the format declares; fail loudly."""
-    squeezed = [t.squeeze(3) for t in _blocks_first_layers()]
-    with pytest.raises(ValueError, match=r"\[NB, 2, NH, 1, BS, HS\]"):
-        _blocks_first_transfer(squeezed, _chunks(), TransferDirection.D2H)
-
-
-def test_blocks_first_rejects_a_non_contiguous_layer() -> None:
-    """A permuted view would break the whole-block copies; fail loudly."""
-    permuted = [
-        t.transpose(0, 1).contiguous().transpose(0, 1) for t in _blocks_first_layers()
-    ]
-    with pytest.raises(ValueError, match="contiguous"):
-        _blocks_first_transfer(permuted, _chunks(), TransferDirection.D2H)
 
 
 # ---------------------------------------------------------------------------
