@@ -281,19 +281,16 @@ def test_chunk_size_must_be_a_block_multiple() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocks-first HND (NL_X_NB_TWO_NH_BS_HS): vLLM-RBLN's default attention
-# kernels allocate [NB, 2, NH, 1, BS, HS]; detection squeezes axis 3.
+# Blocks-first HND (NL_X_NB_TWO_NH_ONE_BS_HS): vLLM-RBLN's default attention
+# kernels allocate [NB, 2, NH, 1, BS, HS].
 # ---------------------------------------------------------------------------
 
-_BLOCKS_FIRST_FORMAT = EngineKVFormat.NL_X_NB_TWO_NH_BS_HS
+_BLOCKS_FIRST_FORMAT = EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS
 
 
 def _blocks_first_layers(fill_random: bool = True) -> list[torch.Tensor]:
-    """Squeezed blocks-first layers holding the same KV as ``_paged_layers``."""
-    return [
-        layer.squeeze(3).transpose(0, 1).contiguous()
-        for layer in _paged_layers(fill_random)
-    ]
+    """Blocks-first layers holding the same KV as ``_paged_layers``."""
+    return [layer.transpose(0, 1).contiguous() for layer in _paged_layers(fill_random)]
 
 
 def _blocks_first_transfer(
@@ -313,21 +310,25 @@ def _blocks_first_transfer(
 
 
 def test_blocks_first_chunk_matches_the_canonical_torch_path() -> None:
-    """Blocks-first chunks are byte-identical to the shared torch path's."""
+    """Blocks-first chunks are byte-identical to the shared torch path's.
+
+    The shared path has no 6-D format, so it moves the squeezed view as the
+    5-D ``NL_X_NB_TWO_NH_BS_HS`` it is byte-identical to.
+    """
     layers = _blocks_first_layers()
     ours = _chunks()
     theirs = _chunks()
 
     _blocks_first_transfer(layers, ours, TransferDirection.D2H)
     multi_layer_block_kv_transfer(
-        layers,
+        [layer.squeeze(3) for layer in layers],
         theirs,
         list(range(NUM_BLOCKS)),
         torch.device("cpu"),
         TransferDirection.D2H,
         _shape_desc(),
         CHUNK_TOKENS,
-        _BLOCKS_FIRST_FORMAT,
+        EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
         0,
     )
 
@@ -363,11 +364,20 @@ def test_blocks_first_round_trip_with_prefix_skip() -> None:
         assert torch.equal(got[3:], expected[3:])
 
 
-def test_blocks_first_rejects_the_unsqueezed_layout() -> None:
-    """The raw 6-D tensor must be squeezed by detection before transfer."""
-    raw = [t.unsqueeze(3) for t in _blocks_first_layers()]
-    with pytest.raises(ValueError, match=r"\[NB, 2, NH, BS, HS\]"):
-        _blocks_first_transfer(raw, _chunks(), TransferDirection.D2H)
+def test_blocks_first_without_the_singleton_axis_is_refused() -> None:
+    """A 5-D blocks-first cache is not what the format declares; fail loudly."""
+    squeezed = [t.squeeze(3) for t in _blocks_first_layers()]
+    with pytest.raises(ValueError, match=r"\[NB, 2, NH, 1, BS, HS\]"):
+        _blocks_first_transfer(squeezed, _chunks(), TransferDirection.D2H)
+
+
+def test_blocks_first_rejects_a_non_contiguous_layer() -> None:
+    """A permuted view would break the whole-block copies; fail loudly."""
+    permuted = [
+        t.transpose(0, 1).contiguous().transpose(0, 1) for t in _blocks_first_layers()
+    ]
+    with pytest.raises(ValueError, match="contiguous"):
+        _blocks_first_transfer(permuted, _chunks(), TransferDirection.D2H)
 
 
 # ---------------------------------------------------------------------------

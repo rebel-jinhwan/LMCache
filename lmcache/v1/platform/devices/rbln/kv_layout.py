@@ -17,18 +17,17 @@ at the transfer boundary instead of mis-addressing bytes.
 
 With its default attention kernels (``rbln_custom_ops``) vLLM-RBLN instead
 allocates each layer blocks-first, ``[num_blocks, 2, num_kv_heads, 1,
-block_size, head_size]``. Squeezing axis 3 there gives a byte-identical
-``[NB, 2, NH, BS, HS]`` view, which is exactly the existing
-``EngineKVFormat.NL_X_NB_TWO_NH_BS_HS``, so the vLLM detector reports that
-format with the squeezed views and :func:`validate_blocks_first_layers` pins
-the result at the transfer boundary.
+block_size, head_size]``, registered as
+``EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS``. Squeezing axis 3 gives a
+byte-identical ``[NB, 2, NH, BS, HS]`` view
+(:func:`squeeze_blocks_first_singleton_axis`).
 
-For the K/V-first layout detection does not squeeze: it is registered as its own
-``EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS``, so the vLLM detector classifies
-what vLLM-RBLN actually allocated and holds no RBLN knowledge beyond that
-shape signature. :func:`squeeze_singleton_axis` is applied one layer lower, by
-:class:`~lmcache.v1.platform.devices.rbln.device_ops.RblnDeviceOps`, where the paged
-tensors are indexed to move bytes.
+Detection squeezes neither: each layout is registered as its own format, so
+the vLLM detector classifies what vLLM-RBLN actually allocated and holds no
+RBLN knowledge beyond those shape signatures. The squeezes are applied one
+layer lower, by
+:class:`~lmcache.v1.platform.devices.rbln.device_ops.RblnDeviceOps`, where the
+paged tensors are indexed to move bytes.
 """
 
 # Future
@@ -97,32 +96,37 @@ def squeeze_singleton_axis(
     return views
 
 
-def validate_blocks_first_layers(
+def squeeze_blocks_first_singleton_axis(
     kv_caches: Sequence[torch.Tensor],
 ) -> list[torch.Tensor]:
-    """Return blocks-first HND per-layer KV tensors after pinning their layout.
+    """Return 5-D blocks-first HND views of 6-D blocks-first RBLN KV tensors.
 
-    vLLM-RBLN's default attention kernels allocate
-    ``[NB, 2, NH, 1, BS, HS]``; the vLLM detector squeezes the singleton axis
-    and reports ``NL_X_NB_TWO_NH_BS_HS``, so these arrive 5-D. The transfer
-    copies ``layer[block]`` as one whole ``[2, NH, BS, HS]`` run, which is only
-    a direct device copy when the layer is contiguous; a permuted view would
-    send every copy down torch-rbln's strided path.
+    Strict like :func:`squeeze_singleton_axis`: the detected format says these
+    came from vLLM-RBLN, so anything else fails loudly. Contiguity is pinned
+    too: the transfer copies ``layer[block]`` as one whole ``[2, NH, BS, HS]``
+    run, which is only a direct device copy when the layer is contiguous; a
+    permuted view would send every copy down torch-rbln's strided path.
 
     Args:
-        kv_caches: Per-layer tensors shaped ``[NB, 2, NH, BS, HS]``.
+        kv_caches: Per-layer tensors shaped ``[NB, 2, NH, 1, BS, HS]``.
 
     Returns:
-        list[torch.Tensor]: The same tensors, as a list.
+        list[torch.Tensor]: Views shaped ``[NB, 2, NH, BS, HS]``, sharing
+        storage with the inputs.
 
     Raises:
-        ValueError: If a tensor is not 5-D with the K/V pair at axis 1, or is
-            not contiguous.
+        ValueError: If a tensor is not 6-D with the K/V pair at axis 1 and a
+            singleton at axis 3, or is not contiguous.
     """
+    views: list[torch.Tensor] = []
     for tensor in kv_caches:
-        if tensor.ndim != RBLN_KV_NDIM - 1 or tensor.shape[1] != 2:
+        if (
+            tensor.ndim != RBLN_KV_NDIM
+            or tensor.shape[1] != 2
+            or tensor.shape[RBLN_SINGLETON_AXIS] != 1
+        ):
             raise ValueError(
-                "RBLN blocks-first KV caches must be [NB, 2, NH, BS, HS]; got "
+                "RBLN blocks-first KV caches must be [NB, 2, NH, 1, BS, HS]; got "
                 + str(tuple(tensor.shape))
             )
         if not tensor.is_contiguous():
@@ -130,7 +134,8 @@ def validate_blocks_first_layers(
                 "RBLN blocks-first KV caches must be contiguous; got strides "
                 + str(tuple(tensor.stride()))
             )
-    return list(kv_caches)
+        views.append(tensor.squeeze(RBLN_SINGLETON_AXIS))
+    return views
 
 
 def validate_mla_layers(

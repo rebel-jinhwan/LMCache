@@ -105,20 +105,15 @@ class VLLM_Detector(EngineDetector):
         ):
             return lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS, kv_caches
         # vLLM-RBLN's default attention kernels allocate the same layout
-        # blocks-first, [NB, 2, NH, 1, BS, HS]. Squeezing the singleton gives a
-        # byte-identical [NB, 2, NH, BS, HS] view, which the existing
-        # blocks-first HND format already describes. NB == 2 matches the
-        # branch above too and keeps the K/V-first reading.
+        # blocks-first. NB == 2 matches the branch above too and keeps the
+        # K/V-first reading.
         if (
             list_depth == 1
             and tensor_ndim == 6
             and first_tensor.shape[1] == 2
             and first_tensor.shape[3] == 1
         ):
-            return (
-                lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
-                [t.squeeze(3) for t in kv_caches],
-            )
+            return lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS, kv_caches
         if list_depth == 1 and tensor_ndim == 5:
             if first_tensor.shape[0] == 2:  # K/V axis first
                 if is_hnd:

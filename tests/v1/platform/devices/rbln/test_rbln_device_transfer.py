@@ -142,15 +142,11 @@ def test_hnd_round_trip_on_device() -> None:
 
 
 def test_blocks_first_hnd_round_trip_on_device() -> None:
-    """The blocks-first HND cache survives store and retrieve on a real NPU.
-
-    The layers are what detection hands over: vLLM-RBLN's
-    ``[NB, 2, NH, 1, BS, HS]`` with the singleton axis squeezed away.
-    """
+    """The blocks-first HND cache survives store and retrieve on a real NPU."""
     _assert_device_round_trip(
-        (NUM_BLOCKS, 2, NUM_HEADS, BLOCK_SIZE, HEAD_SIZE),
+        (NUM_BLOCKS, 2, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE),
         (2, NUM_LAYERS, CHUNK_TOKENS, NUM_HEADS * HEAD_SIZE),
-        EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
+        EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS,
         _shape_desc(kv_size=2, num_heads=NUM_HEADS, head_size=HEAD_SIZE),
     )
 
@@ -158,9 +154,9 @@ def test_blocks_first_hnd_round_trip_on_device() -> None:
 def test_blocks_first_gather_scatter_on_device() -> None:
     """The raw 6-D blocks-first cache round-trips through MP gather/scatter.
 
-    Detection squeezes vLLM-RBLN's ``[NB, 2, NH, 1, BS, HS]`` and the device
-    dispatch routes it to ``RblnDeviceOps``; the chunks must match the ones
-    the K/V-first layout produces for the same KV.
+    Detection reports vLLM-RBLN's ``[NB, 2, NH, 1, BS, HS]`` as its own format
+    and the device dispatch routes it to ``RblnDeviceOps``; the chunks must
+    match the ones the K/V-first layout produces for the same KV.
     """
     # First Party
     from lmcache.v1.multiprocess.transfer_context.base import (
