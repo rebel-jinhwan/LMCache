@@ -289,6 +289,66 @@ def test_chunk_size_must_be_a_block_multiple() -> None:
 
 
 # ---------------------------------------------------------------------------
+# K/V-first HND (NL_X_TWO_NB_NH_ONE_BS_HS): vLLM-RBLN's rbln_triton_ops
+# kernels allocate [2, NB, NH, 1, BS, HS].
+# ---------------------------------------------------------------------------
+
+_KV_FIRST_FORMAT = EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS
+
+
+def _kv_first_layers(fill_random: bool = True) -> list[torch.Tensor]:
+    """K/V-first layers holding the same KV as ``_paged_layers``."""
+    return [layer.transpose(0, 1).contiguous() for layer in _paged_layers(fill_random)]
+
+
+def test_kv_first_chunk_matches_the_blocks_first_layout() -> None:
+    """The same KV stored from either RBLN layout yields the same chunk bytes."""
+    kv_first = _chunks()
+    blocks_first = _chunks()
+    _transfer(
+        _kv_first_layers(),
+        kv_first,
+        TransferDirection.D2H,
+        engine_kv_format=_KV_FIRST_FORMAT,
+    )
+    _transfer(_paged_layers(), blocks_first, TransferDirection.D2H)
+
+    for got, expected in zip(kv_first, blocks_first, strict=True):
+        assert torch.equal(got, expected)
+
+
+def test_kv_first_round_trip_with_prefix_skip() -> None:
+    """Gather then scatter restores every block past the skipped prefix."""
+    src = _kv_first_layers()
+    dst = _kv_first_layers(fill_random=False)
+    chunks = _chunks()
+    _transfer(src, chunks, TransferDirection.D2H, engine_kv_format=_KV_FIRST_FORMAT)
+    _transfer(
+        dst,
+        chunks,
+        TransferDirection.H2D,
+        skip_prefix_n_blocks=3,
+        engine_kv_format=_KV_FIRST_FORMAT,
+    )
+
+    for got, expected in zip(dst, src, strict=True):
+        assert torch.count_nonzero(got[:, :3]) == 0
+        assert torch.equal(got[:, 3:], expected[:, 3:])
+
+
+def test_kv_first_without_the_singleton_axis_is_refused() -> None:
+    """A 5-D two-major HND cache fails the strict K/V-first squeeze."""
+    squeezed = [t.squeeze(3) for t in _kv_first_layers()]
+    with pytest.raises(ValueError, match=r"\[2, NB, NH, 1, BS, HS\]"):
+        _transfer(
+            squeezed,
+            _chunks(),
+            TransferDirection.D2H,
+            engine_kv_format=EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
+        )
+
+
+# ---------------------------------------------------------------------------
 # MLA (NL_X_NB_BS_HS): validated in RblnDeviceOps, moved by the shared path
 # ---------------------------------------------------------------------------
 

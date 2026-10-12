@@ -141,6 +141,16 @@ def test_hnd_round_trip_on_device() -> None:
     )
 
 
+def test_kv_first_hnd_round_trip_on_device() -> None:
+    """The K/V-first 6-D HND cache survives store and retrieve on a real NPU."""
+    _assert_device_round_trip(
+        (2, NUM_BLOCKS, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE),
+        (2, NUM_LAYERS, CHUNK_TOKENS, NUM_HEADS * HEAD_SIZE),
+        EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
+        _shape_desc(kv_size=2, num_heads=NUM_HEADS, head_size=HEAD_SIZE),
+    )
+
+
 def test_hnd_gather_scatter_on_device() -> None:
     """The raw 6-D cache round-trips through MP gather/scatter.
 
