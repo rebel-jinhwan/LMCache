@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-layer blocks-first HND with a singleton between heads and tokens:
-``NL x [NB, 2, NH, 1, BS, HS]`` (vLLM-RBLN).
+``NL x [NB, 2, NH, 1, BS, HS]`` (vLLM-RBLN default attention kernels).
 
 A ``list[NL]`` of a 6-D tensor with the block axis leading. Axis 3 is always 1
 -- the RBLN attention backend requires it -- so the bytes and strides are those
@@ -24,7 +24,7 @@ import lmcache.lmcache_native as lmcache_native
 
 class NL_X_NB_TWO_NH_ONE_BS_HS_Spec(KVFormatSpec):
     engine_kv_format = lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS
-    attention_backends = ("vLLM-RBLN attention (HND layout)",)
+    attention_backends = ("vLLM-RBLN default attention kernels (HND layout)",)
     is_layer_list = True
     is_hnd = True
 

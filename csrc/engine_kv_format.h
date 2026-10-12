@@ -145,7 +145,7 @@ enum class EngineKVFormat : int {
   // vLLM DSA indexer k-cache [NB,BS,132] u8, paged [BSxvals][BSxscales]; kv 1
   NL_X_NB_BSV_BSS = 14,
 
-  // 15 was NL_X_TWO_NB_NH_ONE_BS_HS (vLLM-RBLN K/V-first); removed.
+  NL_X_TWO_NB_NH_ONE_BS_HS = 15,
 
   /*
   used by:
@@ -174,7 +174,7 @@ enum class EngineKVFormat : int {
 
   /*
   used by:
-  - vLLM-RBLN attention (HND layout)
+  - vLLM-RBLN default attention kernels (HND layout), blocks-first
   physical shape per layer: [num_blocks, 2, num_heads, 1, block_size, head_size]
   Axis 3 is always 1 (an RBLN attention-backend requirement), so the bytes and
   strides are those of NL_X_NB_TWO_NH_BS_HS one axis short.
@@ -286,6 +286,11 @@ LMC_KV_FORMAT_HD constexpr FormatFacts format_facts(EngineKVFormat f) {
     case EngineKVFormat::NL_X_NB_BSV_BSS:
       facts.is_layer_list = true;
       facts.is_mla = true;
+      break;
+    case EngineKVFormat::NL_X_TWO_NB_NH_ONE_BS_HS:
+      facts.is_layer_list = true;
+      facts.is_hnd = true;
+      facts.is_two_major = true;
       break;
     case EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS:
       facts.is_layer_list = true;

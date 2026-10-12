@@ -45,11 +45,11 @@ default attention kernels (`rbln_custom_ops`) allocate each layer as
 tokens**, which the RBLN attention backend requires. Every other supported
 engine hands LMCache a 5-D (or 4-D / 3-D) per-layer tensor.
 
-The older K/V-first allocation `[2, num_blocks, num_kv_heads, 1, block_size,
-head_size]`, used only by the `rbln_triton_ops` kernels, is **not supported**.
-Its format (`NL_X_TWO_NB_NH_ONE_BS_HS`, 15) was removed rather than carried
-next to this one: keeping both doubled the RBLN transfer code and made
-`num_blocks == 2` ambiguous (`[2, 2, NH, 1, BS, HS]` fits both).
+The `rbln_triton_ops` kernels allocate the same layout **K/V-first**,
+`[2, num_blocks, num_kv_heads, 1, block_size, head_size]`, registered as
+`EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS` (15). Everything below applies to it
+with the K/V axis leading; the differences are listed under
+[The K/V-first layout](#the-kv-first-layout).
 
 Axis 3 is always 1, so the tensor is byte- and stride-identical to a 5-D
 `[NB, 2, NH, BS, HS]` layout. It is nonetheless **registered as its own
@@ -92,11 +92,12 @@ Consequences of the format being first-class:
   `is_kv_second_tuple`) takes the MLA one (below), and every other layout
   goes to the shared torch path (below). The HND side applies
   `squeeze_singleton_axis` at entry, so `kv_ops.py` indexes a 5-D tensor.
-  `kv_layout.py` therefore exports the strict squeeze plus the
+  `kv_layout.py` therefore exports the strict squeezes plus the
   `is_rbln_kv_layout` predicate -- no tolerant pass-through variant.
   `NL_X_NB_TWO_NH_BS_HS` (7) shares format 19's layout facts (the singleton
   axis is the only difference), but vLLM-RBLN never allocates it, so a 5-D
-  cache fails loudly in the squeeze rather than being accepted.
+  cache fails loudly in the squeeze rather than being accepted. The same holds
+  for `NL_X_TWO_NB_NH_BS_HS` (6) against format 15.
 
   ```python
   spec = get_spec_class(engine_kv_format)
@@ -108,7 +109,8 @@ Consequences of the format being first-class:
   block-transfer extension in tree, and the CUDA / SYCL kernels never see an
   RBLN cache, so their `default:` arm rejecting the format is correct rather
   than a gap. `csrc` therefore carries only the enum value, its
-  `is_layer_list` / `is_hnd` classification, and the pybind registration.
+  `is_layer_list` / `is_hnd` classification, and the pybind registration
+  (likewise for format 15).
 
 The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
@@ -123,6 +125,25 @@ batched into one `torch._foreach_copy_`. The head<->token transpose into the
 canonical `[2, L, T, H*D]` chunk then runs on the host.
 `squeeze_singleton_axis` pins rank, the K/V axis, the singleton, and
 contiguity at the transfer boundary.
+
+## The K/V-first layout
+
+Format 15 (`[2, NB, NH, 1, BS, HS]`, `rbln_triton_ops`) is a per-layer
+two-major HND layout (`is_two_major` set), so it takes the `_kv_first`
+variants: `squeeze_singleton_axis_kv_first`,
+`gather_blocks_to_chunk_hnd_kv_first` and
+`scatter_chunk_to_blocks_hnd_kv_first`. The host staging buffer, the
+host-side transpose and the chunk layout are shared, so for the same KV both
+layouts produce **byte-identical chunks** and caches stored from either stay
+interchangeable. The only difference is the pairing: `layer[:, block]` spans
+both halves of the layer and is not contiguous, so K and V are copied
+separately as `layer[kv, block]` -- twice the copies of the blocks-first
+layout.
+
+**`num_blocks == 2` is ambiguous.** `[2, 2, NH, 1, BS, HS]` fits both layouts.
+The detector checks the K/V-first branch first, so it keeps that reading; a
+layout hint from vLLM-RBLN would be needed to tell them apart. A real KV cache
+has far more than two blocks, so this only matters for synthetic inputs.
 
 ## Untuned layouts
 

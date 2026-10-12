@@ -6,7 +6,9 @@ The multiprocess path never goes through a connector: ``compute_kv_layout``,
 through ``normalize_kv_and_discover_format``. What these cover is that the
 native 6-D layout is detected as ``NL_X_NB_TWO_NH_ONE_BS_HS`` from its shape
 alone -- no device spec consulted, no reshape applied -- and that the squeeze
-happens only in the ops backend that indexes the bytes.
+happens only in the ops backend that indexes the bytes. The K/V-first
+``[2, NB, NH, 1, BS, HS]`` layout of the ``rbln_triton_ops`` kernels is covered
+the same way, as ``NL_X_TWO_NB_NH_ONE_BS_HS``.
 
 ``torch_device_type`` is patched rather than requiring an NPU, so these run
 anywhere.
@@ -37,6 +39,7 @@ from lmcache.v1.gpu_connector.utils import (
 from lmcache.v1.platform.devices.rbln.kv_layout import (
     is_rbln_kv_layout,
     squeeze_singleton_axis,
+    squeeze_singleton_axis_kv_first,
 )
 import lmcache.lmcache_native as lmcache_native
 
@@ -175,6 +178,54 @@ def test_the_reported_layout_is_never_consulted(hints: "LayoutHints | None") -> 
 def test_geometry_reads_past_the_singleton() -> None:
     """The spec must report the real dims, not the ones shifted by the axis."""
     fmt, normalized = _discover(_native_kv())
+    assert get_num_layers(normalized, fmt) == NUM_LAYERS
+    assert get_num_heads(normalized, fmt) == NUM_HEADS
+    assert get_block_size(normalized, fmt) == BLOCK_SIZE
+    assert get_head_size(normalized, fmt) == HEAD_SIZE
+
+
+# ---------------------------------------------------------------------------
+# K/V-first layout ([2, NB, NH, 1, BS, HS], rbln_triton_ops)
+# ---------------------------------------------------------------------------
+
+_KV_FIRST_FORMAT = lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS
+
+
+def _kv_first_kv() -> list[torch.Tensor]:
+    """The same KV as ``_native_kv``, allocated K/V-first."""
+    return [t.transpose(0, 1).contiguous() for t in _native_kv()]
+
+
+@pytest.mark.parametrize(
+    "device_type", ["rbln", "cuda", "cpu"], ids=["rbln", "cuda", "cpu"]
+)
+def test_kv_first_is_its_own_format(device_type: str) -> None:
+    """Detection reports the K/V-first format and does not reshape it."""
+    raw = _kv_first_kv()
+    fmt, normalized = _discover(raw, device_type=device_type)
+    assert int(fmt) == int(_KV_FIRST_FORMAT)
+    for out, src in zip(normalized, raw, strict=True):
+        assert out.data_ptr() == src.data_ptr()
+        assert tuple(out.shape) == tuple(src.shape)
+
+
+def test_kv_first_squeeze_is_a_free_view() -> None:
+    """Dropping the K/V-first singleton must not copy the KV cache."""
+    raw = _kv_first_kv()
+    for view, tensor in zip(squeeze_singleton_axis_kv_first(raw), raw, strict=True):
+        assert view.data_ptr() == tensor.data_ptr()
+        assert tuple(view.shape) == (
+            2,
+            NUM_BLOCKS,
+            NUM_HEADS,
+            BLOCK_SIZE,
+            HEAD_SIZE,
+        )
+
+
+def test_kv_first_geometry_reads_past_the_singleton() -> None:
+    """The spec reports the real dims, not the ones shifted by the axis."""
+    fmt, normalized = _discover(_kv_first_kv())
     assert get_num_layers(normalized, fmt) == NUM_LAYERS
     assert get_num_heads(normalized, fmt) == NUM_HEADS
     assert get_block_size(normalized, fmt) == BLOCK_SIZE
