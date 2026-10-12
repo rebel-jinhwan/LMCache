@@ -121,25 +121,21 @@ new (default):              [num_blocks, 2, num_kv_heads, 1, block_size, head_si
 old (rbln_triton_ops only): [2, num_blocks, num_kv_heads, 1, block_size, head_size]
 ```
 
-Squeezing axis 3 gives a byte-identical, contiguous `[NB, 2, NH, BS, HS]`
-view, which is exactly the existing `EngineKVFormat.NL_X_NB_TWO_NH_BS_HS`.
-Unlike the K/V-first layout above, detection **does squeeze** this one:
+Axis 3 is again always 1, and the layout is handled exactly like format 15:
+it is **registered as its own `EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS` (19)**
+rather than squeezed onto the existing `NL_X_NB_TWO_NH_BS_HS` (7) during
+discovery, so `detectors/vllm.py` only classifies the shape and reshapes
+nothing, and the format is HND by definition, so the NHD hint is never read:
 
 ```python
 if (list_depth == 1 and tensor_ndim == 6
         and first_tensor.shape[1] == 2 and first_tensor.shape[3] == 1):
-    return (lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
-            [t.squeeze(3) for t in kv_caches])
+    return lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS, kv_caches
 ```
 
-Why the opposite choice here: the squeeze is keyed off the shape alone, so
-detection stays a pure function of `(kv_caches, layout_hints)` with no device
-hook -- the objection that ruled out squeezing format 15 does not apply. The
-target format is HND by definition, so the unreliable NHD hint is still never
-read. Reusing the format avoids a new `EngineKVFormat` value, a `csrc`
-rebuild, and a spec for a layout byte-identical to one that exists. The DSA
-indexer branch of the same detector already squeezes a singleton axis the same
-way.
+As with format 15, `csrc` carries only the enum value, its `is_layer_list` /
+`is_hnd` classification, and the pybind registration; no compiled kernel
+handles it.
 
 **`num_blocks == 2` is ambiguous.** `[2, 2, NH, 1, BS, HS]` fits both layouts.
 The K/V-first branch is checked first, so it keeps that reading; a layout hint
@@ -147,8 +143,8 @@ from vLLM-RBLN would be needed to tell them apart.
 
 **Transfer.** By layout facts, a per-layer HND layout that is *not*
 two-major (`is_layer_list`, `is_hnd`, not `is_two_major`, not
-`is_fused_packed`) -- only `NL_X_NB_TWO_NH_BS_HS` -- takes the same HND op
-sequence as format 15 (`gather_blocks_to_chunk_hnd_blocks_first` /
+`is_fused_packed`) -- format 19 -- takes the same HND op sequence as format
+15 (`gather_blocks_to_chunk_hnd_blocks_first` /
 `scatter_chunk_to_blocks_hnd_blocks_first`). The only difference
 is the pairing of device and host views: `layer[block]` is one contiguous
 `[2, NH, BS, HS]` run holding K and V together, so each (block, layer) is a
@@ -156,8 +152,11 @@ single direct copy -- half the copies of the K/V-first layout, still batched
 into one `torch._foreach_copy_`. The host staging buffer, the host-side
 head<->token transpose, and the chunk layout are unchanged, so for the same KV
 both layouts produce **byte-identical chunks**; caches stored before and after
-the vllm-rbln change stay interchangeable. `validate_blocks_first_layers` pins
-rank, the K/V axis, and contiguity at the transfer boundary.
+the vllm-rbln change stay interchangeable.
+`squeeze_blocks_first_singleton_axis` drops the singleton at the transfer
+boundary and pins rank, the K/V axis, the singleton, and contiguity, so
+`NL_X_NB_TWO_NH_BS_HS` (7), which shares format 19's layout facts but is never
+allocated by vLLM-RBLN, fails loudly there like format 6 does.
 
 ## Untuned layouts
 
