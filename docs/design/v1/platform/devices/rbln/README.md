@@ -89,8 +89,8 @@ Consequences of the format being first-class:
   value: a per-layer blocks-first HND layout (`is_layer_list`, `is_hnd`, not
   `is_two_major`, not `is_fused_packed`) takes the HND sequence, a per-layer
   `[NB, BS, HS]` MLA layout (`is_layer_list`, `is_mla`, not `is_pbs_fused` /
-  `is_kv_second_tuple`) takes the MLA one (below), and every other layout
-  goes to the shared torch path (below). The HND side applies
+  `is_kv_second_tuple`) takes the MLA one (below), and any other layout is
+  refused with a `ValueError` naming the format and its shape. The HND side applies
   `squeeze_singleton_axis` at entry, so `kv_ops.py` indexes a 5-D tensor.
   `kv_layout.py` therefore exports the strict squeezes plus the
   `is_rbln_kv_layout` predicate -- no tolerant pass-through variant.
@@ -144,13 +144,6 @@ layout.
 The detector checks the K/V-first branch first, so it keeps that reading; a
 layout hint from vLLM-RBLN would be needed to tell them apart. A real KV cache
 has far more than two blocks, so this only matters for synthetic inputs.
-
-## Untuned layouts
-
-Any format without an RBLN-tuned sequence is delegated to the shared torch
-path (`DeviceOps` -> `torch_ops`) instead of being refused, as on other
-non-CUDA devices. The tuned sequences exist for cost, not correctness, so
-falling back is always correct.
 
 ## The MLA layout
 

@@ -204,38 +204,26 @@ def test_trailing_partial_chunk_is_handled() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_untuned_format_is_served_by_the_shared_path() -> None:
-    """A layout with no RBLN sequence round-trips instead of being refused.
-
-    ``NL_X_TWO_NB_BS_NH_HS`` (vLLM NHD) has no RBLN-tuned sequence; its chunk
-    must match the shared torch path and restore the cache exactly.
-    """
-    torch.manual_seed(5)
-    shape = (2, NUM_BLOCKS, BLOCK_SIZE, NUM_HEADS, HEAD_SIZE)
-    src = [torch.randn(shape, dtype=DTYPE) for _ in range(NUM_LAYERS)]
-    dst = [torch.zeros(shape, dtype=DTYPE) for _ in range(NUM_LAYERS)]
-    ours = _chunks()
-    theirs = _chunks()
-    fmt = EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
-
-    _transfer(src, ours, TransferDirection.D2H, engine_kv_format=fmt)
-    multi_layer_block_kv_transfer(
-        src,
-        theirs,
-        list(range(NUM_BLOCKS)),
-        torch.device("cpu"),
-        TransferDirection.D2H,
-        _shape_desc(),
-        CHUNK_TOKENS,
-        fmt,
-        0,
-    )
-    for got, expected in zip(ours, theirs, strict=True):
-        assert torch.equal(got, expected)
-
-    _transfer(dst, ours, TransferDirection.H2D, engine_kv_format=fmt)
-    for got, expected in zip(dst, src, strict=True):
-        assert torch.equal(got, expected)
+@pytest.mark.parametrize(
+    "engine_kv_format",
+    [
+        EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,  # NHD
+        EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,  # HND, K/V packed in content
+        EngineKVFormat.NB_NL_TWO_NH_BS_HS,  # cross-layer HND
+        EngineKVFormat.NL_X_NBBS_ONE_HS,  # MLA, blocks fused with tokens
+        EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS,  # MLA plane tuples
+    ],
+    ids=lambda fmt: fmt.name,
+)
+def test_unsupported_layouts_are_refused(engine_kv_format: EngineKVFormat) -> None:
+    """A layout the op sequences cannot address fails on its layout facts."""
+    with pytest.raises(ValueError, match="supports only per-layer"):
+        _transfer(
+            _paged_layers(),
+            _chunks(),
+            TransferDirection.D2H,
+            engine_kv_format=engine_kv_format,
+        )
 
 
 def test_hnd_without_the_singleton_axis_is_refused() -> None:
