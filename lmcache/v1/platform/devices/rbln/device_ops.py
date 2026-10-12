@@ -127,41 +127,48 @@ class RblnDeviceOps(DeviceOps):
             get_spec_class,
         )
 
-        # Dispatch on the format's layout facts rather than its identity. Each
-        # tuned layout has a ``prepare`` that turns the engine's per-layer
+        # Dispatch on the format's layout facts rather than its identity, so
+        # any per-layer layout the op sequences below address is accepted.
+        format_spec = get_spec_class(engine_kv_format)
+        is_mla = (
+            format_spec.is_layer_list
+            and format_spec.is_mla
+            and not format_spec.is_pbs_fused
+            and not format_spec.is_kv_second_tuple
+        )
+        is_hnd = (
+            format_spec.is_layer_list
+            and format_spec.is_hnd
+            and not format_spec.is_fused_packed
+        )
+        if not (is_mla or is_hnd):
+            raise ValueError(
+                "RBLN block transfer supports only per-layer [NB, BS, HS] MLA "
+                "and per-layer HND layouts; got "
+                f"{engine_kv_format!r} ({describe_shape(engine_kv_format)})"
+            )
+
+        # Each tuned layout has a ``prepare`` that turns the engine's per-layer
         # tensors into the views its gather/scatter index, failing loudly on
         # a layout drift. The HND singleton axis the RBLN attention backend
         # requires is squeezed there, where the bytes are addressed.
-        spec = get_spec_class(engine_kv_format)
-        if (
-            spec.is_layer_list
-            and spec.is_mla
-            and not spec.is_pbs_fused
-            and not spec.is_kv_second_tuple
-        ):
+        if is_mla:
             prepare, gather, scatter = (
                 validate_mla_layers,
                 gather_blocks_to_chunk_mla,
                 scatter_chunk_to_blocks_mla,
             )
-        elif spec.is_layer_list and spec.is_hnd and not spec.is_fused_packed:
-            if spec.is_two_major:
-                prepare, gather, scatter = (
-                    squeeze_singleton_axis_kv_first,
-                    gather_blocks_to_chunk_hnd_kv_first,
-                    scatter_chunk_to_blocks_hnd_kv_first,
-                )
-            else:
-                prepare, gather, scatter = (
-                    squeeze_singleton_axis,
-                    gather_blocks_to_chunk_hnd,
-                    scatter_chunk_to_blocks_hnd,
-                )
+        elif format_spec.is_two_major:
+            prepare, gather, scatter = (
+                squeeze_singleton_axis_kv_first,
+                gather_blocks_to_chunk_hnd_kv_first,
+                scatter_chunk_to_blocks_hnd_kv_first,
+            )
         else:
-            raise ValueError(
-                "RBLN block transfer supports only per-layer [NB, BS, HS] MLA "
-                "and per-layer HND layouts; got "
-                f"{engine_kv_format!r} ({describe_shape(engine_kv_format)})"
+            prepare, gather, scatter = (
+                squeeze_singleton_axis,
+                gather_blocks_to_chunk_hnd,
+                scatter_chunk_to_blocks_hnd,
             )
 
         # The chunk/block bookkeeping below is shared by every tuned layout.
