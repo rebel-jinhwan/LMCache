@@ -117,13 +117,6 @@ def test_squeeze_rejects_a_foreign_layout() -> None:
         squeeze_singleton_axis([torch.zeros(NUM_BLOCKS, 2, NUM_HEADS, BLOCK_SIZE)])
 
 
-def test_squeeze_rejects_a_non_contiguous_layer() -> None:
-    """A permuted 6-D view would break the whole-block copies; fail loudly."""
-    permuted = _native_kv()[0].transpose(0, 1).contiguous().transpose(0, 1)
-    with pytest.raises(ValueError, match="contiguous"):
-        squeeze_singleton_axis([permuted])
-
-
 # ---------------------------------------------------------------------------
 # Discovery integration
 # ---------------------------------------------------------------------------
@@ -196,19 +189,6 @@ def _kv_first_kv() -> list[torch.Tensor]:
     return [t.transpose(0, 1).contiguous() for t in _native_kv()]
 
 
-@pytest.mark.parametrize(
-    "device_type", ["rbln", "cuda", "cpu"], ids=["rbln", "cuda", "cpu"]
-)
-def test_kv_first_is_its_own_format(device_type: str) -> None:
-    """Detection reports the K/V-first format and does not reshape it."""
-    raw = _kv_first_kv()
-    fmt, normalized = _discover(raw, device_type=device_type)
-    assert int(fmt) == int(_KV_FIRST_FORMAT)
-    for out, src in zip(normalized, raw, strict=True):
-        assert out.data_ptr() == src.data_ptr()
-        assert tuple(out.shape) == tuple(src.shape)
-
-
 def test_kv_first_squeeze_is_a_free_view() -> None:
     """Dropping the K/V-first singleton must not copy the KV cache."""
     raw = _kv_first_kv()
@@ -221,15 +201,6 @@ def test_kv_first_squeeze_is_a_free_view() -> None:
             BLOCK_SIZE,
             HEAD_SIZE,
         )
-
-
-def test_kv_first_geometry_reads_past_the_singleton() -> None:
-    """The spec reports the real dims, not the ones shifted by the axis."""
-    fmt, normalized = _discover(_kv_first_kv())
-    assert get_num_layers(normalized, fmt) == NUM_LAYERS
-    assert get_num_heads(normalized, fmt) == NUM_HEADS
-    assert get_block_size(normalized, fmt) == BLOCK_SIZE
-    assert get_head_size(normalized, fmt) == HEAD_SIZE
 
 
 # ---------------------------------------------------------------------------

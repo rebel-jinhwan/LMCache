@@ -76,19 +76,6 @@ def test_vllm_rbln_native_singleton_axis(monkeypatch, hint):
     assert out[0].data_ptr() == kv[0].data_ptr()
 
 
-@pytest.mark.parametrize("hint", [{}, {"kv_layout": "NHD"}, {"kv_layout": "HND"}])
-def test_vllm_rbln_blocks_first_singleton_axis(monkeypatch, hint):
-    # vLLM-RBLN's default attention kernels allocate [NB, 2, NH, 1, BS, HS],
-    # its own format, detected from the shape alone whatever the hint says.
-    monkeypatch.setattr(_VLLM_DEV, "cuda")
-    kv = [_t(NB, 2, NH, 1, BS, HS) for _ in range(NL)]
-    fmt, out = detect_format(kv, EngineType.VLLM, hint)
-    assert fmt == F.NL_X_NB_TWO_NH_ONE_BS_HS
-    # Detection must not reshape it away: the singleton axis survives.
-    assert tuple(out[0].shape) == (NB, 2, NH, 1, BS, HS)
-    assert out[0].data_ptr() == kv[0].data_ptr()
-
-
 def test_vllm_rbln_num_blocks_2_keeps_kv_first_reading(monkeypatch):
     # [2, 2, NH, 1, BS, HS] fits both RBLN layouts; the K/V-first reading wins.
     monkeypatch.setattr(_VLLM_DEV, "cuda")

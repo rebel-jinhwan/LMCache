@@ -237,13 +237,6 @@ def test_hnd_without_the_singleton_axis_is_refused() -> None:
         )
 
 
-def test_non_contiguous_layer_is_refused() -> None:
-    """A permuted view would break the whole-block copies; fail loudly."""
-    permuted = [t.transpose(0, 1).contiguous().transpose(0, 1) for t in _paged_layers()]
-    with pytest.raises(ValueError, match="contiguous"):
-        _transfer(permuted, _chunks(), TransferDirection.D2H)
-
-
 def test_pointer_operands_are_refused() -> None:
     """RBLN has no compiled block-transfer extension, so pointers can't occur."""
     with pytest.raises(ValueError, match="tensor operands"):

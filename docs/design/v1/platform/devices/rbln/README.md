@@ -123,8 +123,8 @@ V together -- with its slot in a per-thread host staging buffer laid out
 `[B, L, 2, H, BS, D]`, so each (block, layer) is a single direct copy, all
 batched into one `torch._foreach_copy_`. The head<->token transpose into the
 canonical `[2, L, T, H*D]` chunk then runs on the host.
-`squeeze_singleton_axis` pins rank, the K/V axis, the singleton, and
-contiguity at the transfer boundary.
+`squeeze_singleton_axis` pins rank, the K/V axis, and the singleton at the
+transfer boundary.
 
 ## The K/V-first layout
 

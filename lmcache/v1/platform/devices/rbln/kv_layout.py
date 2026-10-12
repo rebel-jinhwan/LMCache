@@ -70,10 +70,6 @@ def squeeze_singleton_axis(
     Strict by contract: the caller has already established that these tensors
     came from vLLM-RBLN (the detected ``EngineKVFormat`` says so), so anything
     else is a bug and fails loudly rather than being passed through.
-    Contiguity is pinned too: the transfer copies ``layer[block]`` as one
-    whole ``[2, NH, BS, HS]`` run, which is only a direct device copy when the
-    layer is contiguous; a permuted view would send every copy down
-    torch-rbln's strided path.
 
     Args:
         kv_caches: Per-layer tensors shaped ``[NB, 2, NH, 1, BS, HS]``.
@@ -84,7 +80,7 @@ def squeeze_singleton_axis(
 
     Raises:
         ValueError: If a tensor is not 6-D with the K/V pair at axis 1 and a
-            singleton at axis 3, or is not contiguous.
+            singleton at axis 3.
     """
     views: list[torch.Tensor] = []
     for tensor in kv_caches:
@@ -92,11 +88,6 @@ def squeeze_singleton_axis(
             raise ValueError(
                 "RBLN KV caches must be [NB, 2, NH, 1, BS, HS]; got "
                 + str(tuple(tensor.shape))
-            )
-        if not tensor.is_contiguous():
-            raise ValueError(
-                "RBLN KV caches must be contiguous; got strides "
-                + str(tuple(tensor.stride()))
             )
         views.append(tensor.squeeze(RBLN_SINGLETON_AXIS))
     return views
