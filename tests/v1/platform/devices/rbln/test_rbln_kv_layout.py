@@ -6,7 +6,10 @@ The multiprocess path never goes through a connector: ``compute_kv_layout``,
 through ``normalize_kv_and_discover_format``. What these cover is that the
 native 6-D layout is detected as ``NL_X_TWO_NB_NH_ONE_BS_HS`` from its shape
 alone -- no device spec consulted, no reshape applied -- and that the squeeze
-happens only in the ops backend that indexes the bytes.
+happens only in the ops backend that indexes the bytes. The blocks-first
+``[NB, 2, NH, 1, BS, HS]`` layout of vLLM-RBLN's default attention kernels is
+the exception: detection squeezes it onto the existing
+``NL_X_NB_TWO_NH_BS_HS`` format as a free view.
 
 ``torch_device_type`` is patched rather than requiring an NPU, so these run
 anywhere.
@@ -172,6 +175,82 @@ def test_geometry_reads_past_the_singleton() -> None:
     assert get_num_heads(normalized, fmt) == NUM_HEADS
     assert get_block_size(normalized, fmt) == BLOCK_SIZE
     assert get_head_size(normalized, fmt) == HEAD_SIZE
+
+
+# ---------------------------------------------------------------------------
+# Blocks-first layout ([NB, 2, NH, 1, BS, HS], vLLM-RBLN default kernels)
+# ---------------------------------------------------------------------------
+
+_BLOCKS_FIRST_FORMAT = lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS
+
+
+def _blocks_first_kv() -> list[torch.Tensor]:
+    """The same KV as ``_native_kv``, allocated blocks-first."""
+    return [t.transpose(0, 1).contiguous() for t in _native_kv()]
+
+
+@pytest.mark.parametrize(
+    "device_type", ["rbln", "cuda", "cpu"], ids=["rbln", "cuda", "cpu"]
+)
+def test_blocks_first_is_detected_as_a_squeezed_view(device_type: str) -> None:
+    """Detection reports the existing blocks-first HND format, zero-copy."""
+    raw = _blocks_first_kv()
+    fmt, normalized = _discover(raw, device_type=device_type)
+    assert int(fmt) == int(_BLOCKS_FIRST_FORMAT)
+    for out, src in zip(normalized, raw, strict=True):
+        assert out.data_ptr() == src.data_ptr()
+        assert out.is_contiguous()
+        assert tuple(out.shape) == (
+            NUM_BLOCKS,
+            2,
+            NUM_HEADS,
+            BLOCK_SIZE,
+            HEAD_SIZE,
+        )
+
+
+def test_blocks_first_geometry_reads_past_the_singleton() -> None:
+    """The spec reports the real dims of the squeezed blocks-first view."""
+    fmt, normalized = _discover(_blocks_first_kv())
+    assert get_num_layers(normalized, fmt) == NUM_LAYERS
+    assert get_num_heads(normalized, fmt) == NUM_HEADS
+    assert get_block_size(normalized, fmt) == BLOCK_SIZE
+    assert get_head_size(normalized, fmt) == HEAD_SIZE
+
+
+def test_blocks_first_gather_scatter_round_trip() -> None:
+    """The raw 6-D blocks-first cache round-trips through MP gather/scatter.
+
+    Runs ``gather_paged_kv_to_cpu`` / ``scatter_cpu_to_paged_kv`` on the raw
+    tensors, so detection and transfer are exercised together, and checks the
+    chunks hold canonical token-major rows of the original KV.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        gather_paged_kv_to_cpu,
+        scatter_cpu_to_paged_kv,
+    )
+
+    block_ids = list(range(NUM_BLOCKS))
+    blocks_per_chunk = 2
+    chunk_tokens = blocks_per_chunk * BLOCK_SIZE
+    kv_first = _native_kv()
+    blocks_first = {f"layer.{i}": t for i, t in enumerate(_blocks_first_kv())}
+
+    with patch.object(vllm_detector, "torch_device_type", "rbln"):
+        chunks = gather_paged_kv_to_cpu(blocks_first, block_ids, blocks_per_chunk)
+        restored = {name: torch.zeros_like(t) for name, t in blocks_first.items()}
+        scatter_cpu_to_paged_kv(restored, block_ids, chunks, blocks_per_chunk)
+
+    for ci, chunk in enumerate(chunks):
+        for kv in (0, 1):
+            for li in range(NUM_LAYERS):
+                for ti in range(chunk_tokens):
+                    block, offset = divmod(ci * chunk_tokens + ti, BLOCK_SIZE)
+                    row = kv_first[li][kv, block, :, 0, offset]
+                    assert torch.equal(chunk[kv, li, ti], row.reshape(-1))
+    for name, tensor in blocks_first.items():
+        assert torch.equal(restored[name], tensor)
 
 
 # ---------------------------------------------------------------------------

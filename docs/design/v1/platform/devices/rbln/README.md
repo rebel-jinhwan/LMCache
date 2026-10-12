@@ -33,7 +33,9 @@ needs no special casing.
 
 ## The 6-D KV cache
 
-This is what makes RBLN unusual. vllm-rbln allocates each layer as
+This is what makes RBLN unusual. With `rbln_triton_ops`, vllm-rbln allocates
+each layer as (the default kernels use the blocks-first variant described
+below)
 
 ```
 [2, num_blocks, num_kv_heads, 1, block_size, head_size]
@@ -83,10 +85,12 @@ Consequences of the format being first-class:
   `is_two_major`, not `is_fused_packed`) takes the HND sequence, and a
   per-layer `[NB, BS, HS]` MLA layout (`is_layer_list`, `is_mla`, not
   `is_pbs_fused` / `is_kv_second_tuple` / `requires_blocked_scale_repacking`)
-  takes the MLA one (below). The HND side applies `squeeze_singleton_axis` at
-  entry, so `kv_ops.py` keeps indexing a 5-D tensor. `kv_layout.py` therefore
-  exports the strict squeeze plus the `is_rbln_kv_layout` predicate -- no
-  tolerant pass-through variant.
+  takes the MLA one (below). A
+  per-layer HND layout that is not two-major takes the blocks-first sequence,
+  and every other layout goes to the shared torch path (both below). The HND
+  side applies `squeeze_singleton_axis` at entry, so `kv_ops.py` keeps
+  indexing a 5-D tensor. `kv_layout.py` therefore exports the strict squeeze
+  plus the `is_rbln_kv_layout` predicate -- no tolerant pass-through variant.
   `NL_X_TWO_NB_NH_BS_HS` (6) shares format 15's layout facts (the singleton
   axis is the only difference), but vLLM-RBLN never allocates it, so a 5-D
   cache fails loudly in the squeeze rather than being accepted.
@@ -106,6 +110,62 @@ The multiprocess path reaches the layout through `compute_kv_layout` / gather /
 scatter, all of which resolve it via `normalize_kv_and_discover_format` and
 never touch a connector -- which is why the format must be recognised by
 detection rather than by a connector.
+
+## The blocks-first 6-D KV cache
+
+Since [vllm-rbln#1114](https://github.com/RBLN-SW/vllm-rbln/pull/1114), the
+default attention kernels (`rbln_custom_ops`, `use_custom_kernel=False`)
+allocate each layer **blocks-first**:
+
+```
+new (default):              [num_blocks, 2, num_kv_heads, 1, block_size, head_size]
+old (rbln_triton_ops only): [2, num_blocks, num_kv_heads, 1, block_size, head_size]
+```
+
+Squeezing axis 3 gives a byte-identical, contiguous `[NB, 2, NH, BS, HS]`
+view, which is exactly the existing `EngineKVFormat.NL_X_NB_TWO_NH_BS_HS`.
+Unlike the K/V-first layout above, detection **does squeeze** this one:
+
+```python
+if (list_depth == 1 and tensor_ndim == 6
+        and first_tensor.shape[1] == 2 and first_tensor.shape[3] == 1):
+    return (lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
+            [t.squeeze(3) for t in kv_caches])
+```
+
+Why the opposite choice here: the squeeze is keyed off the shape alone, so
+detection stays a pure function of `(kv_caches, layout_hints)` with no device
+hook -- the objection that ruled out squeezing format 15 does not apply. The
+target format is HND by definition, so the unreliable NHD hint is still never
+read. Reusing the format avoids a new `EngineKVFormat` value, a `csrc`
+rebuild, and a spec for a layout byte-identical to one that exists. The DSA
+indexer branch of the same detector already squeezes a singleton axis the same
+way.
+
+**`num_blocks == 2` is ambiguous.** `[2, 2, NH, 1, BS, HS]` fits both layouts.
+The K/V-first branch is checked first, so it keeps that reading; a layout hint
+from vLLM-RBLN would be needed to tell them apart.
+
+**Transfer.** By layout facts, a per-layer HND layout that is *not*
+two-major (`is_layer_list`, `is_hnd`, not `is_two_major`, not
+`is_fused_packed`) -- only `NL_X_NB_TWO_NH_BS_HS` -- takes the same HND op
+sequence as format 15 (`gather_blocks_to_chunk_hnd_blocks_first` /
+`scatter_chunk_to_blocks_hnd_blocks_first`). The only difference
+is the pairing of device and host views: `layer[block]` is one contiguous
+`[2, NH, BS, HS]` run holding K and V together, so each (block, layer) is a
+single direct copy -- half the copies of the K/V-first layout, still batched
+into one `torch._foreach_copy_`. The host staging buffer, the host-side
+head<->token transpose, and the chunk layout are unchanged, so for the same KV
+both layouts produce **byte-identical chunks**; caches stored before and after
+the vllm-rbln change stay interchangeable. `validate_blocks_first_layers` pins
+rank, the K/V axis, and contiguity at the transfer boundary.
+
+## Untuned layouts
+
+Any format without an RBLN-tuned sequence is delegated to the shared torch
+path (`DeviceOps` -> `torch_ops`) instead of being refused, as on other
+non-CUDA devices. The tuned sequences exist for cost, not correctness, so
+falling back is always correct.
 
 ## The MLA layout
 
@@ -163,7 +223,7 @@ How the two layouts relate inside the backend:
   names carry the split: `gather_blocks_to_chunk_hnd` / `_mla` and
   `scatter_chunk_to_blocks_hnd` / `_mla`.
 
-Both layouts require the engine's KV caches to be real device tensors
+All RBLN layouts require the engine's KV caches to be real device tensors
 (vLLM-RBLN: `VLLM_RBLN_USE_DEVICE_TENSOR=1`). With the default compile-mode
 allocation the per-layer tensors are `meta`, and any transfer -- this
 backend's or the shared path's -- dies at the first host copy with "Cannot
