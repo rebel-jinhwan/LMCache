@@ -44,7 +44,7 @@ copy out of meta tensor".
 from __future__ import annotations
 
 # Standard
-from typing import TYPE_CHECKING, Callable, ClassVar, NamedTuple, cast
+from typing import ClassVar, cast
 
 # Third Party
 import torch
@@ -68,66 +68,7 @@ from lmcache.v1.platform.devices.rbln.kv_ops import (
 from lmcache.v1.platform.ops_types import PageBufferShapeDesc
 import lmcache.lmcache_native as lmcache_native
 
-if TYPE_CHECKING:
-    # First Party
-    from lmcache.v1.gpu_connector.kv_format.specs.base import KVFormatSpec
-
 logger = init_logger(__name__)
-
-
-class _TunedSequence(NamedTuple):
-    """The RBLN op sequence for one layout.
-
-    ``prepare`` turns the engine's per-layer tensors into the views ``gather``
-    and ``scatter`` index, failing loudly on a layout drift.
-    """
-
-    prepare: Callable[[list[torch.Tensor]], list[torch.Tensor]]
-    gather: Callable[[list[torch.Tensor], list[int], torch.Tensor], None]
-    scatter: Callable[[list[torch.Tensor], list[int], torch.Tensor, int], None]
-
-
-#: Per-layer two-major HND. vLLM-RBLN allocates it with a singleton axis the
-#: attention backend requires; it is squeezed here, where the bytes are
-#: addressed, and the squeeze is strict, so a layout without that axis fails.
-_KV_FIRST_HND = _TunedSequence(
-    squeeze_singleton_axis, gather_blocks_to_chunk_hnd, scatter_chunk_to_blocks_hnd
-)
-
-#: Per-layer blocks-first HND, squeezed the same way.
-_BLOCKS_FIRST_HND = _TunedSequence(
-    squeeze_blocks_first_singleton_axis,
-    gather_blocks_to_chunk_hnd_blocks_first,
-    scatter_chunk_to_blocks_hnd_blocks_first,
-)
-
-#: Per-layer ``[NB, BS, HS]`` MLA. Nothing to squeeze; the rank is pinned.
-_MLA = _TunedSequence(
-    validate_mla_layers, gather_blocks_to_chunk_mla, scatter_chunk_to_blocks_mla
-)
-
-
-def _tuned_sequence(format_spec: type[KVFormatSpec]) -> _TunedSequence | None:
-    """Pick the RBLN op sequence for a format from its layout facts.
-
-    Args:
-        format_spec: Spec class of the engine KV format.
-
-    Returns:
-        The tuned sequence, or ``None`` when the layout has none and the
-        shared torch path should move it.
-    """
-    if not format_spec.is_layer_list:
-        return None
-    if (
-        format_spec.is_mla
-        and not format_spec.is_pbs_fused
-        and not format_spec.is_kv_second_tuple
-    ):
-        return _MLA
-    if format_spec.is_hnd and not format_spec.is_fused_packed:
-        return _KV_FIRST_HND if format_spec.is_two_major else _BLOCKS_FIRST_HND
-    return None
 
 
 class RblnDeviceOps(DeviceOps):
@@ -189,9 +130,37 @@ class RblnDeviceOps(DeviceOps):
             get_spec_class,
         )
 
-        # Dispatch on the format's layout facts rather than its identity.
-        sequence = _tuned_sequence(get_spec_class(engine_kv_format))
-        if sequence is None:
+        # Dispatch on the format's layout facts rather than its identity. Each
+        # tuned layout has a ``prepare`` that turns the engine's per-layer
+        # tensors into the views its gather/scatter index, failing loudly on
+        # a layout drift. The HND singleton axis the RBLN attention backend
+        # requires is squeezed there, where the bytes are addressed.
+        spec = get_spec_class(engine_kv_format)
+        if (
+            spec.is_layer_list
+            and spec.is_mla
+            and not spec.is_pbs_fused
+            and not spec.is_kv_second_tuple
+        ):
+            prepare, gather, scatter = (
+                validate_mla_layers,
+                gather_blocks_to_chunk_mla,
+                scatter_chunk_to_blocks_mla,
+            )
+        elif spec.is_layer_list and spec.is_hnd and not spec.is_fused_packed:
+            if spec.is_two_major:
+                prepare, gather, scatter = (
+                    squeeze_singleton_axis,
+                    gather_blocks_to_chunk_hnd,
+                    scatter_chunk_to_blocks_hnd,
+                )
+            else:
+                prepare, gather, scatter = (
+                    squeeze_blocks_first_singleton_axis,
+                    gather_blocks_to_chunk_hnd_blocks_first,
+                    scatter_chunk_to_blocks_hnd_blocks_first,
+                )
+        else:
             super().multi_layer_block_kv_transfer(
                 paged_buffer_ptrs_tensor,
                 lmcache_objects_ptrs,
@@ -205,9 +174,8 @@ class RblnDeviceOps(DeviceOps):
             )
             return
 
-        # Per-layout addressing only; the chunk/block bookkeeping below is
-        # shared.
-        paged_layers = sequence.prepare(
+        # The chunk/block bookkeeping below is shared by every tuned layout.
+        paged_layers = prepare(
             cast("list[torch.Tensor]", list(paged_buffer_ptrs_tensor))
         )
         chunks = cast("list[torch.Tensor]", list(lmcache_objects_ptrs))
@@ -236,10 +204,10 @@ class RblnDeviceOps(DeviceOps):
             if not blocks:
                 break
             if is_d2h:
-                sequence.gather(paged_layers, blocks, chunk)
+                gather(paged_layers, blocks, chunk)
             else:
                 # The prefix skip is global across the transfer; translate it
                 # into this chunk's local block offset.
                 local_skip = min(len(blocks), max(0, skip_prefix_n_blocks - consumed))
-                sequence.scatter(paged_layers, blocks, chunk, local_skip)
+                scatter(paged_layers, blocks, chunk, local_skip)
             consumed += len(blocks)
