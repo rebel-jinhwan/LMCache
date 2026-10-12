@@ -141,6 +141,69 @@ def test_hnd_round_trip_on_device() -> None:
     )
 
 
+def test_blocks_first_hnd_round_trip_on_device() -> None:
+    """The blocks-first HND cache survives store and retrieve on a real NPU.
+
+    The layers are what detection hands over: vLLM-RBLN's
+    ``[NB, 2, NH, 1, BS, HS]`` with the singleton axis squeezed away.
+    """
+    _assert_device_round_trip(
+        (NUM_BLOCKS, 2, NUM_HEADS, BLOCK_SIZE, HEAD_SIZE),
+        (2, NUM_LAYERS, CHUNK_TOKENS, NUM_HEADS * HEAD_SIZE),
+        EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
+        _shape_desc(kv_size=2, num_heads=NUM_HEADS, head_size=HEAD_SIZE),
+    )
+
+
+def test_blocks_first_gather_scatter_on_device() -> None:
+    """The raw 6-D blocks-first cache round-trips through MP gather/scatter.
+
+    Detection squeezes vLLM-RBLN's ``[NB, 2, NH, 1, BS, HS]`` and the device
+    dispatch routes it to ``RblnDeviceOps``; the chunks must match the ones
+    the K/V-first layout produces for the same KV.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        gather_paged_kv_to_cpu,
+        scatter_cpu_to_paged_kv,
+    )
+
+    torch.manual_seed(13)
+    kv_first = [
+        torch.randn((2, NUM_BLOCKS, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE), dtype=DTYPE)
+        for _ in range(NUM_LAYERS)
+    ]
+    expected = [
+        torch.zeros((2, NUM_LAYERS, CHUNK_TOKENS, NUM_HEADS * HEAD_SIZE), dtype=DTYPE)
+        for _ in range(NUM_BLOCKS // BLOCKS_PER_CHUNK)
+    ]
+    _transfer(
+        kv_first,
+        expected,
+        TransferDirection.D2H,
+        EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
+        _shape_desc(kv_size=2, num_heads=NUM_HEADS, head_size=HEAD_SIZE),
+    )
+
+    cpu_layers = [t.transpose(0, 1).contiguous() for t in kv_first]
+    block_ids = list(range(NUM_BLOCKS))
+    paged = {f"layer.{i}": _bound_device_tensor(t) for i, t in enumerate(cpu_layers)}
+    restored = {
+        name: _bound_device_tensor(torch.zeros_like(t.cpu()))
+        for name, t in paged.items()
+    }
+    torch.rbln.synchronize()
+    chunks = gather_paged_kv_to_cpu(paged, block_ids, BLOCKS_PER_CHUNK)
+    torch.rbln.synchronize()
+    scatter_cpu_to_paged_kv(restored, block_ids, chunks, BLOCKS_PER_CHUNK)
+    torch.rbln.synchronize()
+
+    for chunk, want in zip(chunks, expected, strict=True):
+        assert torch.equal(chunk, want)
+    for name, layer in zip(restored, cpu_layers, strict=True):
+        assert torch.equal(restored[name].cpu(), layer)
+
+
 def test_mla_round_trip_on_device() -> None:
     """The MLA cache survives store and retrieve on a real NPU."""
     _assert_device_round_trip(

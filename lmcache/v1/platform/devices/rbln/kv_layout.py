@@ -15,7 +15,15 @@ with no K/V split and no head axis, which the vLLM detector classifies as
 :func:`validate_mla_layers` only pins the rank so a layout drift fails loudly
 at the transfer boundary instead of mis-addressing bytes.
 
-Detection does not squeeze: the layout is registered as its own
+With its default attention kernels (``rbln_custom_ops``) vLLM-RBLN instead
+allocates each layer blocks-first, ``[num_blocks, 2, num_kv_heads, 1,
+block_size, head_size]``. Squeezing axis 3 there gives a byte-identical
+``[NB, 2, NH, BS, HS]`` view, which is exactly the existing
+``EngineKVFormat.NL_X_NB_TWO_NH_BS_HS``, so the vLLM detector reports that
+format with the squeezed views and :func:`validate_blocks_first_layers` pins
+the result at the transfer boundary.
+
+For the K/V-first layout detection does not squeeze: it is registered as its own
 ``EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS``, so the vLLM detector classifies
 what vLLM-RBLN actually allocated and holds no RBLN knowledge beyond that
 shape signature. :func:`squeeze_singleton_axis` is applied one layer lower, by
@@ -87,6 +95,42 @@ def squeeze_singleton_axis(
             )
         views.append(tensor.squeeze(RBLN_SINGLETON_AXIS))
     return views
+
+
+def validate_blocks_first_layers(
+    kv_caches: Sequence[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Return blocks-first HND per-layer KV tensors after pinning their layout.
+
+    vLLM-RBLN's default attention kernels allocate
+    ``[NB, 2, NH, 1, BS, HS]``; the vLLM detector squeezes the singleton axis
+    and reports ``NL_X_NB_TWO_NH_BS_HS``, so these arrive 5-D. The transfer
+    copies ``layer[block]`` as one whole ``[2, NH, BS, HS]`` run, which is only
+    a direct device copy when the layer is contiguous; a permuted view would
+    send every copy down torch-rbln's strided path.
+
+    Args:
+        kv_caches: Per-layer tensors shaped ``[NB, 2, NH, BS, HS]``.
+
+    Returns:
+        list[torch.Tensor]: The same tensors, as a list.
+
+    Raises:
+        ValueError: If a tensor is not 5-D with the K/V pair at axis 1, or is
+            not contiguous.
+    """
+    for tensor in kv_caches:
+        if tensor.ndim != RBLN_KV_NDIM - 1 or tensor.shape[1] != 2:
+            raise ValueError(
+                "RBLN blocks-first KV caches must be [NB, 2, NH, BS, HS]; got "
+                + str(tuple(tensor.shape))
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(
+                "RBLN blocks-first KV caches must be contiguous; got strides "
+                + str(tuple(tensor.stride()))
+            )
+    return list(kv_caches)
 
 
 def validate_mla_layers(

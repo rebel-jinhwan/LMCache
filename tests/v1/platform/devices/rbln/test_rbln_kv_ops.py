@@ -203,27 +203,38 @@ def test_trailing_partial_chunk_is_handled() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "engine_kv_format",
-    [
-        EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,  # NHD
-        EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,  # HND, K/V axis after blocks
-        EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,  # HND, K/V packed in content
-        EngineKVFormat.NB_NL_TWO_NH_BS_HS,  # cross-layer HND
-        EngineKVFormat.NL_X_NBBS_ONE_HS,  # MLA, blocks fused with tokens
-        EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS,  # MLA plane tuples
-    ],
-    ids=lambda fmt: fmt.name,
-)
-def test_unsupported_layouts_are_refused(engine_kv_format: EngineKVFormat) -> None:
-    """A layout the op sequences cannot address fails on its layout facts."""
-    with pytest.raises(ValueError, match="supports only per-layer"):
-        _transfer(
-            _paged_layers(),
-            _chunks(),
-            TransferDirection.D2H,
-            engine_kv_format=engine_kv_format,
-        )
+def test_untuned_format_is_served_by_the_shared_path() -> None:
+    """A layout with no RBLN sequence round-trips instead of being refused.
+
+    ``NL_X_TWO_NB_BS_NH_HS`` (vLLM NHD) has no RBLN-tuned sequence; its chunk
+    must match the shared torch path and restore the cache exactly.
+    """
+    torch.manual_seed(5)
+    shape = (2, NUM_BLOCKS, BLOCK_SIZE, NUM_HEADS, HEAD_SIZE)
+    src = [torch.randn(shape, dtype=DTYPE) for _ in range(NUM_LAYERS)]
+    dst = [torch.zeros(shape, dtype=DTYPE) for _ in range(NUM_LAYERS)]
+    ours = _chunks()
+    theirs = _chunks()
+    fmt = EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
+
+    _transfer(src, ours, TransferDirection.D2H, engine_kv_format=fmt)
+    multi_layer_block_kv_transfer(
+        src,
+        theirs,
+        list(range(NUM_BLOCKS)),
+        torch.device("cpu"),
+        TransferDirection.D2H,
+        _shape_desc(),
+        CHUNK_TOKENS,
+        fmt,
+        0,
+    )
+    for got, expected in zip(ours, theirs, strict=True):
+        assert torch.equal(got, expected)
+
+    _transfer(dst, ours, TransferDirection.H2D, engine_kv_format=fmt)
+    for got, expected in zip(dst, src, strict=True):
+        assert torch.equal(got, expected)
 
 
 def test_hnd_without_the_singleton_axis_is_refused() -> None:
@@ -267,6 +278,96 @@ def test_chunk_size_must_be_a_block_multiple() -> None:
             EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
             0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Blocks-first HND (NL_X_NB_TWO_NH_BS_HS): vLLM-RBLN's default attention
+# kernels allocate [NB, 2, NH, 1, BS, HS]; detection squeezes axis 3.
+# ---------------------------------------------------------------------------
+
+_BLOCKS_FIRST_FORMAT = EngineKVFormat.NL_X_NB_TWO_NH_BS_HS
+
+
+def _blocks_first_layers(fill_random: bool = True) -> list[torch.Tensor]:
+    """Squeezed blocks-first layers holding the same KV as ``_paged_layers``."""
+    return [
+        layer.squeeze(3).transpose(0, 1).contiguous()
+        for layer in _paged_layers(fill_random)
+    ]
+
+
+def _blocks_first_transfer(
+    layers: list[torch.Tensor],
+    chunks: list[torch.Tensor],
+    direction: TransferDirection,
+    skip_prefix_n_blocks: int = 0,
+) -> None:
+    """Run the RBLN block transfer over blocks-first layers."""
+    _transfer(
+        layers,
+        chunks,
+        direction,
+        skip_prefix_n_blocks=skip_prefix_n_blocks,
+        engine_kv_format=_BLOCKS_FIRST_FORMAT,
+    )
+
+
+def test_blocks_first_chunk_matches_the_canonical_torch_path() -> None:
+    """Blocks-first chunks are byte-identical to the shared torch path's."""
+    layers = _blocks_first_layers()
+    ours = _chunks()
+    theirs = _chunks()
+
+    _blocks_first_transfer(layers, ours, TransferDirection.D2H)
+    multi_layer_block_kv_transfer(
+        layers,
+        theirs,
+        list(range(NUM_BLOCKS)),
+        torch.device("cpu"),
+        TransferDirection.D2H,
+        _shape_desc(),
+        CHUNK_TOKENS,
+        _BLOCKS_FIRST_FORMAT,
+        0,
+    )
+
+    for got, expected in zip(ours, theirs, strict=True):
+        assert torch.equal(got, expected)
+
+
+def test_blocks_first_chunk_matches_the_kv_first_layout() -> None:
+    """The same KV stored from either RBLN layout yields the same chunk bytes.
+
+    This keeps caches stored before and after vLLM-RBLN's layout change
+    interchangeable.
+    """
+    blocks_first = _chunks()
+    kv_first = _chunks()
+    _blocks_first_transfer(_blocks_first_layers(), blocks_first, TransferDirection.D2H)
+    _transfer(_paged_layers(), kv_first, TransferDirection.D2H)
+
+    for got, expected in zip(blocks_first, kv_first, strict=True):
+        assert torch.equal(got, expected)
+
+
+def test_blocks_first_round_trip_with_prefix_skip() -> None:
+    """Gather then scatter restores every block past the skipped prefix."""
+    src = _blocks_first_layers()
+    dst = _blocks_first_layers(fill_random=False)
+    chunks = _chunks()
+    _blocks_first_transfer(src, chunks, TransferDirection.D2H)
+    _blocks_first_transfer(dst, chunks, TransferDirection.H2D, skip_prefix_n_blocks=3)
+
+    for got, expected in zip(dst, src, strict=True):
+        assert torch.count_nonzero(got[:3]) == 0
+        assert torch.equal(got[3:], expected[3:])
+
+
+def test_blocks_first_rejects_the_unsqueezed_layout() -> None:
+    """The raw 6-D tensor must be squeezed by detection before transfer."""
+    raw = [t.unsqueeze(3) for t in _blocks_first_layers()]
+    with pytest.raises(ValueError, match=r"\[NB, 2, NH, BS, HS\]"):
+        _blocks_first_transfer(raw, _chunks(), TransferDirection.D2H)
 
 
 # ---------------------------------------------------------------------------
