@@ -4,11 +4,9 @@
 The multiprocess path never goes through a connector: ``compute_kv_layout``,
 ``gather_paged_kv_to_cpu`` and ``scatter_cpu_to_paged_kv`` all resolve layouts
 through ``normalize_kv_and_discover_format``. What these cover is that the
-native 6-D layout is detected as ``NL_X_TWO_NB_NH_ONE_BS_HS`` from its shape
+native 6-D layout is detected as ``NL_X_NB_TWO_NH_ONE_BS_HS`` from its shape
 alone -- no device spec consulted, no reshape applied -- and that the squeeze
-happens only in the ops backend that indexes the bytes. The blocks-first
-``[NB, 2, NH, 1, BS, HS]`` layout of vLLM-RBLN's default attention kernels is
-covered the same way, as ``NL_X_NB_TWO_NH_ONE_BS_HS``.
+happens only in the ops backend that indexes the bytes.
 
 ``torch_device_type`` is patched rather than requiring an NPU, so these run
 anywhere.
@@ -38,7 +36,6 @@ from lmcache.v1.gpu_connector.utils import (
 )
 from lmcache.v1.platform.devices.rbln.kv_layout import (
     is_rbln_kv_layout,
-    squeeze_blocks_first_singleton_axis,
     squeeze_singleton_axis,
 )
 import lmcache.lmcache_native as lmcache_native
@@ -49,13 +46,13 @@ NUM_HEADS = 2
 BLOCK_SIZE = 4
 HEAD_SIZE = 16
 
-_NATIVE_FORMAT = lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS
+_NATIVE_FORMAT = lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS
 
 
 def _native_kv() -> list[torch.Tensor]:
     """Per-layer tensors in the native RBLN 6-D layout."""
     torch.manual_seed(3)
-    shape = (2, NUM_BLOCKS, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE)
+    shape = (NUM_BLOCKS, 2, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE)
     return [torch.randn(shape) for _ in range(NUM_LAYERS)]
 
 
@@ -79,18 +76,18 @@ def _discover(
 
 
 def test_recognizes_the_native_layout() -> None:
-    """Only 6-D, K/V-first, singleton-at-3 qualifies."""
+    """Only 6-D, K/V-at-1, singleton-at-3 qualifies."""
     assert is_rbln_kv_layout(_native_kv()[0]) is True
 
 
 @pytest.mark.parametrize(
     "shape",
     [
-        (2, NUM_BLOCKS, NUM_HEADS, BLOCK_SIZE, HEAD_SIZE),
-        (2, NUM_BLOCKS, NUM_HEADS, 2, BLOCK_SIZE, HEAD_SIZE),
-        (NUM_BLOCKS, 2, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE),
+        (NUM_BLOCKS, 2, NUM_HEADS, BLOCK_SIZE, HEAD_SIZE),
+        (NUM_BLOCKS, 2, NUM_HEADS, 2, BLOCK_SIZE, HEAD_SIZE),
+        (2, NUM_BLOCKS, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE),
     ],
-    ids=["5d", "non-singleton-axis", "blocks-first"],
+    ids=["5d", "non-singleton-axis", "kv-first"],
 )
 def test_rejects_other_layouts(shape: tuple[int, ...]) -> None:
     """Anything else is not the RBLN layout."""
@@ -103,8 +100,8 @@ def test_squeeze_is_a_free_view() -> None:
     for view, tensor in zip(squeeze_singleton_axis(native), native, strict=True):
         assert view.data_ptr() == tensor.data_ptr()
         assert tuple(view.shape) == (
-            2,
             NUM_BLOCKS,
+            2,
             NUM_HEADS,
             BLOCK_SIZE,
             HEAD_SIZE,
@@ -113,8 +110,15 @@ def test_squeeze_is_a_free_view() -> None:
 
 def test_squeeze_rejects_a_foreign_layout() -> None:
     """A mismatched rank fails loudly instead of mis-transferring."""
-    with pytest.raises(ValueError, match=r"\[2, NB, NH, 1, BS, HS\]"):
-        squeeze_singleton_axis([torch.zeros(2, NUM_BLOCKS, NUM_HEADS, BLOCK_SIZE)])
+    with pytest.raises(ValueError, match=r"\[NB, 2, NH, 1, BS, HS\]"):
+        squeeze_singleton_axis([torch.zeros(NUM_BLOCKS, 2, NUM_HEADS, BLOCK_SIZE)])
+
+
+def test_squeeze_rejects_a_non_contiguous_layer() -> None:
+    """A permuted 6-D view would break the whole-block copies; fail loudly."""
+    permuted = _native_kv()[0].transpose(0, 1).contiguous().transpose(0, 1)
+    with pytest.raises(ValueError, match="contiguous"):
+        squeeze_singleton_axis([permuted])
 
 
 # ---------------------------------------------------------------------------
@@ -178,55 +182,6 @@ def test_geometry_reads_past_the_singleton() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocks-first layout ([NB, 2, NH, 1, BS, HS], vLLM-RBLN default kernels)
-# ---------------------------------------------------------------------------
-
-_BLOCKS_FIRST_FORMAT = lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS
-
-
-def _blocks_first_kv() -> list[torch.Tensor]:
-    """The same KV as ``_native_kv``, allocated blocks-first."""
-    return [t.transpose(0, 1).contiguous() for t in _native_kv()]
-
-
-@pytest.mark.parametrize(
-    "device_type", ["rbln", "cuda", "cpu"], ids=["rbln", "cuda", "cpu"]
-)
-def test_blocks_first_is_its_own_format(device_type: str) -> None:
-    """Detection reports the blocks-first format and does not reshape it."""
-    raw = _blocks_first_kv()
-    fmt, normalized = _discover(raw, device_type=device_type)
-    assert int(fmt) == int(_BLOCKS_FIRST_FORMAT)
-    for out, src in zip(normalized, raw, strict=True):
-        assert out.data_ptr() == src.data_ptr()
-        assert tuple(out.shape) == tuple(src.shape)
-
-
-def test_blocks_first_squeeze_is_a_free_view() -> None:
-    """Dropping the blocks-first singleton must not copy the KV cache."""
-    raw = _blocks_first_kv()
-    views = squeeze_blocks_first_singleton_axis(raw)
-    for view, tensor in zip(views, raw, strict=True):
-        assert view.data_ptr() == tensor.data_ptr()
-        assert tuple(view.shape) == (
-            NUM_BLOCKS,
-            2,
-            NUM_HEADS,
-            BLOCK_SIZE,
-            HEAD_SIZE,
-        )
-
-
-def test_blocks_first_geometry_reads_past_the_singleton() -> None:
-    """The spec reports the real dims, not the ones shifted by the axis."""
-    fmt, normalized = _discover(_blocks_first_kv())
-    assert get_num_layers(normalized, fmt) == NUM_LAYERS
-    assert get_num_heads(normalized, fmt) == NUM_HEADS
-    assert get_block_size(normalized, fmt) == BLOCK_SIZE
-    assert get_head_size(normalized, fmt) == HEAD_SIZE
-
-
-# ---------------------------------------------------------------------------
 # MLA layout validation
 # ---------------------------------------------------------------------------
 
@@ -244,7 +199,7 @@ def test_validate_mla_layers_passes_tensors_through() -> None:
 @pytest.mark.parametrize(
     "shape",
     [
-        (2, 4, 2, 1, 8, 16),  # the 6-D attention layout
+        (4, 2, 2, 1, 8, 16),  # the 6-D attention layout
         (4, 8),
         (4, 8, 16, 2),
     ],

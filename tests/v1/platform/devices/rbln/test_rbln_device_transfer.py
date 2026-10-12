@@ -134,16 +134,6 @@ def _assert_device_round_trip(
 def test_hnd_round_trip_on_device() -> None:
     """The 6-D HND cache survives store and retrieve on a real NPU."""
     _assert_device_round_trip(
-        (2, NUM_BLOCKS, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE),
-        (2, NUM_LAYERS, CHUNK_TOKENS, NUM_HEADS * HEAD_SIZE),
-        EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
-        _shape_desc(kv_size=2, num_heads=NUM_HEADS, head_size=HEAD_SIZE),
-    )
-
-
-def test_blocks_first_hnd_round_trip_on_device() -> None:
-    """The blocks-first HND cache survives store and retrieve on a real NPU."""
-    _assert_device_round_trip(
         (NUM_BLOCKS, 2, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE),
         (2, NUM_LAYERS, CHUNK_TOKENS, NUM_HEADS * HEAD_SIZE),
         EngineKVFormat.NL_X_NB_TWO_NH_ONE_BS_HS,
@@ -151,37 +141,41 @@ def test_blocks_first_hnd_round_trip_on_device() -> None:
     )
 
 
-def test_blocks_first_gather_scatter_on_device() -> None:
-    """The raw 6-D blocks-first cache round-trips through MP gather/scatter.
+def test_hnd_gather_scatter_on_device() -> None:
+    """The raw 6-D cache round-trips through MP gather/scatter.
 
     Detection reports vLLM-RBLN's ``[NB, 2, NH, 1, BS, HS]`` as its own format
     and the device dispatch routes it to ``RblnDeviceOps``; the chunks must
-    match the ones the K/V-first layout produces for the same KV.
+    match what the shared torch path writes for the same KV.
     """
     # First Party
     from lmcache.v1.multiprocess.transfer_context.base import (
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
     )
+    from lmcache.v1.platform.torch_ops import multi_layer_block_kv_transfer
 
     torch.manual_seed(13)
-    kv_first = [
-        torch.randn((2, NUM_BLOCKS, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE), dtype=DTYPE)
+    cpu_layers = [
+        torch.randn((NUM_BLOCKS, 2, NUM_HEADS, 1, BLOCK_SIZE, HEAD_SIZE), dtype=DTYPE)
         for _ in range(NUM_LAYERS)
     ]
     expected = [
         torch.zeros((2, NUM_LAYERS, CHUNK_TOKENS, NUM_HEADS * HEAD_SIZE), dtype=DTYPE)
         for _ in range(NUM_BLOCKS // BLOCKS_PER_CHUNK)
     ]
-    _transfer(
-        kv_first,
+    multi_layer_block_kv_transfer(
+        [layer.squeeze(3) for layer in cpu_layers],
         expected,
+        list(range(NUM_BLOCKS)),
+        torch.device("cpu"),
         TransferDirection.D2H,
-        EngineKVFormat.NL_X_TWO_NB_NH_ONE_BS_HS,
         _shape_desc(kv_size=2, num_heads=NUM_HEADS, head_size=HEAD_SIZE),
+        CHUNK_TOKENS,
+        EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
+        0,
     )
 
-    cpu_layers = [t.transpose(0, 1).contiguous() for t in kv_first]
     block_ids = list(range(NUM_BLOCKS))
     paged = {f"layer.{i}": _bound_device_tensor(t) for i, t in enumerate(cpu_layers)}
     restored = {

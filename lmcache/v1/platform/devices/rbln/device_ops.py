@@ -16,9 +16,7 @@ the case that matters for cross-device KV sharing and PD disaggregation.
 
 For HND, what the override replaces is the shared path's strided device
 indexing: RBLN stores heads before block tokens, and the head<->token
-transpose is hoisted to the host. That holds for both HND layouts vLLM-RBLN
-allocates -- K/V-first (``NL_X_TWO_NB_NH_ONE_BS_HS``) and blocks-first
-(``NL_X_NB_TWO_NH_ONE_BS_HS``, the default attention kernels' layout). The MLA
+transpose is hoisted to the host. The MLA
 layout (``NL_X_NB_BS_HS``, single
 latent plane, no head axis) has no transpose to hoist; its RBLN sequence in
 :mod:`kv_ops` exists for the DMA shape. The shared torch path issues one
@@ -53,16 +51,13 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.platform.base.device_ops import DeviceOps
 from lmcache.v1.platform.devices.rbln.kv_layout import (
-    squeeze_blocks_first_singleton_axis,
     squeeze_singleton_axis,
     validate_mla_layers,
 )
 from lmcache.v1.platform.devices.rbln.kv_ops import (
     gather_blocks_to_chunk_hnd,
-    gather_blocks_to_chunk_hnd_blocks_first,
     gather_blocks_to_chunk_mla,
     scatter_chunk_to_blocks_hnd,
-    scatter_chunk_to_blocks_hnd_blocks_first,
     scatter_chunk_to_blocks_mla,
 )
 from lmcache.v1.platform.ops_types import PageBufferShapeDesc
@@ -94,9 +89,8 @@ class RblnDeviceOps(DeviceOps):
 
         Args:
             paged_buffer_ptrs_tensor: Per-layer KV tensors --
-                ``[2, NB, NH, 1, BS, HS]`` (K/V-first HND),
-                ``[NB, 2, NH, 1, BS, HS]`` (blocks-first HND), ``[NB, BS, HS]``
-                (MLA), or any layout the shared torch path supports.
+                ``[NB, 2, NH, 1, BS, HS]`` (HND), ``[NB, BS, HS]`` (MLA), or
+                any layout the shared torch path supports.
             lmcache_objects_ptrs: Staging chunks in the canonical token-major
                 layout -- ``[2, L, T, H*D]`` (HND) or ``[L, T, HS]`` (MLA).
             block_ids: Flat paged-block IDs in chunk-token order.
@@ -147,19 +141,17 @@ class RblnDeviceOps(DeviceOps):
                 gather_blocks_to_chunk_mla,
                 scatter_chunk_to_blocks_mla,
             )
-        elif spec.is_layer_list and spec.is_hnd and not spec.is_fused_packed:
-            if spec.is_two_major:
-                prepare, gather, scatter = (
-                    squeeze_singleton_axis,
-                    gather_blocks_to_chunk_hnd,
-                    scatter_chunk_to_blocks_hnd,
-                )
-            else:
-                prepare, gather, scatter = (
-                    squeeze_blocks_first_singleton_axis,
-                    gather_blocks_to_chunk_hnd_blocks_first,
-                    scatter_chunk_to_blocks_hnd_blocks_first,
-                )
+        elif (
+            spec.is_layer_list
+            and spec.is_hnd
+            and not spec.is_two_major
+            and not spec.is_fused_packed
+        ):
+            prepare, gather, scatter = (
+                squeeze_singleton_axis,
+                gather_blocks_to_chunk_hnd,
+                scatter_chunk_to_blocks_hnd,
+            )
         else:
             super().multi_layer_block_kv_transfer(
                 paged_buffer_ptrs_tensor,
