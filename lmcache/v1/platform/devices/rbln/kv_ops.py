@@ -73,14 +73,6 @@ def _host_staging(
     return buf[:n_blocks]
 
 
-#: Pairs each contiguous run of the paged blocks with its host staging slot,
-#: returning ``(paged, host)`` views in matching order.
-_BlockPairer = Callable[
-    [Sequence[torch.Tensor], Sequence[int], torch.Tensor],
-    tuple[list[torch.Tensor], list[torch.Tensor]],
-]
-
-
 def _hnd_block_pairs(
     paged_layers: Sequence[torch.Tensor],
     block_ids: Sequence[int],
@@ -205,9 +197,14 @@ def _gather_hnd(
     paged_layers: Sequence[torch.Tensor],
     block_ids: Sequence[int],
     dst: torch.Tensor,
-    pair_blocks: _BlockPairer,
+    pair_blocks: Callable[..., tuple[list[torch.Tensor], list[torch.Tensor]]],
 ) -> None:
-    """Gather HND paged blocks into ``dst`` via the host staging buffer."""
+    """Gather HND paged blocks into ``dst`` via the host staging buffer.
+
+    ``pair_blocks`` is the layout's pairer (``_hnd_block_pairs`` or
+    ``_hnd_kv_first_block_pairs``): it matches each contiguous run of the
+    paged blocks with its staging slot, as ``(paged, host)`` views.
+    """
     # Both HND layouts carry NH, BS, HS on their trailing three axes.
     num_heads, block_size, head_size = paged_layers[0].shape[2:]
     n_blocks = len(block_ids)
@@ -235,9 +232,12 @@ def _scatter_hnd(
     block_ids: Sequence[int],
     src: torch.Tensor,
     skip_prefix_n_blocks: int,
-    pair_blocks: _BlockPairer,
+    pair_blocks: Callable[..., tuple[list[torch.Tensor], list[torch.Tensor]]],
 ) -> None:
-    """Scatter ``src`` into HND paged blocks via the host staging buffer."""
+    """Scatter ``src`` into HND paged blocks via the host staging buffer.
+
+    ``pair_blocks`` is as in :func:`_gather_hnd`.
+    """
     num_heads, block_size, head_size = paged_layers[0].shape[2:]
     n_blocks = len(block_ids)
     start = min(skip_prefix_n_blocks, n_blocks)
