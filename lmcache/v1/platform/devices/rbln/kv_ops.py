@@ -121,8 +121,7 @@ def gather_blocks_to_chunk_hnd(
     """Gather whole HND paged blocks into a token-major chunk.
 
     Args:
-        paged_layers: Per-layer HND KV tensors, each contiguous
-            ``[NB, 2, NH, BS, HS]``.
+        paged_layers: Per-layer HND KV tensors, each ``[NB, 2, NH, BS, HS]``.
         block_ids: Blocks to gather, in chunk-token order.
         dst: Chunk shaped ``[2, L, T, H*D]``. Only its leading
             ``len(block_ids) * BS`` tokens are written, so a trailing chunk
@@ -160,8 +159,7 @@ def scatter_chunk_to_blocks_hnd(
     """Scatter a token-major chunk back into whole HND paged blocks.
 
     Args:
-        paged_layers: Per-layer HND KV tensors, each contiguous
-            ``[NB, 2, NH, BS, HS]``.
+        paged_layers: Per-layer HND KV tensors, each ``[NB, 2, NH, BS, HS]``.
         block_ids: Destination blocks, in chunk-token order.
         src: Chunk shaped ``[2, L, T, H*D]``. Only the token windows the
             blocks map to are read, so a trailing chunk holding fewer blocks
