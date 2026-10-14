@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NL_X_NB_BSV_BSS through the torch fallback block transfer.
+"""NL_X_NB_BSV_BSS through the torch fallback transfers.
 
 A blocked-scale page stores, per block, all tokens' values and then all
 tokens' 4-byte scales, while LMCache chunk rows are token-major
@@ -31,6 +31,19 @@ def _blocked_write(page: torch.Tensor, slot: int, row: torch.Tensor) -> None:
     flat[offset * _VALS : (offset + 1) * _VALS] = row[:_VALS]
     scale_base = _BS * _VALS
     flat[scale_base + offset * 4 : scale_base + (offset + 1) * 4] = row[_VALS:]
+
+
+def _blocked_read(page: torch.Tensor, slot: int) -> torch.Tensor:
+    """Read one token's row back out of the blocked page layout."""
+    block, offset = divmod(slot, _BS)
+    flat = page[block].view(-1)
+    scale_base = _BS * _VALS
+    return torch.cat(
+        [
+            flat[offset * _VALS : (offset + 1) * _VALS],
+            flat[scale_base + offset * 4 : scale_base + (offset + 1) * 4],
+        ]
+    )
 
 
 def _pages() -> list[torch.Tensor]:
@@ -73,6 +86,24 @@ def _block_transfer(
     )
 
 
+def _slot_transfer(
+    pages: list[torch.Tensor],
+    key_value: torch.Tensor,
+    slots: torch.Tensor,
+    direction: TransferDirection,
+) -> None:
+    torch_ops.multi_layer_kv_transfer(
+        key_value,
+        pages,
+        slots,
+        torch.device("cpu"),
+        _NB * _BS,
+        direction,
+        _FMT,
+        block_size=_BS,
+    )
+
+
 def test_block_transfer_gathers_token_major_rows() -> None:
     """D2H chunk rows are canonical; H2D writes them back to blocked slots."""
     block_ids = [4, 1, 3]
@@ -91,3 +122,25 @@ def test_block_transfer_gathers_token_major_rows() -> None:
     _block_transfer(dst, chunks, block_ids, TransferDirection.H2D)
     for layer in range(_NL):
         assert torch.equal(dst[layer], src[layer])
+
+
+def test_slot_transfer_round_trips_across_alignments() -> None:
+    """Rows gathered by slot land at a differently aligned destination."""
+    n_tokens = 10
+    rows = _rows(n_tokens)
+    src_slots = torch.arange(3, 3 + n_tokens)
+    src = _pages()
+    for layer in range(_NL):
+        for i, slot in enumerate(src_slots.tolist()):
+            _blocked_write(src[layer], slot, rows[layer, i])
+
+    key_value = torch.zeros(1, _NL, n_tokens, _ROW, dtype=torch.uint8)
+    _slot_transfer(src, key_value, src_slots, TransferDirection.D2H)
+    assert torch.equal(key_value[0], rows)
+
+    dst_slots = torch.arange(6, 6 + n_tokens)
+    dst = _pages()
+    _slot_transfer(dst, key_value, dst_slots, TransferDirection.H2D)
+    for layer in range(_NL):
+        got = torch.stack([_blocked_read(dst[layer], s) for s in dst_slots.tolist()])
+        assert torch.equal(got, rows[layer])

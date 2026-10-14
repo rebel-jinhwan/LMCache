@@ -11,7 +11,10 @@ from lmcache.lmcache_native import (
     EngineKVFormat,
     TransferDirection,
 )
-from lmcache.v1.platform.torch_ops._kv_format import _format_spec
+from lmcache.v1.platform.torch_ops._kv_format import (
+    _blocked_scale_views,
+    _format_spec,
+)
 from lmcache.v1.platform.torch_ops._tensor_from_ptr import (
     _copy_bytes_with_tensor,
     _get_copy_lib,
@@ -52,6 +55,8 @@ def multi_layer_kv_transfer(
             "HND layouts are not supported in the non-CUDA fallback. "
             "head_size parameter is required but not implemented in this path."
         )
+    # Blocked-scale pages address each token through its block, as in CUDA.
+    is_blocked_scale = format_spec.requires_blocked_scale_repacking
     # 1. Filter out invalid slots.
     #    valid_mask_kv:  on key_value.device, used to index key_value
     #    valid_slots:    on paged_memory_device, used to index paged_tensor
@@ -84,9 +89,9 @@ def multi_layer_kv_transfer(
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
 
-    # For layouts with K/V interleaved after the block axis, pre-compute
-    # block-level indices.
-    if has_interleaved_kv_blocks:
+    # For layouts with K/V interleaved after the block axis, and blocked-scale
+    # pages, pre-compute block-level indices.
+    if has_interleaved_kv_blocks or is_blocked_scale:
         block_indices = valid_slots // block_size
         block_offsets = valid_slots % block_size
 
@@ -115,7 +120,32 @@ def multi_layer_kv_transfer(
             )
 
         # --- B. Vectorized bulk data transfer. ---
-        if is_mla:
+        if is_blocked_scale:
+            # Paged layout : [num_blocks, block_size, hidden_size], each block
+            #                [BS x vals][BS x scales]
+            # key_value layout: [1, num_layers, num_tokens, hidden_size]
+            vals, scales = _blocked_scale_views(
+                paged_tensor.view(-1, block_size, hidden_size)
+            )
+            val_units = vals.shape[-1]
+            if int(direction) == int(TransferDirection.H2D):
+                lmc_valid = key_value[0, layer_id, valid_mask_kv, :].to(
+                    paged_tensor.device
+                )
+                vals[block_indices, block_offsets] = lmc_valid[:, :val_units]
+                scales[block_indices, block_offsets] = lmc_valid[:, val_units:]
+            else:
+                gathered = torch.cat(
+                    (
+                        vals[block_indices, block_offsets],
+                        scales[block_indices, block_offsets],
+                    ),
+                    dim=-1,
+                )
+                key_value[0, layer_id, valid_mask_kv, :] = gathered.to(
+                    kv_device, non_blocking=False
+                )
+        elif is_mla:
             # Paged layout : [page_buffer_size, hidden_size]
             # key_value layout: [1, num_layers, num_tokens, hidden_size]
             if int(direction) == int(TransferDirection.H2D):
