@@ -195,11 +195,13 @@ def _gather_hnd(
     paged_layers: Sequence[torch.Tensor],
     block_ids: Sequence[int],
     dst: torch.Tensor,
-    pair_blocks: Callable[..., tuple[list[torch.Tensor], list[torch.Tensor]]],
+    pair_paged_with_staging: Callable[
+        ..., tuple[list[torch.Tensor], list[torch.Tensor]]
+    ],
 ) -> None:
     """Gather HND paged blocks into ``dst`` via the host staging buffer.
 
-    ``pair_blocks`` is the layout's pairer (``_hnd_block_pairs`` or
+    ``pair_paged_with_staging`` is the layout's pairer (``_hnd_block_pairs`` or
     ``_hnd_kv_first_block_pairs``): it matches each contiguous run of the
     paged blocks with its staging slot, as ``(paged, host)`` views.
     """
@@ -213,7 +215,7 @@ def _gather_hnd(
         (len(paged_layers), 2, num_heads, block_size, head_size),
         paged_layers[0].dtype,
     )
-    paged, host = pair_blocks(paged_layers, block_ids, staged)
+    paged, host = pair_paged_with_staging(paged_layers, block_ids, staged)
     torch._foreach_copy_(host, paged)
     # Both splits stay views; reshape() would not, and would rebuild the very
     # chunk-sized temporary this buffer exists to avoid.
@@ -230,11 +232,13 @@ def _scatter_hnd(
     block_ids: Sequence[int],
     src: torch.Tensor,
     skip_prefix_n_blocks: int,
-    pair_blocks: Callable[..., tuple[list[torch.Tensor], list[torch.Tensor]]],
+    pair_paged_with_staging: Callable[
+        ..., tuple[list[torch.Tensor], list[torch.Tensor]]
+    ],
 ) -> None:
     """Scatter ``src`` into HND paged blocks via the host staging buffer.
 
-    ``pair_blocks`` is as in :func:`_gather_hnd`.
+    ``pair_paged_with_staging`` is as in :func:`_gather_hnd`.
     """
     num_heads, block_size, head_size = paged_layers[0].shape[2:]
     n_blocks = len(block_ids)
@@ -257,7 +261,9 @@ def _scatter_hnd(
     # staged [B, L, 2, H, BS, D] -> [2, L, B, BS, H, D], matching by_block.
     staged.permute(2, 1, 0, 4, 3, 5).copy_(by_block)
 
-    paged, host = pair_blocks(paged_layers, list(block_ids)[start:n_blocks], staged)
+    paged, host = pair_paged_with_staging(
+        paged_layers, list(block_ids)[start:n_blocks], staged
+    )
     torch._foreach_copy_(paged, host)
 
 
