@@ -579,6 +579,9 @@ def _store_hook_engine(stored_mask):
 
     eng = MagicMock(spec=BlendModule)
     eng.store = BlendModule.store.__get__(eng)
+    eng._enqueue_stored_fingerprints = BlendModule._enqueue_stored_fingerprints.__get__(
+        eng
+    )
     eng._transfer_module = MagicMock()
     eng._transfer_module.store_with_chunk_mask.return_value = (
         b"evt",

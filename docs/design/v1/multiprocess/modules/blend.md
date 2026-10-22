@@ -7,14 +7,18 @@ multiprocess server.
 
 ```text
 blend/
-├── module.py            BlendModule: mixin composition, __init__ (all state),
-│                        get_handlers, protocol handshake, liveness, close
+├── module.py            BlendModuleBase: transfer-neutral state, handshake,
+│                        reorder, stash take, applied-range LRU, close;
+│                        BlendModule: the LMCache-driven composition
+├── engine_driven.py     EngineDrivenBlendModule — COMMIT_STORE shadow +
+│                        CB_PREPARE_RETRIEVE / CB_COMMIT_RETRIEVE
 ├── lookup.py            LookupMixin — CB_UNIFIED_LOOKUP FSM: prefix leg,
 │                        local fingerprint match, coordinator leg, sparse leg
 ├── registration.py      RegistrationMixin — CB_(UN)REGISTER_ROPE (rope
 │                        state attach/detach)
-├── store.py             StoreMixin — the STORE shadow: async fingerprint
-│                        registration + drainers
+├── store.py             FingerprintMixin — fingerprint jobs from a store's
+│                        committed-chunk mask + drainers; StoreMixin — the
+│                        STORE shadow
 ├── retrieve.py          RetrieveMixin — CB_RETRIEVE_PRE_COMPUTED: planning
 │                        section (invariant specs + flat int64 work tables)
 │                        first, then the handler
@@ -28,7 +32,9 @@ blend/
 
 The pure modules have no server context, streams, or event bus — they are
 CPU-testable by import. All mutable state is created in
-`BlendModule.__init__`; mixin methods share it on `self`.
+`BlendModuleBase.__init__` and the concrete module's `__init__`; mixin
+methods share it on `self`. The worker half of the engine-driven retrieve
+lives in `lmcache/v1/multiprocess/transfer_context/blend_scatter.py`.
 
 ## Wire contract
 
@@ -42,6 +48,8 @@ change requires a **new operation name**, never a changed existing contract.
 | `CB_UNREGISTER_ROPE` | `(instance_id)` → `None` | KV cache stays registered |
 | `CB_UNIFIED_LOOKUP` | `(key, tp_size)` → `CBUnifiedLookupResult \| None` | submit-once / poll-on-recall; `None` = defer, client re-issues |
 | `CB_RETRIEVE_PRE_COMPUTED` | `(key, matches[], gpu_block_ids[][], instance_id, event_ipc)` → `(event_ipc, scatter_ran)` | event is server-recorded; may be called more than once per request |
+| `CB_PREPARE_RETRIEVE` | `(key, matches[], block_ids[][], instance_id)` → `CBPrepareRetrieveResponse` | engine-driven only; a response with `matches` holds read locks until the commit |
+| `CB_COMMIT_RETRIEVE` | `(key, instance_id, scattered)` → `bool` | engine-driven only; releases the locks, records applied ranges if `scattered` |
 | `CB_REORDER_PLAN` | `(key, keep_prefix, budget_ms)` → `list[int]` | opt-in (`--enable-blend-reorder`, no coordinator); best-effort: `[]` = keep the prompt (off, no gain, out of budget, any error); else `key.token_ids` reordered, first `keep_prefix` tokens in place; the server never changes a request |
 | `CB_PROTOCOL_HANDSHAKE` | `(client_version)` → `(server_version, compatible)` | client-gated by `cb.handshake`, default off |
 
@@ -158,6 +166,56 @@ worker re-import it (CUDA "invalid device context").
 Repeat calls are keyed by the destination blocks each range writes into
 (bounded LRU per `(request, worker)`): block-table growth keeps a range
 applied, a reassigned destination re-scatters.
+
+## Engine-driven path (`EngineDrivenBlendModule`)
+
+Devices without cross-process device memory and events (CPU, RBLN, and the
+other engine-driven backends) cannot take `CB_RETRIEVE_PRE_COMPUTED`: the
+server never touches the worker's KV. With `--engine-type blend
+--supported-transfer-mode engine_driven` the server composes
+`EngineDrivenBlendModule` instead of `BlendModule`. Both share
+`BlendModuleBase` — the matcher, `CB_UNIFIED_LOOKUP`, `CB_REORDER_PLAN`, the
+handshake, the stash, and the applied-range LRU — so only the transfer half
+differs. `auto` keeps serving blend on the LMCache-driven path: one module
+owns the matcher.
+
+| Concern | LMCache-driven (`BlendModule`) | Engine-driven (`EngineDrivenBlendModule`) |
+|---|---|---|
+| Fingerprint source | `STORE` shadow, enqueue stream-ordered after the L1 commit | `COMMIT_STORE` shadow, enqueue after the synchronous commit |
+| Re-RoPE geometry | `CB_REGISTER_ROPE` (cos/sin cache over device IPC) | worker-local `CBRopeSpec`; no RPC |
+| Retrieve | one RPC; server runs the CUDA plan | `CB_PREPARE_RETRIEVE` → worker scatter → `CB_COMMIT_RETRIEVE` |
+| Completion | server-recorded IPC event | the commit's synchronous return |
+
+```text
+worker (EngineDrivenTransferContext.submit_cb_retrieve)          server
+  cb_prepare_retrieve(key, matches, block_ids, instance_id) ──▶ sort, applied-range
+                                                                filter, alloc gates,
+                                                                take stash, unsafe_read,
+  ◀── CBPrepareRetrieveResponse(scatter_ran, matches,          export via the instance's
+                                data | context["slots"])       SHM / pickle transport
+  scatter_cb_matches_to_paged_kv(...)                           (read locks held)
+    1. D2H the destination blocks a match covers only partly
+    2. host: copy each match's rows, K-only re-RoPE the shifted
+    3. H2D the staging chunk as whole blocks
+  cb_commit_retrieve(key, instance_id, scattered) ─────────────▶ release 1 lock per key;
+  ◀── scattered                                                 record applied ranges
+                                                                only if scattered
+```
+
+The scatter uses only `DeviceOps.multi_layer_block_kv_transfer`, which
+every engine-driven device implements, so no device needs a blend kernel.
+The cost is a read-back of the partly covered destination blocks (at most
+two per run of adjacent matches) and host-side re-RoPE in fp32
+(`torch_ops.pos_kernels`).
+
+Rules carried over unchanged: matches are scattered all-or-nothing, the
+`MATCHES_BEYOND_ALLOC` / `MATCHES_STRADDLE_ALLOC` / `ALREADY_APPLIED` /
+`NO_OBJECT_KEYS` outcomes keep their wire bools, and a response with no
+`matches` holds no locks (the worker sends no commit). A prepared retrieve
+whose commit never arrives is released by the next prepare for the same
+`(instance, request, worker)`, by `drop_instance_state` when the instance
+is reaped, or by `close`. Engine-driven transfer has one KV group, so the
+read set is object group 0.
 
 ## Reorder planner (`CB_REORDER_PLAN`, opt-in)
 

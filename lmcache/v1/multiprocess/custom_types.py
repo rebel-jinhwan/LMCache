@@ -269,6 +269,30 @@ class CBUnifiedLookupResult:
     segmented_prefix_segments: list[CBMatchResult] = field(default_factory=list)
 
 
+@dataclass
+class CBPrepareRetrieveResponse:
+    """Resolved payload of ``CB_PREPARE_RETRIEVE`` (engine-driven blend).
+
+    The server picks the matches the worker must scatter and exports their
+    chunks through the instance's engine-driven transport: SHM slot
+    descriptors in ``context["slots"]``, or a pickled chunk list in ``data``.
+
+    Attributes:
+        scatter_ran: The wire bool of ``CB_RETRIEVE_PRE_COMPUTED``: ``False``
+            means the client must degrade the request to full recompute.
+        matches: The matches to scatter, ``cur_st`` order, one exported chunk
+            each. Empty when nothing is scattered this call; the worker then
+            sends no ``CB_COMMIT_RETRIEVE``.
+        data: Pickled ``list[torch.Tensor]`` chunks (pickle transport).
+        context: ``{"slots": [...]}`` SHM slot descriptors (SHM transport).
+    """
+
+    scatter_ran: bool
+    matches: list[CBMatchResult] = field(default_factory=list)
+    data: bytes = b""
+    context: dict = field(default_factory=dict)
+
+
 _CUSTOMERIZED_SERIALIZERS = {
     DeviceIPCWrapper: CustomizedSerdeConfig(
         serializer=DeviceIPCWrapper.Serialize,

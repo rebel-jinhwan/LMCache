@@ -32,7 +32,11 @@ from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import (
+    CBMatchResult,
+    CBPrepareRetrieveResponse,
+    IPCCacheServerKey,
+)
 from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.platform import resolve_device_ops, synchronize_device
 import lmcache.lmcache_native as lmcache_native
@@ -154,6 +158,72 @@ class EngineDrivenContext(ABC):
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
         """Commit retrieve. Pickle: no-op. Shm: release read locks."""
         ...
+
+    @abstractmethod
+    def decode_read_payload(self, data: bytes, context: dict) -> list[torch.Tensor]:
+        """Turn a server read export into chunk tensors.
+
+        Args:
+            data: Pickled chunk list (pickle transport).
+            context: ``{"slots": [...]}`` SHM slot descriptors (SHM transport).
+
+        Returns:
+            One chunk tensor per exported object, in export order.
+        """
+        ...
+
+    def prepare_cb_retrieve(
+        self,
+        key: IPCCacheServerKey,
+        matches: list[CBMatchResult],
+        block_ids: list[list[int]],
+        instance_id: int,
+    ) -> tuple[CBPrepareRetrieveResponse, list[torch.Tensor]]:
+        """Send CB_PREPARE_RETRIEVE and decode the exported match chunks.
+
+        Args:
+            key: The request key.
+            matches: The lookup's matches.
+            block_ids: The request's block table, one engine group.
+            instance_id: Worker instance identifier.
+
+        Returns:
+            The server response and one chunk per ``response.matches``.
+
+        Raises:
+            TimeoutError: If the server does not answer within
+                ``mq_timeout``.
+        """
+        response = self.req_client.cb_prepare_retrieve(
+            key, matches, block_ids, instance_id
+        ).result(timeout=self.mq_timeout)
+        if not response.matches:
+            return response, []
+        return response, self.decode_read_payload(response.data, response.context)
+
+    def commit_cb_retrieve(
+        self, key: IPCCacheServerKey, instance_id: int, scattered: bool
+    ) -> bool:
+        """Send CB_COMMIT_RETRIEVE, releasing the prepared read locks.
+
+        Args:
+            key: The request key the retrieve was prepared with.
+            instance_id: Worker instance identifier.
+            scattered: Whether every prepared match was written.
+
+        Returns:
+            The server's answer: ``scattered``, or ``False`` if it held no
+            prepared retrieve for the key.
+
+        Raises:
+            TimeoutError: If the server does not answer within
+                ``mq_timeout``.
+        """
+        return bool(
+            self.req_client.cb_commit_retrieve(key, instance_id, scattered).result(
+                timeout=self.mq_timeout
+            )
+        )
 
     @abstractmethod
     def close(self) -> None:

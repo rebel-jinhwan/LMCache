@@ -30,7 +30,7 @@ from lmcache.v1.multiprocess.custom_types import (
     RegisterEngineDrivenContextResponse,
 )
 from lmcache.v1.multiprocess.ext_server_module import ExtServerModuleRouter
-from lmcache.v1.multiprocess.modules.blend import BlendModule
+from lmcache.v1.multiprocess.modules.blend import BlendModule, EngineDrivenBlendModule
 from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
     EngineDrivenTransferModule,
 )
@@ -80,10 +80,13 @@ _GRPC_MODULE_TYPES = (
     EngineDrivenTransferModule,
     QStoreModule,
     BlendModule,
+    EngineDrivenBlendModule,
     ExtServerModuleRouter,
 )
 
 _GRPC_SERVICE_NAME_OVERRIDES = {
+    # Both blend modules serve BlendService; each handles its transfer path.
+    EngineDrivenBlendModule: "BlendService",
     EngineDrivenTransferModule: "EngineDrivenService",
     LMCacheDrivenTransferModule: "LMCacheDrivenService",
     P2PController: "P2PService",

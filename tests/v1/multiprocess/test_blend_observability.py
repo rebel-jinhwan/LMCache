@@ -292,6 +292,7 @@ class TestFingerprintJobTuple:
         ]
 
         eng._fingerprint_queue = Queue()
+        eng._enqueue_stored_fingerprints = _bind(eng, "_enqueue_stored_fingerprints")
         key = SimpleNamespace(
             request_id="req-store",
             worker_id=0,

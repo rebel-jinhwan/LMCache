@@ -89,5 +89,10 @@ class EngineDrivenContextPickle(EngineDrivenContext):
             pass
         return True
 
+    def decode_read_payload(self, data: bytes, context: dict) -> list[torch.Tensor]:
+        """Unpickle the exported chunk list."""
+        chunks: list[torch.Tensor] = pickle.loads(data)
+        return chunks
+
     def close(self) -> None:
         """No-op: the pickle path holds no persistent resources."""

@@ -208,6 +208,10 @@ class EngineDrivenContextShm(EngineDrivenContext):
         except TimeoutError:
             return False
 
+    def decode_read_payload(self, data: bytes, context: dict) -> list[torch.Tensor]:
+        """View the exported SHM slots as chunk tensors (no copy)."""
+        return self._build_slot_tensors(context["slots"])
+
     def close(self) -> None:
         if self._shm is None:
             return

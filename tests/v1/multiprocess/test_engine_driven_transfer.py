@@ -1548,6 +1548,66 @@ def test_server_store_and_retrieve_cpu_chunks(
     assert torch.allclose(recovered_chunks[0], payload)
 
 
+def test_server_commit_store_with_chunk_mask_marks_written_chunks(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Only chunks this commit wrote are marked; a chunk the storage manager
+    did not reserve (already stored) is not."""
+    mock_storage = MagicMock()
+    written = MagicMock()
+    written.tensor = torch.zeros(2, 2, 8, 16)
+    mock_storage.reserve_write.return_value = {"b": written}
+    module, _, _, _ = server_module_factory(
+        mock_storage=mock_storage, object_keys=["a", "b"]
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=2)
+    )
+    chunks = [torch.ones(2, 2, 8, 16), torch.full((2, 2, 8, 16), 2.0)]
+
+    success, mask = module.commit_store_with_chunk_mask(
+        _default_key(16), 2, pickle.dumps(chunks)
+    )
+
+    assert success is True
+    assert mask == [False, True]
+    assert torch.equal(written.tensor, chunks[1])
+
+
+def test_server_export_read_objects_uses_the_instance_transport(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """On the pickle transport the objects come back as pickled CPU copies."""
+    module, _, _, _ = server_module_factory()
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=2)
+    )
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.arange(8.0)
+
+    response = module.export_read_objects(2, [memory_obj])
+
+    assert response.success is True
+    (chunk,) = pickle.loads(response.data)
+    assert torch.equal(chunk, memory_obj.tensor)
+
+
+def test_server_get_block_size_requires_a_registration(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    module, _, _, _ = server_module_factory()
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=2)
+    )
+
+    assert module.get_block_size(2) == 4
+    with pytest.raises(ValueError, match="not registered"):
+        module.get_block_size(9)
+
+
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,

@@ -12,6 +12,7 @@ from lmcache.v1.gpu_connector.kv_format.types import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     CBMatchResult,
+    CBPrepareRetrieveResponse,
     CBUnifiedLookupResult,
     DeviceIPCWrapper,
     IPCCacheServerKey,
@@ -197,6 +198,20 @@ class RequestClient(Protocol):
         instance_id: int,
         event_ipc_handle: bytes,
     ) -> MessagingFuture[tuple[bytes, bool]]: ...
+
+    @rpc_method
+    def cb_prepare_retrieve(
+        self,
+        key: IPCCacheServerKey,
+        match_results: list[CBMatchResult],
+        block_ids: list[list[int]],
+        instance_id: int,
+    ) -> MessagingFuture[CBPrepareRetrieveResponse]: ...
+
+    @rpc_method
+    def cb_commit_retrieve(
+        self, key: IPCCacheServerKey, instance_id: int, scattered: bool
+    ) -> MessagingFuture[bool]: ...
 
     @rpc_method
     def cb_unified_lookup(

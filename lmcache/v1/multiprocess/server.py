@@ -214,8 +214,7 @@ def _build_server_components(
         Initialized modules and transport-specific service registrars.
 
     Raises:
-        ValueError: If blend engine is requested with
-        supported_transfer_mode="engine_driven".
+        ValueError: If ``supported_transfer_mode`` is unknown.
     """
     lookup_module = LookupModule(
         ctx,
@@ -259,21 +258,15 @@ def _build_server_components(
 
     blend_module: EngineModule | None = None
     if mp_config.engine_type == "blend":
-        if mp_config.supported_transfer_mode == "engine_driven":
-            raise ValueError(
-                "blend engine requires supported_transfer_mode "
-                f"'lmcache_driven' or 'auto', got "
-                f"'{mp_config.supported_transfer_mode}'"
-            )
         # First Party
         from lmcache.v1.mp_coordinator.blend_client import (
             BlendCoordinatorClient,
         )
-        from lmcache.v1.multiprocess.modules.blend import BlendModule
-
-        transfer_module = next(
-            m for m in transfer_modules if isinstance(m, LMCacheDrivenTransferModule)
+        from lmcache.v1.multiprocess.modules.blend import (
+            BlendModule,
+            EngineDrivenBlendModule,
         )
+
         # Opt-in: enabled when a coordinator URL is configured (flag or
         # LMCACHE_COORDINATOR_URL, resolved at config parsing); otherwise
         # None and the blend module matches purely locally.
@@ -293,17 +286,39 @@ def _build_server_components(
             timeout=coordinator_config.blend_timeout,
             match_concurrency=coordinator_config.blend_match_concurrency,
         )
-        blend = BlendModule(
-            ctx,
-            transfer_module,
-            coordinator=coordinator,
-            enable_segmented_prefix=mp_config.enable_segmented_prefix,
-            enable_dedup_content=mp_config.enable_dedup_content,
-            enable_reorder=mp_config.enable_blend_reorder,
-        )
+        blend: BlendModule | EngineDrivenBlendModule
+        if mp_config.supported_transfer_mode == "engine_driven":
+            engine_driven = next(
+                m for m in transfer_modules if isinstance(m, EngineDrivenTransferModule)
+            )
+            blend = EngineDrivenBlendModule(
+                ctx,
+                engine_driven,
+                coordinator=coordinator,
+                enable_segmented_prefix=mp_config.enable_segmented_prefix,
+                enable_dedup_content=mp_config.enable_dedup_content,
+                enable_reorder=mp_config.enable_blend_reorder,
+            )
+        else:
+            # 'auto' serves blend on the LMCache-driven path only: one blend
+            # module owns the fingerprint matcher and its store shadow.
+            lmcache_driven = next(
+                m
+                for m in transfer_modules
+                if isinstance(m, LMCacheDrivenTransferModule)
+            )
+            blend = BlendModule(
+                ctx,
+                lmcache_driven,
+                coordinator=coordinator,
+                enable_segmented_prefix=mp_config.enable_segmented_prefix,
+                enable_dedup_content=mp_config.enable_dedup_content,
+                enable_reorder=mp_config.enable_blend_reorder,
+            )
         blend_module = blend
-        # The blend module mirrors per-instance CB rope state, so the reaper
-        # must notify it via drop_instance_state when an instance is reaped.
+        # The blend module mirrors per-instance state (CB rope state, or a
+        # prepared retrieve's read locks), so the reaper must notify it via
+        # drop_instance_state when an instance is reaped.
         liveness_targets.append(blend)
 
     # Experimental intermediate tensor transfer modules

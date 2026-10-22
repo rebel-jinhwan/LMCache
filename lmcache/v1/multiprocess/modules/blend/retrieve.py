@@ -33,7 +33,6 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.modules.blend.read_set import (
     _BlendReadGroups,
-    _cb_chunk_major_object_keys,
     _classify_cb_read_groups,
 )
 from lmcache.v1.multiprocess.modules.blend.rope import (
@@ -115,6 +114,19 @@ class RetrieveMixin:
         _cb_plan_done_events: "weakref.WeakKeyDictionary[Any, _DeviceEvent]"
         _cb_retrieve_streams: "weakref.WeakKeyDictionary[Any, Any]"
         _cb_retrieve_cupy_streams: "weakref.WeakKeyDictionary[Any, Any]"
+
+        def _take_cb_read_keys(
+            self,
+            key: IPCCacheServerKey,
+            matches: list[CBMatchResult],
+            read_gids: tuple[int, ...],
+        ) -> "tuple[list[ObjectKey], dict[ObjectKey, int] | None]": ...
+
+        def _record_applied_ranges(
+            self,
+            key: IPCCacheServerKey,
+            applied_now: "set[tuple[bytes, int, int, tuple]]",
+        ) -> None: ...
 
     def _cb_staged_groups(
         self, gpu_context: BaseCacheContext
@@ -748,61 +760,9 @@ class RetrieveMixin:
                     f"/{len(cb_match_result)} match(es) beyond "
                     f"slot_bound={slot_bound}",
                 )
-        # L2 opt: take the lookup's obj_keys stash (once; later calls
-        # re-resolve). ``get``, not ``get_or_create``: a retrieve after
-        # session end must not recreate ownership state.
-        session = self._ctx.session_manager.get(key.request_id)
-        _stash = (
-            session.extras.pop(self.UNRETRIEVED_KEYS_EXTRA, None)
-            if session is not None
-            else None
+        all_obj_keys, l1_owners = self._take_cb_read_keys(
+            key, cb_match_result, read_groups.blend_gids
         )
-        cached = _stash["per_hash"] if _stash else None
-        stash_read_locks = _stash["read_locks"] if _stash else 1
-        l1_owners = (
-            _stash.get("l1_owners")
-            if _stash
-            else session.extras.get("cb.sparse_l1_owners")
-            if session
-            else None
-        )
-        if cached is not None and all(r.hash in cached for r in cb_match_result):
-            # The lookup cached all-ranks obj keys (group-major, rank-minor);
-            # select THIS rank's key per read group or TP>1 mispairs ranks.
-            if key.worker_id is not None and key.world_size > 1:
-                ws = key.world_size
-                all_obj_keys = [
-                    cached[r.hash][g * ws + key.worker_id]
-                    for r in cb_match_result
-                    for g in range(n_read)
-                ]
-            else:
-                all_obj_keys = [k for r in cb_match_result for k in cached[r.hash]]
-        else:
-            # One key per (hash, read group), chunk-major like the cached path.
-            all_obj_keys = _cb_chunk_major_object_keys(
-                key, [r.hash for r in cb_match_result], read_groups.blend_gids
-            )
-
-        # The connector may have dropped matches after the lookup read-locked
-        # the full found set; release those orphan locks now (disjoint from
-        # all_obj_keys, which retrieve still consumes).
-        if cached is not None:
-            retrieved_hashes = {r.hash for r in cb_match_result}
-            orphan_keys = [
-                k for h, ks in cached.items() if h not in retrieved_hashes for k in ks
-            ]
-            if orphan_keys:
-                # Nothing will read these keys: release every lock the lookup
-                # took (N per key).
-                self._ctx.storage_manager.finish_read_prefetched(
-                    orphan_keys, read_locks=stash_read_locks, l1_owners=l1_owners
-                )
-                logger.debug(
-                    "CB released %d prefetched-but-unretrieved keys (req=%s)",
-                    len(orphan_keys),
-                    key.request_id,
-                )
 
         # Non-prefix sparse hits split by re-rope need (not prefix coverage).
         n_non_shifted = sum(1 for r in cb_match_result if r.old_st == r.cur_st)
@@ -1103,16 +1063,7 @@ class RetrieveMixin:
                 ),
             )
 
-        # Record scattered ranges for the repeat-call guard (bounded LRU).
-        if applied_now:
-            applied_entry = applied_ranges.setdefault(applied_key, set())
-            applied_entry.update(applied_now)
-            applied_ranges.move_to_end(applied_key)
-            # One entry per (request, worker): scale the cap by world size to
-            # cover the same number of requests as at TP1.
-            cap = 4096 * max(1, int(key.world_size or 1))
-            while len(applied_ranges) > cap:
-                applied_ranges.popitem(last=False)
+        self._record_applied_ranges(key, applied_now)
 
         _scatter_ms = (time.perf_counter() - _retrieve_t0) * 1000
         logger.info(

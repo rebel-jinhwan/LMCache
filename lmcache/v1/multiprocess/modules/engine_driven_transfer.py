@@ -16,6 +16,7 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     PrepareRetrieveResponse,
@@ -430,26 +431,92 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no non-GPU context is registered for the given
                 instance ID.
         """
+        success, _ = self.commit_store_with_chunk_mask(key, instance_id, cpu_data)
+        return success
+
+    def commit_store_with_chunk_mask(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        cpu_data: bytes,
+    ) -> tuple[bool, list[bool]]:
+        """Commit serialized CPU chunks to storage and report which chunks
+        this call wrote.
+
+        Args:
+            key: Cache key for the token range to store.
+            instance_id: Worker instance identifier.
+            cpu_data: Pickled list of CPU tensors produced by the worker, or
+                ``b""`` for the SHM transport.
+
+        Returns:
+            ``(success, stored_mask)``: ``success`` as :meth:`commit_store`
+            reports it, and per chunk of ``key``'s range whether this call
+            committed it. Chunks already stored or not reservable are
+            ``False``.
+
+        Raises:
+            ValueError: If no non-GPU context is registered for the given
+                instance ID.
+        """
         entry, strategy = self._resolve_for_transfer(instance_id)
         session = self._ctx.session_manager.get_or_create(key.request_id)
         st = session.extras.pop("store_start_time", None)
-        result = strategy.commit_store(
+        success, committed_keys = strategy.commit_store(
             key=key,
             instance_id=instance_id,
             cpu_data=cpu_data,
             context=entry.metadata,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
         )
-        if st is not None and result:
-            num_tokens = (
-                len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
-            )
+        obj_keys = self._resolve_single_group_obj_keys(key)
+        if st is not None and success:
             logger.info(
                 "Stored %d tokens in %.3f seconds",
-                num_tokens,
+                len(obj_keys) * self._ctx.chunk_size,
                 time.perf_counter() - st,
             )
-        return result
+        committed = set(committed_keys)
+        return success, [obj_key in committed for obj_key in obj_keys]
+
+    def get_block_size(self, instance_id: int) -> int:
+        """Return the paged-block size the instance registered.
+
+        Args:
+            instance_id: Worker instance identifier.
+
+        Returns:
+            Tokens per paged block.
+
+        Raises:
+            ValueError: If no non-GPU context is registered for the given
+                instance ID.
+        """
+        entry, _ = self._resolve_for_transfer(instance_id)
+        return entry.metadata.block_size
+
+    def export_read_objects(
+        self, instance_id: int, memory_objs: list[MemoryObj]
+    ) -> PrepareRetrieveResponse:
+        """Expose read-locked objects to the worker through the instance's
+        transport (SHM slot descriptors, or pickled chunks).
+
+        The caller keeps the objects' read locks until the worker is done.
+
+        Args:
+            instance_id: Worker instance identifier.
+            memory_objs: Read-locked L1 objects, in consumption order.
+
+        Returns:
+            The transport payload; ``success=False`` if an object has no
+            tensor.
+
+        Raises:
+            ValueError: If no non-GPU context is registered for the given
+                instance ID.
+        """
+        _, strategy = self._resolve_for_transfer(instance_id)
+        return strategy.export_read_objects(memory_objs)
 
     @request_handler(
         HandlerType.BLOCKING,

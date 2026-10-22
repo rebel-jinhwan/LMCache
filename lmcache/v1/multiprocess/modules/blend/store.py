@@ -38,15 +38,17 @@ CB_FINGERPRINTS_KIND = "cb_fingerprints"
 FpJob = tuple[list[int], list[bytes], int, int, str]
 
 
-class StoreMixin:
-    """STORE fingerprint handlers of ``BlendModule``; state lives on the
-    composed instance."""
+class FingerprintMixin:
+    """Fingerprint registration shared by every blend store path: job
+    building from a store's committed-chunk mask, the prompt record for the
+    reorder planner, and the queue drainers. State lives on the composed
+    instance."""
 
     if TYPE_CHECKING:
-        # State owned by BlendModule.__init__; declared so the mixin type-checks.
+        # State owned by BlendModuleBase.__init__; declared so the mixin
+        # type-checks.
         _ctx: "MPCacheServerContext"
         _event_bus: Any
-        _transfer_module: "LMCacheDrivenTransferModule"
         _token_range_matcher: "BlendTokenRangeMatcher"
         _fingerprint_queue: "Queue[FpJob]"
         _fingerprint_stop: "threading.Event"
@@ -54,37 +56,28 @@ class StoreMixin:
         _pending_fp_lock: "threading.Lock"
         _prompt_store: Any
 
-    @request_handler(
-        HandlerType.BLOCKING,
-        requires_client_affinity=True,
-    )
-    def store(
+    def _enqueue_stored_fingerprints(
         self,
         key: IPCCacheServerKey,
-        instance_id: int,
-        gpu_block_ids: list[list[int]],
-        event_ipc_handle: bytes,
-    ) -> tuple[bytes, bool]:
-        """Paged store, then register the stored chunks as match fingerprints.
+        stored_mask: list[bool],
+        cupy_stream: Any,
+    ) -> None:
+        """Enqueue the committed chunks of one store for fingerprint
+        registration.
 
-        Delegates the KV write to ``LMCacheDrivenTransfer.store``, then
-        (worker 0 only) enqueues chunk hashes for async fingerprint
-        registration ordered after the L1 commit. Fingerprint failures are
-        logged, never raised — they do not affect store correctness.
+        Callers invoke it for worker 0 only: the matcher is engine-shared.
+        Never raises — a fingerprint failure does not affect store
+        correctness.
 
-        Returns:
-            The underlying ``LMCacheDrivenTransfer.store`` result
-            (event handle, success).
+        Args:
+            key: The store's key; ``[key.start, key.end)`` is the stored range.
+            stored_mask: Per chunk of the range, whether it was committed.
+                Only committed chunks are registered: a fingerprint for a
+                skipped chunk would advertise content that was never
+                persisted.
+            cupy_stream: Stream to order the enqueue after the L1 commit on,
+                or ``None`` when the commit already completed on the host.
         """
-        handle, store_ok, stored_mask = self._transfer_module.store_with_chunk_mask(
-            key, instance_id, gpu_block_ids, event_ipc_handle
-        )
-        result = (handle, store_ok)
-
-        # The matcher is engine-shared; only worker 0 registers.
-        if key.worker_id not in (0, None):
-            return result
-
         # Stream-ordered enqueue via the device host-func dispatcher: the
         # completion fires at this stream position (after the L1-commit
         # callback, else lookups drop the whole group as stale) without
@@ -101,7 +94,7 @@ class StoreMixin:
                 for h in session.get_hashes(key.start, key.end)
             ]
             if not chunk_hashes:
-                return result
+                return
             # Record prompts whose KV was stored, for the reorder planner.
             if getattr(self, "_prompt_store", None) is not None and any(stored_mask):
                 self._record_prompt(key, session)
@@ -137,18 +130,14 @@ class StoreMixin:
                     )
                 run_start = None
             if not jobs:
-                return result
+                return
 
             with self._pending_fp_lock:
                 for _, hashes, sci, _, _ in jobs:
                     self._pending_fp_hashes.update(hashes[sci:])
-            entry = self._transfer_module.get_and_touch_context_entry(instance_id)
-            gpu_ctx = entry.cache_context if entry is not None else None
             for job in jobs:
-                if gpu_ctx is not None and gpu_ctx.cupy_stream is not None:
-                    submit_callback_to_stream(
-                        gpu_ctx.cupy_stream, CB_FINGERPRINTS_KIND, job
-                    )
+                if cupy_stream is not None:
+                    submit_callback_to_stream(cupy_stream, CB_FINGERPRINTS_KIND, job)
                 else:
                     self._fingerprint_queue.put_nowait(job)
         except Exception:
@@ -157,8 +146,6 @@ class StoreMixin:
                 "(does not affect store correctness)",
                 key.request_id,
             )
-
-        return result
 
     def _record_prompt(self, key: IPCCacheServerKey, session: Any) -> None:
         """Remember a stored prompt for the reorder planner. The chain starts
@@ -243,3 +230,50 @@ class StoreMixin:
                     self._pending_fp_hashes.difference_update(
                         chunk_hashes[start_chunk_idx:]
                     )
+
+
+class StoreMixin:
+    """The LMCache-driven STORE shadow of ``BlendModule``; state lives on
+    the composed instance."""
+
+    if TYPE_CHECKING:
+        # State owned by BlendModule.__init__; declared so the mixin type-checks.
+        _transfer_module: "LMCacheDrivenTransferModule"
+
+        def _enqueue_stored_fingerprints(
+            self, key: IPCCacheServerKey, stored_mask: list[bool], cupy_stream: Any
+        ) -> None: ...
+
+    @request_handler(
+        HandlerType.BLOCKING,
+        requires_client_affinity=True,
+    )
+    def store(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        gpu_block_ids: list[list[int]],
+        event_ipc_handle: bytes,
+    ) -> tuple[bytes, bool]:
+        """Paged store, then register the stored chunks as match fingerprints.
+
+        Delegates the KV write to ``LMCacheDrivenTransfer.store``, then
+        (worker 0 only) enqueues chunk hashes for async fingerprint
+        registration ordered after the L1 commit. Fingerprint failures are
+        logged, never raised — they do not affect store correctness.
+
+        Returns:
+            The underlying ``LMCacheDrivenTransfer.store`` result
+            (event handle, success).
+        """
+        handle, store_ok, stored_mask = self._transfer_module.store_with_chunk_mask(
+            key, instance_id, gpu_block_ids, event_ipc_handle
+        )
+        # The matcher is engine-shared; only worker 0 registers.
+        if key.worker_id in (0, None):
+            entry = self._transfer_module.get_and_touch_context_entry(instance_id)
+            gpu_ctx = entry.cache_context if entry is not None else None
+            self._enqueue_stored_fingerprints(
+                key, stored_mask, gpu_ctx.cupy_stream if gpu_ctx is not None else None
+            )
+        return handle, store_ok

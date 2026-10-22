@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Blend (context-blend / cross-request KV reuse) package for MPCacheServer.
 
-The public surface is :class:`BlendModule`; the remaining re-exports keep
-the pre-split ``modules.blend`` import surface working for the existing
-tests until they are repointed at the submodules.
+The public surface is :class:`BlendModule` (LMCache-driven transfer) and
+:class:`EngineDrivenBlendModule` (engine-driven transfer); the remaining
+re-exports keep the pre-split ``modules.blend`` import surface working for
+the existing tests until they are repointed at the submodules.
 """
 
 # First Party
 # Legacy re-export: tests gate on the native plan via this module attribute.
 from lmcache import device_ops as device_ops
 from lmcache.v1.mp_coordinator.blend_client import PENDING as PENDING
+from lmcache.v1.multiprocess.modules.blend.engine_driven import (
+    EngineDrivenBlendModule,
+)
 from lmcache.v1.multiprocess.modules.blend.lookup import _CBUnifiedJob as _CBUnifiedJob
 from lmcache.v1.multiprocess.modules.blend.matcher import (
     BlendTokenRangeMatcher as BlendTokenRangeMatcher,
@@ -35,4 +39,4 @@ from lmcache.v1.multiprocess.modules.blend.rope import (
 )
 from lmcache.v1.multiprocess.modules.blend.rope import _CBRopeState as _CBRopeState
 
-__all__ = ["BlendModule"]
+__all__ = ["BlendModule", "EngineDrivenBlendModule"]

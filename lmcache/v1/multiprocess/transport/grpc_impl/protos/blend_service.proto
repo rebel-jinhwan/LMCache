@@ -43,6 +43,34 @@ message CbRetrievePreComputedResponse {
   EventIpcHandleResult result = 1;
 }
 
+message CbPrepareRetrieveRequest {
+  IpcCacheServerKey key = 1;
+  repeated CbMatchResult match_results = 2;
+  repeated BlockIdGroup block_ids = 3;
+  int64 instance_id = 4;
+}
+
+message CbPrepareRetrievePayload {
+  bool scatter_ran = 1;
+  repeated CbMatchResult matches = 2;
+  bytes data = 3;
+  bytes encoded_context = 4;
+}
+
+message CbPrepareRetrieveResponse {
+  CbPrepareRetrievePayload payload = 1;
+}
+
+message CbCommitRetrieveRequest {
+  IpcCacheServerKey key = 1;
+  int64 instance_id = 2;
+  bool scattered = 3;
+}
+
+message CbCommitRetrieveResponse {
+  bool success = 1;
+}
+
 message CbUnifiedLookupRequest {
   IpcCacheServerKey key = 1;
   int64 tp_size = 2;
@@ -95,6 +123,10 @@ service BlendService {
       returns (CbUnregisterRopeResponse);
   rpc CbRetrievePreComputed(CbRetrievePreComputedRequest)
       returns (CbRetrievePreComputedResponse);
+  rpc CbPrepareRetrieve(CbPrepareRetrieveRequest)
+      returns (CbPrepareRetrieveResponse);
+  rpc CbCommitRetrieve(CbCommitRetrieveRequest)
+      returns (CbCommitRetrieveResponse);
   rpc CbUnifiedLookup(CbUnifiedLookupRequest) returns (CbUnifiedLookupResponse);
   rpc CbReorderPlan(CbReorderPlanRequest) returns (CbReorderPlanResponse);
 }

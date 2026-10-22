@@ -25,6 +25,7 @@ from lmcache.v1.multiprocess.transfer_context.shm import ShmSlotDescriptor
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.distributed.storage_manager import StorageManager
+    from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
 
@@ -116,7 +117,7 @@ class TransferStrategy(abc.ABC):
         cpu_data: bytes,
         context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
-    ) -> bool:
+    ) -> tuple[bool, list[ObjectKey]]:
         """Finalize a store request.
 
         Args:
@@ -127,7 +128,10 @@ class TransferStrategy(abc.ABC):
             resolve_obj_keys: Callable that resolves object keys from ``key``.
 
         Returns:
-            ``True`` when the strategy successfully commits the store request.
+            ``(success, committed_keys)``: whether the strategy committed the
+            store request, and the object keys this call wrote. Keys skipped
+            because they were already stored, or could not be reserved, are
+            not in ``committed_keys``.
         """
 
     @abc.abstractmethod
@@ -146,6 +150,25 @@ class TransferStrategy(abc.ABC):
 
         Returns:
             Transport-specific retrieve preparation response.
+        """
+
+    @abc.abstractmethod
+    def export_read_objects(
+        self, memory_objs: "list[MemoryObj]"
+    ) -> PrepareRetrieveResponse:
+        """Expose read-locked objects to the worker through this transport.
+
+        The caller holds the objects' read locks until the worker is done
+        with the exported data.
+
+        Args:
+            memory_objs: Read-locked L1 objects, in the order the worker
+                consumes them.
+
+        Returns:
+            ``success=False`` if an object has no tensor; otherwise the
+            transport payload (pickled chunks in ``data``, or SHM slot
+            descriptors in ``context["slots"]``).
         """
 
     @abc.abstractmethod
@@ -207,11 +230,12 @@ class PickleTransferStrategy(TransferStrategy):
         cpu_data: bytes,
         context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
-    ) -> bool:
+    ) -> tuple[bool, list[ObjectKey]]:
         """Deserialize and write pickled chunks into reserved objects.
 
         Returns:
-            ``True`` when every reserved object is written successfully.
+            ``(success, written_keys)``: ``success`` is ``True`` when every
+            reserved object is written.
         """
         obj_keys = resolve_obj_keys(key)
         chunks: list[torch.Tensor] = pickle.loads(cpu_data)
@@ -275,7 +299,7 @@ class PickleTransferStrategy(TransferStrategy):
                 len(chunks),
                 len(written_keys),
             )
-        return success
+        return success, written_keys
 
     def prepare_retrieve(
         self,
@@ -299,21 +323,25 @@ class PickleTransferStrategy(TransferStrategy):
                 if not maybe_memory_objs or len(maybe_memory_objs) != len(obj_keys):
                     return PrepareRetrieveResponse(success=False, data=b"", context={})
                 prefetched_keys = obj_keys[: len(maybe_memory_objs)]
-                chunks = []
-                for memory_obj in maybe_memory_objs:
-                    if memory_obj.tensor is None:
-                        return PrepareRetrieveResponse(
-                            success=False, data=b"", context={}
-                        )
-                    chunks.append(memory_obj.tensor.cpu().clone())
-                return PrepareRetrieveResponse(
-                    success=True, data=pickle.dumps(chunks), context={}
-                )
+                return self.export_read_objects(maybe_memory_objs)
         finally:
             if prefetched_keys:
                 self._storage_manager.finish_read_prefetched(
                     prefetched_keys, l1_owners=owners
                 )
+
+    def export_read_objects(
+        self, memory_objs: "list[MemoryObj]"
+    ) -> PrepareRetrieveResponse:
+        """Copy the objects to CPU tensors and pickle them into ``data``."""
+        chunks = []
+        for memory_obj in memory_objs:
+            if memory_obj.tensor is None:
+                return PrepareRetrieveResponse(success=False, data=b"", context={})
+            chunks.append(memory_obj.tensor.cpu().clone())
+        return PrepareRetrieveResponse(
+            success=True, data=pickle.dumps(chunks), context={}
+        )
 
     def commit_retrieve(
         self,
@@ -416,11 +444,12 @@ class ShmTransferStrategy(TransferStrategy):
         cpu_data: bytes,
         context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
-    ) -> bool:
+    ) -> tuple[bool, list[ObjectKey]]:
         """Finalize SHM store write locks or fallback to pickle commit.
 
         Returns:
-            ``True`` when pending SHM reservation is committed successfully.
+            ``(success, committed_keys)``: ``success`` is ``True`` when the
+            pending SHM reservation is committed.
         """
         if cpu_data != b"":
             return self._fallback_strategy.commit_store(
@@ -434,10 +463,10 @@ class ShmTransferStrategy(TransferStrategy):
         with self._pending_lock:
             reserved_keys = self._pending_writes.pop(transfer_key, None)
         if reserved_keys is None:
-            return False
+            return False, []
         if reserved_keys:
             self._storage_manager.finish_write(reserved_keys)
-        return True
+        return True, reserved_keys
 
     def prepare_retrieve(
         self,
@@ -458,10 +487,22 @@ class ShmTransferStrategy(TransferStrategy):
             if shm_prefetched_keys:
                 self._storage_manager.finish_read_prefetched(shm_prefetched_keys)
             return PrepareRetrieveResponse(success=False, data=b"", context={})
+        response = self.export_read_objects(shm_memory_objs)
+        if not response.success:
+            self._storage_manager.finish_read_prefetched(shm_prefetched_keys)
+            return response
+        transfer_key = self._transfer_key_factory(key, instance_id)
+        with self._pending_lock:
+            self._pending_reads[transfer_key] = shm_prefetched_keys
+        return response
+
+    def export_read_objects(
+        self, memory_objs: "list[MemoryObj]"
+    ) -> PrepareRetrieveResponse:
+        """Describe the objects' SHM slots in ``context["slots"]``."""
         slots: list[dict[str, Any]] = []
-        for memory_obj in shm_memory_objs:
+        for memory_obj in memory_objs:
             if memory_obj.tensor is None:
-                self._storage_manager.finish_read_prefetched(shm_prefetched_keys)
                 return PrepareRetrieveResponse(success=False, data=b"", context={})
             slots.append(
                 ShmSlotDescriptor(
@@ -471,9 +512,6 @@ class ShmTransferStrategy(TransferStrategy):
                     dtype=_dtype_to_name(memory_obj.tensor.dtype),
                 ).to_dict()
             )
-        transfer_key = self._transfer_key_factory(key, instance_id)
-        with self._pending_lock:
-            self._pending_reads[transfer_key] = shm_prefetched_keys
         return PrepareRetrieveResponse(success=True, data=b"", context={"slots": slots})
 
     def commit_retrieve(

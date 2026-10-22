@@ -17,6 +17,8 @@ from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints, get_device
 from lmcache.v1.multiprocess.custom_types import (
+    CBMatchResult,
+    IPCCacheServerKey,
     RegisterEngineDrivenContextPayload,
     RegisterEngineDrivenContextResponse,
 )
@@ -29,6 +31,10 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     create_engine_driven_context,
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
+)
+from lmcache.v1.multiprocess.transfer_context.blend_scatter import (
+    CBRopeSpec,
+    scatter_cb_matches_to_paged_kv,
 )
 from lmcache.v1.multiprocess.transfer_mode import MPTransferMode
 from lmcache.v1.multiprocess.transport.base import RequestClient
@@ -1003,6 +1009,78 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context.commit_retrieve(key, self._instance_id)
 
         future: MessagingFuture[bool] = MessagingFuture()
+        future.set_result(ok)
+        return future
+
+    def submit_cb_retrieve(
+        self,
+        key: IPCCacheServerKey,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        matches: list[CBMatchResult],
+        rope: CBRopeSpec | None,
+    ) -> MessagingFuture[bool]:
+        """Scatter CacheBlend matches into the paged KV (engine-driven).
+
+        The engine-driven counterpart of ``CB_RETRIEVE_PRE_COMPUTED``: the
+        server selects the matches and exports their chunks, this worker
+        re-RoPEs and writes them at token granularity, and the server then
+        releases the read locks. May be called once per block-allocation
+        round; ranges already written into the same blocks are skipped.
+
+        Args:
+            key: The request key.
+            kv_caches: Per-layer KV tensors of the single KV group.
+            block_ids: The request's block table, one engine group.
+            matches: The lookup's ``non_prefix_segments``.
+            rope: K re-RoPE geometry, or ``None`` for a NoPE model.
+
+        Returns:
+            A resolved future with the wire bool: ``False`` means the caller
+            must degrade the request to full recompute.
+
+        Raises:
+            RuntimeError: If :meth:`register` has not completed.
+        """
+        if self._engine_driven_context is None:
+            raise RuntimeError(
+                "Engine-driven transfer context is not registered. "
+                "Call register() before submit_cb_retrieve()."
+            )
+        context = self._engine_driven_context
+        future: MessagingFuture[bool] = MessagingFuture()
+        try:
+            response, chunks = context.prepare_cb_retrieve(
+                key, matches, block_ids, self._instance_id
+            )
+        except TimeoutError:
+            logger.exception("CB prepare retrieve timed out (req=%s)", key.request_id)
+            future.set_result(False)
+            return future
+        if not response.matches:
+            future.set_result(response.scatter_ran)
+            return future
+
+        scattered = True
+        try:
+            scatter_cb_matches_to_paged_kv(
+                kv_caches,
+                _single_group_block_ids(block_ids),
+                chunks,
+                response.matches,
+                rope,
+                layout_hints=self._layout_hints,
+                engine_kv_format=self._engine_kv_format,
+                engine_type=self._engine_type,
+            )
+        except (RuntimeError, ValueError, TypeError, IndexError):
+            logger.exception("CB scatter failed (req=%s)", key.request_id)
+            scattered = False
+        try:
+            ok = context.commit_cb_retrieve(key, self._instance_id, scattered)
+        except TimeoutError:
+            logger.exception("CB commit retrieve timed out (req=%s)", key.request_id)
+            ok = False
         future.set_result(ok)
         return future
 

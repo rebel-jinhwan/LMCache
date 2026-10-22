@@ -24,6 +24,9 @@ from lmcache.v1.multiprocess.modules.blend.rope import (
     _CBRopeState,
 )
 from lmcache.v1.multiprocess.request_handler import request_handler
+from lmcache.v1.multiprocess.transfer_context.blend_scatter import (
+    normalize_cos_sin_cache,
+)
 
 logger = init_logger(__name__)
 
@@ -147,25 +150,10 @@ class RegistrationMixin:
                 )
             norm_rot.append((int(rot_entry[0]), int(rot_entry[1])))
 
-        cos_sin_caches: list[torch.Tensor] = []
-        for cache_idx, cache_ipc in enumerate(cos_sin_caches_ipc):
-            cos_sin_cache = cache_ipc.to_tensor()
-            # YaRN/longrope bake an mscale m into the cache (cos²+sin²=m²≠1);
-            # CB re-RoPE assumes a pure rotation, so an un-normalized m
-            # injects an m² error per K element.
-            _c32 = cos_sin_cache.to(torch.float32)
-            _half = _c32.shape[1] // 2
-            _m = float((_c32[:, :_half] ** 2 + _c32[:, _half:] ** 2).mean().sqrt())
-            if abs(_m - 1.0) >= 1e-3:
-                logger.info(
-                    "CB re-RoPE: cache %d: stripping rope-cache mscale=%.4f "
-                    "(m²=%.4f → K inflation if uncorrected) → unit magnitude",
-                    cache_idx,
-                    _m,
-                    _m * _m,
-                )
-                cos_sin_cache = (_c32 / _m).to(cos_sin_cache.dtype)
-            cos_sin_caches.append(cos_sin_cache)
+        cos_sin_caches: list[torch.Tensor] = [
+            normalize_cos_sin_cache(cache_ipc.to_tensor())
+            for cache_ipc in cos_sin_caches_ipc
+        ]
 
         self._cb_rope_state[instance_id] = _CBRopeState(
             head_size=head_size,

@@ -438,7 +438,9 @@ def add_mp_server_args(
         default="default",
         choices=["default", "blend"],
         help="Cache engine backend type. 'default' uses standard prefix caching; "
-        "'blend' composes the blend module for non-prefix KV reuse. "
+        "'blend' composes the blend module for non-prefix KV reuse "
+        "(on the engine-driven path with --supported-transfer-mode "
+        "engine_driven, else on the LMCache-driven path). "
         "Default is 'default'.",
     )
     mp_group.add_argument(
