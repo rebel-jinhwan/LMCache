@@ -10,6 +10,7 @@ Rebellions NPUs. The engine is
 |---|---|---|
 | multiprocess, engine-driven | yes | `gather_paged_kv_to_cpu` / `scatter_cpu_to_paged_kv`, dispatching to `RblnDeviceOps.multi_layer_block_kv_transfer` |
 | multiprocess, LMCache-driven | **no** | refused up front |
+| multiprocess, CacheBlend (engine-driven) | yes | `EngineDrivenBlendModule` on the server, `submit_cb_retrieve` on the worker; see [CacheBlend](#cacheblend) |
 | in-process | not yet | `CreateGPUConnector` still raises for `rbln`; a follow-up adds the connector |
 
 Multiprocess is the mode that matters first, and it is self-contained: the MP
@@ -168,3 +169,37 @@ Both layouts require the engine's KV caches to be real device tensors
 allocation the per-layer tensors are `meta`, and any transfer -- this
 backend's or the shared path's -- dies at the first host copy with "Cannot
 copy out of meta tensor".
+
+## CacheBlend
+
+CacheBlend's LMCache-driven retrieve is unavailable here for the same reason
+as every LMCache-driven transfer: it writes the paged KV from the server over
+device IPC, ordered by cross-process events. RBLN takes the engine-driven
+blend path instead (`docs/design/v1/multiprocess/modules/blend.md`,
+"Engine-driven path"), which needs nothing beyond the block transfer above:
+
+- **Server**: `--engine-type blend` with `--supported-transfer-mode
+  engine_driven`, or `auto` -- on an RBLN host `auto` resolves blend to
+  engine-driven, because `RblnDeviceSpec.default_mp_transfer_mode()` is
+  engine-driven (the same value RBLN workers resolve `auto` to).
+- **Worker**: `EngineDrivenTransferContext.submit_cb_retrieve(key,
+  kv_caches, block_ids, matches, rope)`, with `rope` a `CBRopeSpec` built from
+  the model's cos/sin cache (any device; only the rows of the rotated
+  positions are copied to the host).
+
+The worker's `scatter_cb_matches_to_paged_kv` maps onto the RBLN ops as:
+
+1. Read back the destination blocks a match covers only partly: one
+   `multi_layer_block_kv_transfer` D2H over those blocks (at most two per run
+   of adjacent matches) -- `gather_blocks_to_chunk_hnd` / `_mla`.
+2. On the host, copy each match's rows and K-only re-RoPE the shifted ones in
+   fp32. For the 6-D cache the K plane is the chunk's `[0]` plane; for MLA
+   the rope window is `CBRopeSpec.rot_offset..` of the latent row.
+3. Write every destination block back with one H2D --
+   `scatter_chunk_to_blocks_hnd` / `_mla`.
+
+So the head<->token transpose stays hoisted to the host (HND) and the
+contiguous-block DMA shape is kept (MLA); no RBLN blend kernel exists or is
+needed. `tests/v1/platform/devices/rbln/test_rbln_blend_scatter.py` runs both
+layouts on a real NPU under `torch.rbln.explain()`. The device-tensor
+requirement above (`VLLM_RBLN_USE_DEVICE_TENSOR=1`) applies here as well.

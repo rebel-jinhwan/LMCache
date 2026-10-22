@@ -119,8 +119,10 @@ Source: ``lmcache/v1/multiprocess/config.py``
        non-prefix KV reuse. With ``--supported-transfer-mode
        engine_driven`` it serves the engine-driven path
        (``EngineDrivenBlendModule``: the worker scatters the matches); with
-       ``lmcache_driven`` or ``auto`` it serves the LMCache-driven path
-       (``BlendModule``). Choices: ``default``, ``blend``.
+       ``lmcache_driven`` it serves the LMCache-driven path
+       (``BlendModule``); with ``auto`` it serves the path the host's
+       workers default to (engine-driven on RBLN and CPU, LMCache-driven on
+       CUDA). Choices: ``default``, ``blend``.
    * - ``--supported-transfer-mode``
      - ``lmcache_driven``
      - Which worker → server transfer paths the server loads.

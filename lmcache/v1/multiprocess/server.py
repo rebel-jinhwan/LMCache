@@ -68,8 +68,10 @@ from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
 from lmcache.v1.multiprocess.modules.lookup import LookupModule
 from lmcache.v1.multiprocess.modules.management import ManagementModule
 from lmcache.v1.multiprocess.modules.p2p_controller import P2PController
+from lmcache.v1.multiprocess.transfer_mode import MPTransferMode
 from lmcache.v1.multiprocess.transport.base import RequestServer
 from lmcache.v1.multiprocess.transport.server_factory import create_request_server
+from lmcache.v1.platform import current_device_spec
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.ipc_policy import set_isolated_ipc
 
@@ -286,8 +288,15 @@ def _build_server_components(
             timeout=coordinator_config.blend_timeout,
             match_concurrency=coordinator_config.blend_match_concurrency,
         )
+        # One blend module owns the fingerprint matcher and its store
+        # shadow, so 'auto' serves blend on one path only: the one this
+        # host's workers default to (RBLN, CPU: engine-driven; CUDA:
+        # LMCache-driven).
+        blend_mode = MPTransferMode(mp_config.supported_transfer_mode)
+        if blend_mode is MPTransferMode.AUTO:
+            blend_mode = current_device_spec.default_mp_transfer_mode()
         blend: BlendModule | EngineDrivenBlendModule
-        if mp_config.supported_transfer_mode == "engine_driven":
+        if blend_mode is MPTransferMode.ENGINE_DRIVEN:
             engine_driven = next(
                 m for m in transfer_modules if isinstance(m, EngineDrivenTransferModule)
             )
@@ -300,8 +309,6 @@ def _build_server_components(
                 enable_reorder=mp_config.enable_blend_reorder,
             )
         else:
-            # 'auto' serves blend on the LMCache-driven path only: one blend
-            # module owns the fingerprint matcher and its store shadow.
             lmcache_driven = next(
                 m
                 for m in transfer_modules
