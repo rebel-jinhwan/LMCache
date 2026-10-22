@@ -176,8 +176,10 @@ server never touches the worker's KV. With `--engine-type blend
 `EngineDrivenBlendModule` instead of `BlendModule`. Both share
 `BlendModuleBase` — the matcher, `CB_UNIFIED_LOOKUP`, `CB_REORDER_PLAN`, the
 handshake, the stash, and the applied-range LRU — so only the transfer half
-differs. `auto` keeps serving blend on the LMCache-driven path: one module
-owns the matcher.
+differs. One module owns the matcher, so `auto` serves blend on one path:
+the host device's `DeviceSpec.default_mp_transfer_mode()`, which is also what
+its workers resolve `auto` to (engine-driven on RBLN and CPU, LMCache-driven
+on CUDA).
 
 | Concern | LMCache-driven (`BlendModule`) | Engine-driven (`EngineDrivenBlendModule`) |
 |---|---|---|
