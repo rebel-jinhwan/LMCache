@@ -7,6 +7,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
+import math
 
 # Third Party
 import torch
@@ -73,6 +74,69 @@ LayerGroupIdentity = KernelGroupIdentity  # Alias for compatibility
 # excluded from every LMCache group (used for cross-layer KV-sharing layers; see
 # ``create_engine_group_infos_from_vllm``).
 EXCLUDED_ENGINE_GROUP = -1
+
+
+def _kernel_pages_per_block(
+    tensor_num_blocks: int,
+    engine_num_blocks: int,
+    slots_per_page: int,
+    tokens_per_block: int,
+) -> int:
+    """Return how many tensor pages one engine block ID covers.
+
+    vLLM may page a group's tensor at a kernel block size smaller than its
+    block-id unit (``kernel_block_size``), mapping engine block ``b`` to pages
+    ``b*k .. b*k+k-1``. The tensor then holds ``k`` times as many pages as the
+    engine has block IDs, which is what tells it apart from slot compression
+    (as many pages as block IDs, fewer slots than tokens in each).
+
+    Args:
+        tensor_num_blocks: Pages along the registered tensor's block axis.
+        engine_num_blocks: Block IDs the engine allocated; ``0`` = unreported.
+        slots_per_page: Slots in one tensor page.
+        tokens_per_block: Tokens one engine block ID covers.
+
+    Returns:
+        ``k`` when the pages tile each engine block exactly, else ``1``.
+    """
+    if engine_num_blocks <= 0 or tensor_num_blocks % engine_num_blocks != 0:
+        return 1
+    pages = tensor_num_blocks // engine_num_blocks
+    if pages > 1 and slots_per_page * pages == tokens_per_block:
+        return pages
+    return 1
+
+
+def _engine_num_blocks(reported: int, page_counts: "Sequence[int]") -> int:
+    """Return the engine's block-id count, checked against the tensors.
+
+    The engine's groups share one block-id space of ``N`` IDs, so each group's
+    tensor holds ``N`` pages, or ``k * N`` when kernel-paged. An engine can
+    re-allocate its KV cache after handing the connector its config (vLLM-RBLN
+    resizes it to the compiled placement after warm-up), leaving ``reported``
+    stale. When a tensor is not a whole multiple of ``reported``, ``N`` is the
+    GCD of the page counts instead -- exact as long as one group is not
+    kernel-paged.
+
+    Args:
+        reported: Block IDs the engine reported; ``0`` = unreported.
+        page_counts: Pages along each engine group tensor's block axis.
+
+    Returns:
+        ``reported`` when it tiles every tensor (or is unreported), else the
+        GCD of ``page_counts``.
+    """
+    if reported <= 0 or all(count % reported == 0 for count in page_counts):
+        return reported
+    derived = math.gcd(*page_counts)
+    logger.info(
+        "Engine reported %d KV blocks but its tensors hold %s pages; "
+        "using %d blocks (the KV cache was re-allocated after the report)",
+        reported,
+        list(page_counts),
+        derived,
+    )
+    return derived
 
 
 def group_layers_by_identity(
@@ -219,6 +283,11 @@ class KernelGroupInfo:
     """Whether this group's pages hold recurrent state snapshots (Mamba/GDN)
     rather than per-token attention KV. The window reflects restore
     semantics, so ``full_sw_kv`` forcing must not widen it."""
+    kernel_pages_per_block: int = 1
+    """Tensor pages per engine block ID. Greater than 1 when the engine pages
+    the tensor at a kernel block size smaller than its block-id unit (vLLM
+    ``kernel_block_size``): engine block ``b`` then covers pages
+    ``b*k .. b*k+k-1``, each ``slots_per_block`` slots."""
 
     def __repr__(self) -> str:
         if not self.layer_indices:
@@ -236,6 +305,7 @@ class KernelGroupInfo:
             f"dtype={self.dtype}, "
             f"tokens_per_block={self.tokens_per_block}, "
             f"slots_per_block={self.slots_per_block}, "
+            f"kernel_pages_per_block={self.kernel_pages_per_block}, "
             f"engine_group_idx={self.engine_group_idx}, "
             f"sw_size_tokens={self.sw_size_tokens})"
         )
@@ -254,14 +324,21 @@ class KernelGroupInfo:
     def slots_per_block(self) -> int:
         """Physical slots in one paged chunk of this group, detected from
         the registered KV tensors at registration time (the batch-size
-        dimension, ``shape_desc.bs``)."""
+        dimension, ``shape_desc.bs``). With kernel paging this is one
+        kernel page, not one engine block."""
         return self.shape_desc.bs
+
+    @property
+    def slots_per_engine_block(self) -> int:
+        """Physical slots behind one engine block ID: every kernel page it
+        covers. Fewer than ``tokens_per_block`` only for slot compression."""
+        return self.slots_per_block * self.kernel_pages_per_block
 
     def calculate_slots(self, num_tokens: int) -> int:
         """Calculate the number of slots for the specified number of
         tokens. Assuming the number of tokens are already aligned.
         """
-        return num_tokens * self.slots_per_block // self.tokens_per_block
+        return num_tokens * self.slots_per_engine_block // self.tokens_per_block
 
 
 KVLayerGroupInfo = KernelGroupInfo  # Alias for compatibility
@@ -395,6 +472,22 @@ class KVLayerGroupsManager:
                 "engine group info per kernel group"
             )
 
+        reported_num_blocks = max(
+            (info.num_blocks for info in engine_group_infos), default=0
+        )
+        engine_num_blocks = _engine_num_blocks(
+            reported_num_blocks,
+            [
+                get_num_blocks([kv_caches[indices[0]]], identity.engine_kv_format)
+                for (identity, indices), info in zip(
+                    groups_by_identity, engine_group_infos, strict=False
+                )
+                if info.num_blocks > 0
+            ]
+            if engine_group_infos
+            else [],
+        )
+
         # Emit groups in order of their first-appearing layer so that group
         # indices remain deterministic across runs.
         for group_idx, (identity, indices) in enumerate(groups_by_identity):
@@ -440,13 +533,21 @@ class KVLayerGroupsManager:
                 else bs
             )
             sw_size_tokens = info.sw_size_tokens if info is not None else -1
+            kernel_pages_per_block = (
+                _kernel_pages_per_block(
+                    group_num_blocks, engine_num_blocks, bs, tokens_per_block
+                )
+                if info is not None and info.num_blocks > 0
+                else 1
+            )
 
             self._validate_block_chunk_size_config(
                 group_idx,
-                slots_per_block=bs,
+                slots_per_block=bs * kernel_pages_per_block,
                 tokens_per_block=tokens_per_block,
                 lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
                 sw_size_tokens=sw_size_tokens,
+                kernel_pages_per_block=kernel_pages_per_block,
             )
 
             self._kernel_groups.append(
@@ -464,6 +565,7 @@ class KVLayerGroupsManager:
                     recurrent_state=(
                         info.recurrent_state if info is not None else False
                     ),
+                    kernel_pages_per_block=kernel_pages_per_block,
                 )
             )
 
@@ -730,9 +832,14 @@ class KVLayerGroupsManager:
         tokens_per_block: int,
         lmcache_tokens_per_chunk: int,
         sw_size_tokens: int = -1,
+        kernel_pages_per_block: int = 1,
     ) -> None:
         """Validate the chunk size configuration against the slot and
         tokens block detected from the serving engine.
+
+        ``slots_per_block`` is the slots behind one engine block ID. With
+        kernel paging (``kernel_pages_per_block > 1``) blocks move a kernel
+        page at a time, so a sub-chunk window need only cover whole pages.
 
         Raises:
             ValueError: If one of the following conditions is met:
@@ -741,8 +848,9 @@ class KVLayerGroupsManager:
                 - ``lmcache_tokens_per_chunk`` is not a whole multiple of
                   ``tokens_per_block``
                 - a sub-chunk sliding window is not a whole multiple of
-                  ``tokens_per_block``
+                  the tokens of one kernel page
         """
+        page_tokens = tokens_per_block // kernel_pages_per_block
         if tokens_per_block % slots_per_block != 0:
             raise ValueError(
                 f"group {group_idx}: tokens_per_block {tokens_per_block} "
@@ -756,12 +864,12 @@ class KVLayerGroupsManager:
             )
         if (
             0 < sw_size_tokens < lmcache_tokens_per_chunk
-            and sw_size_tokens % tokens_per_block != 0
+            and sw_size_tokens % page_tokens != 0
         ):
             raise ValueError(
                 f"group {group_idx}: sub-chunk sliding window size "
-                f"{sw_size_tokens} must be a multiple of tokens_per_block "
-                f"{tokens_per_block}"
+                f"{sw_size_tokens} must be a multiple of the block size "
+                f"{page_tokens}"
             )
         if slots_per_block != tokens_per_block:
             logger.info(

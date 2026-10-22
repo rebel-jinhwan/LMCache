@@ -806,5 +806,80 @@ class TestKernelAndObjectGroups:
         assert manager.calculate_num_blocks(0, 256) == 16
 
 
+class TestKernelPagedGroups:
+    """vLLM may page a group's tensor at a kernel block size smaller than its
+    block size (``kernel_block_size``). The tensor then holds a whole multiple
+    of the engine's block IDs, which tells it apart from slot compression."""
+
+    @staticmethod
+    def _manager(
+        num_pages: int, engine_num_blocks: int, sw_size_tokens: int = -1
+    ) -> KVLayerGroupsManager:
+        # 8-slot pages under a 32-token engine block.
+        tensors = [torch.randn(2, num_pages, 8, 2, 16, dtype=torch.float16)]
+        return KVLayerGroupsManager(
+            tensors,
+            engine_kv_formats=[lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS],
+            engine_group_infos=[
+                EngineGroupInfo(
+                    0,
+                    (0,),
+                    tokens_per_block=32,
+                    sw_size_tokens=sw_size_tokens,
+                    num_blocks=engine_num_blocks,
+                )
+            ],
+            lmcache_tokens_per_chunk=64,
+        )
+
+    def test_page_multiple_of_block_ids_is_kernel_paged(self):
+        group = self._manager(num_pages=16, engine_num_blocks=4).kernel_groups[0]
+        assert group.kernel_pages_per_block == 4
+        assert group.slots_per_block == 8
+        assert group.slots_per_engine_block == 32
+        # Not compressed: every token keeps its slot.
+        assert group.calculate_slots(64) == 64
+
+    def test_window_of_one_page_is_accepted(self):
+        manager = self._manager(num_pages=16, engine_num_blocks=4, sw_size_tokens=8)
+        assert manager.get_subchunk_sw_size_tokens(0) == 8
+
+    def test_as_many_pages_as_block_ids_stays_compressed(self):
+        group = self._manager(num_pages=4, engine_num_blocks=4).kernel_groups[0]
+        assert group.kernel_pages_per_block == 1
+        assert group.calculate_slots(64) == 16
+
+    def test_unreported_block_count_keeps_the_old_reading(self):
+        group = self._manager(num_pages=16, engine_num_blocks=0).kernel_groups[0]
+        assert group.kernel_pages_per_block == 1
+        with pytest.raises(ValueError, match="sliding window"):
+            self._manager(num_pages=16, engine_num_blocks=0, sw_size_tokens=8)
+
+    def test_stale_block_count_is_derived_from_the_tensors(self):
+        """An engine that re-allocates its KV cache after reporting (vLLM-RBLN
+        resizes it after warm-up) leaves the count stale; the full group's
+        pages still give the real one."""
+        num_blocks, pages_per_block = 4, 4
+        full = torch.randn(2, num_blocks, 32, 2, 16, dtype=torch.float16)
+        paged = torch.randn(
+            2, num_blocks * pages_per_block, 8, 2, 16, dtype=torch.float16
+        )
+        manager = KVLayerGroupsManager(
+            [full, paged],
+            engine_kv_formats=[lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS] * 2,
+            engine_group_infos=[
+                EngineGroupInfo(0, (0,), tokens_per_block=32, num_blocks=6),
+                EngineGroupInfo(
+                    1, (1,), tokens_per_block=32, sw_size_tokens=8, num_blocks=6
+                ),
+            ],
+            lmcache_tokens_per_chunk=64,
+        )
+        assert [g.kernel_pages_per_block for g in manager.kernel_groups] == [
+            1,
+            pages_per_block,
+        ]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
