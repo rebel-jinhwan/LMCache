@@ -25,6 +25,7 @@ from lmcache import device_ops
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import LayoutHints
+from lmcache.v1.multiprocess.object_group_transfer import recalculate_blocks_to_skip
 from lmcache.v1.platform.devices.cpu.cache_context import CPUCacheContext
 import lmcache.lmcache_native as lmcache_native
 
@@ -67,19 +68,35 @@ class RblnCacheContext(CPUCacheContext):
         self._wrappers = kv_caches
         self.device_ = self.kv_caches_[0].device
         self._rbln_stream = torch.rbln.current_stream(self.device_)  # type: ignore[attr-defined]
-        attn_desc = self.kv_layer_groups_manager_.get_attn_desc()
-        if not all(
-            attn_desc.is_full_attention(idx)
-            for idx in range(self.kv_layer_groups_manager_.num_object_groups)
-        ):
-            raise ValueError(
-                "RBLN LMCache-driven transfer supports full-attention KV only"
-            )
 
     @property
     def stream(self) -> Any:
         """Returns the ``torch.rbln`` stream the server enqueues on."""
         return self._rbln_stream
+
+    def get_kernel_group_shape_dtype(
+        self,
+        num_tokens: int,
+        kernel_group_idx: int,
+    ) -> tuple[torch.Size, torch.dtype]:
+        """Returns the stored ``(shape, dtype)`` of a kernel group.
+
+        A sliding-window group narrower than a chunk stores only each chunk's
+        last window, as on CUDA, so its slot count is the window's.
+
+        Args:
+            num_tokens: Number of tokens, a whole number of chunks.
+            kernel_group_idx: Index of the kernel group.
+
+        Returns:
+            ``([kv_size, num_layers, slots, hidden], dtype)``.
+        """
+        shape, dtype = super().get_kernel_group_shape_dtype(
+            num_tokens, kernel_group_idx
+        )
+        num_chunks = num_tokens // self.lmcache_tokens_per_chunk
+        slots = self.get_slots_per_chunk_in_sw(kernel_group_idx) * num_chunks
+        return torch.Size((shape[0], shape[1], slots, shape[3])), dtype
 
     def close(self) -> None:
         """Release the imported KV mappings."""
@@ -102,7 +119,11 @@ class RblnCacheContext(CPUCacheContext):
         """Copy whole blocks between the KV cache and the memory objects.
 
         Each chunk is gathered into (or scattered from) its memory object's
-        region for the kernel group, in LMCache's token-major layout.
+        region for the kernel group, in LMCache's token-major layout. The
+        sliding-window handling matches the CUDA path: a group narrower than
+        a chunk moves only each chunk's last window (``block_ids_gpu`` is
+        already cut to it), and a retrieve of a sliding-window object group
+        writes only the chunks that fall inside the window.
 
         Args:
             block_ids_gpu: Staged block IDs per kernel group (host tensors).
@@ -116,14 +137,23 @@ class RblnCacheContext(CPUCacheContext):
             block_ids_host: Unused; ``block_ids_gpu`` already lives on host.
 
         Raises:
-            ValueError: If a retrieve has a missing memory object.
+            ValueError: If a retrieve has a missing memory object, or a memory
+                object has no host tensor.
         """
         del batch_size, transfer_key, block_ids_host
         is_h2d = direction == lmcache_native.TransferDirection.H2D
         chunk_tokens = self.lmcache_tokens_per_chunk
         manager = self.kv_layer_groups_manager_
         object_group = manager.object_groups[object_group_id]
+        attn_desc = manager.get_attn_desc()
+        first_chunk = 0
+        if is_h2d and not attn_desc.is_full_attention(object_group_id):
+            first_chunk = max(
+                0, len(memory_objs) - attn_desc.num_chunks_in_sw[object_group_id]
+            )
         for chunk_idx, memory_obj in enumerate(memory_objs):
+            if chunk_idx < first_chunk:
+                continue
             if memory_obj is None:
                 if is_h2d:
                     raise ValueError(
@@ -131,7 +161,8 @@ class RblnCacheContext(CPUCacheContext):
                     )
                 continue
             chunk_start = chunk_idx * chunk_tokens
-            if is_h2d and chunk_start + chunk_tokens <= skip_first_n_tokens:
+            skip_tokens = max(0, skip_first_n_tokens - chunk_start) if is_h2d else 0
+            if skip_tokens >= chunk_tokens:
                 continue
             raw = memory_obj.raw_tensor
             if raw is None:
@@ -141,8 +172,15 @@ class RblnCacheContext(CPUCacheContext):
                 blocks_per_chunk = self.calculate_num_blocks(
                     chunk_tokens, kernel_group_idx
                 )
+                blocks_per_window = self.calculate_num_blocks(
+                    min(
+                        chunk_tokens,
+                        manager.get_subchunk_sw_size_tokens(kernel_group_idx),
+                    ),
+                    kernel_group_idx,
+                )
                 block_ids = block_ids_gpu[kernel_group_idx][
-                    chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
+                    chunk_idx * blocks_per_window : (chunk_idx + 1) * blocks_per_window
                 ]
                 shape, dtype = self.get_kernel_group_shape_dtype(
                     chunk_tokens, kernel_group_idx
@@ -152,8 +190,10 @@ class RblnCacheContext(CPUCacheContext):
                 )
                 nbytes = shape.numel() * dtype.itemsize
                 chunk = raw.view(torch.uint8)[offset : offset + nbytes]
-                skip_blocks = max(0, skip_first_n_tokens - chunk_start) // max(
-                    1, chunk_tokens // blocks_per_chunk
+                skip_blocks = recalculate_blocks_to_skip(
+                    blocks_per_chunk,
+                    blocks_per_window,
+                    self.calculate_num_blocks(skip_tokens, kernel_group_idx),
                 )
                 device_ops.multi_layer_block_kv_transfer(
                     [self.kv_caches_[i] for i in group.layer_indices],
@@ -162,9 +202,9 @@ class RblnCacheContext(CPUCacheContext):
                     self.device_,
                     direction,
                     self.get_shape_desc(kernel_group_idx),
-                    chunk_tokens,
+                    self.get_slots_per_chunk_in_sw(kernel_group_idx),
                     self.get_engine_kv_format(kernel_group_idx),
-                    skip_blocks if is_h2d else 0,
+                    skip_blocks,
                 )
 
     def _check_shm_capacity(self) -> None:

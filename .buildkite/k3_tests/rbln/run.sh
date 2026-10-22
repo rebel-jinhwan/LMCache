@@ -52,5 +52,16 @@ fi
 kill "${SERVER_PID}"
 wait "${SERVER_PID}" || true
 
-echo "--- :vllm: vLLM-RBLN + LMCache e2e"
+echo "--- :vllm: vLLM-RBLN + LMCache e2e (engine-driven)"
 "${PYTHON}" "${SCRIPT_DIR}/vllm_e2e.py" --model "${RBLN_E2E_MODEL:-Qwen/Qwen3-0.6B}"
+
+# LMCache-driven needs cross-process device memory (torch.rbln.ipc), which
+# torch-rbln ships after the image's release; run it once the image has it.
+echo "--- :vllm: vLLM-RBLN + LMCache e2e (LMCache-driven)"
+if "${PYTHON}" -c "import sys, torch; sys.exit(not hasattr(torch.rbln, 'ipc'))"; then
+    "${PYTHON}" "${SCRIPT_DIR}/vllm_e2e.py" \
+        --model "${RBLN_E2E_MODEL:-Qwen/Qwen3-0.6B}" \
+        --transfer-mode lmcache_driven
+else
+    echo "Skipped: this torch-rbln has no torch.rbln.ipc"
+fi
