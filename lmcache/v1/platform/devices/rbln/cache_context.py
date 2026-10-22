@@ -121,9 +121,11 @@ class RblnCacheContext(CPUCacheContext):
         Each chunk is gathered into (or scattered from) its memory object's
         region for the kernel group, in LMCache's token-major layout. The
         sliding-window handling matches the CUDA path: a group narrower than
-        a chunk moves only each chunk's last window (``block_ids_gpu`` is
-        already cut to it), and a retrieve of a sliding-window object group
-        writes only the chunks that fall inside the window.
+        a chunk moves only each chunk's last window, and a retrieve of a
+        sliding-window object group writes only the chunks that fall inside
+        the window. Kernel-paged groups (``kernel_pages_per_block > 1``) have
+        their engine block IDs expanded to tensor pages first, so a window
+        smaller than an engine block still moves just its pages.
 
         Args:
             block_ids_gpu: Staged block IDs per kernel group (host tensors).
@@ -169,19 +171,28 @@ class RblnCacheContext(CPUCacheContext):
                 raise ValueError(f"MemoryObj for chunk {chunk_idx} has no host tensor")
             for kernel_group_idx in object_group.kernel_group_indices:
                 group = manager.kernel_groups[kernel_group_idx]
-                blocks_per_chunk = self.calculate_num_blocks(
-                    chunk_tokens, kernel_group_idx
-                )
-                blocks_per_window = self.calculate_num_blocks(
+                # Blocks move a tensor page at a time. With kernel paging
+                # (vLLM kernel_block_size < block_size) engine block b covers
+                # pages b*k .. b*k+k-1 and a window can be a fraction of a block.
+                pages_per_block = group.kernel_pages_per_block
+                page_tokens = group.tokens_per_block // pages_per_block
+                pages_per_chunk = chunk_tokens // page_tokens
+                pages_per_window = (
                     min(
                         chunk_tokens,
                         manager.get_subchunk_sw_size_tokens(kernel_group_idx),
-                    ),
-                    kernel_group_idx,
+                    )
+                    // page_tokens
                 )
-                block_ids = block_ids_gpu[kernel_group_idx][
-                    chunk_idx * blocks_per_window : (chunk_idx + 1) * blocks_per_window
-                ]
+                staged = block_ids_gpu[kernel_group_idx].tolist()
+                ids_per_chunk = len(staged) // len(memory_objs)
+                pages = [
+                    block_id * pages_per_block + page
+                    for block_id in staged[
+                        chunk_idx * ids_per_chunk : (chunk_idx + 1) * ids_per_chunk
+                    ]
+                    for page in range(pages_per_block)
+                ][-pages_per_window:]
                 shape, dtype = self.get_kernel_group_shape_dtype(
                     chunk_tokens, kernel_group_idx
                 )
@@ -190,21 +201,19 @@ class RblnCacheContext(CPUCacheContext):
                 )
                 nbytes = shape.numel() * dtype.itemsize
                 chunk = raw.view(torch.uint8)[offset : offset + nbytes]
-                skip_blocks = recalculate_blocks_to_skip(
-                    blocks_per_chunk,
-                    blocks_per_window,
-                    self.calculate_num_blocks(skip_tokens, kernel_group_idx),
+                skip_pages = recalculate_blocks_to_skip(
+                    pages_per_chunk, pages_per_window, skip_tokens // page_tokens
                 )
                 device_ops.multi_layer_block_kv_transfer(
                     [self.kv_caches_[i] for i in group.layer_indices],
                     [chunk.view(dtype).view(shape)],
-                    block_ids,
+                    pages,
                     self.device_,
                     direction,
                     self.get_shape_desc(kernel_group_idx),
                     self.get_slots_per_chunk_in_sw(kernel_group_idx),
                     self.get_engine_kv_format(kernel_group_idx),
-                    skip_blocks,
+                    skip_pages,
                 )
 
     def _check_shm_capacity(self) -> None:
