@@ -22,10 +22,13 @@ from lmcache.v1.multiprocess.config import (
     HttpCacheEventSinkConfig,
     KafkaCacheEventSinkConfig,
     MPServerConfig,
+    P2PConfig,
     add_coordinator_args,
     add_mp_server_args,
+    add_p2p_args,
     parse_args_to_coordinator_config,
     parse_args_to_mp_server_config,
+    parse_args_to_p2p_config,
 )
 
 _COORD_ENV = (
@@ -192,6 +195,48 @@ def test_server_module_flags_are_parsed():
 def test_server_module_flag_rejects_invalid_json():
     with pytest.raises(ValueError, match="--server-module must be valid JSON"):
         _parse_mp(["--server-module", "{"])
+
+
+def _parse_p2p(argv: list[str]) -> P2PConfig:
+    parser = argparse.ArgumentParser()
+    add_p2p_args(parser)
+    return parse_args_to_p2p_config(parser.parse_args(argv))
+
+
+def test_p2p_nixl_backend_defaults_to_ucx_without_params():
+    config = _parse_p2p([])
+    assert config.nixl_backend == "UCX"
+    assert config.nixl_backend_params == {}
+    assert config.transfer_engine_kwargs == {"backend": "UCX", "backend_params": {}}
+    assert P2PConfig().transfer_engine_kwargs == config.transfer_engine_kwargs
+
+
+def test_p2p_nixl_backend_flags_reach_the_nixl_engine():
+    config = _parse_p2p(
+        [
+            "--p2p-nixl-backend",
+            "RBLN",
+            "--p2p-nixl-backend-params",
+            '{"listen_ip": "all", "listen_port": "26000"}',
+        ]
+    )
+    assert config.transfer_engine_kwargs == {
+        "backend": "RBLN",
+        "backend_params": {"listen_ip": "all", "listen_port": "26000"},
+    }
+
+
+def test_p2p_nixl_backend_flags_do_not_reach_other_engines():
+    config = _parse_p2p(
+        ["--p2p-transfer-engine", "mooncake_te", "--p2p-nixl-backend", "RBLN"]
+    )
+    assert config.transfer_engine_kwargs == {}
+
+
+@pytest.mark.parametrize("raw", ["{", '["listen_ip"]', '{"listen_port": 26000}'])
+def test_p2p_nixl_backend_params_must_be_json_object_of_strings(raw):
+    with pytest.raises(ValueError, match="nixl.backend.params"):
+        _parse_p2p(["--p2p-nixl-backend-params", raw])
 
 
 def test_mp_config_rejects_non_positive_chunk_size() -> None:

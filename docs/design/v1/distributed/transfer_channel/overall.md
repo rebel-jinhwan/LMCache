@@ -98,7 +98,7 @@ The normal way application code obtains a context:
 
 | Function | Purpose |
 |---|---|
-| `initialize_transfer_channel_context(transfer_channel_type, l1_memory_desc, listen_url, advertise_url, **kwargs)` | Create the process-global context via the registered factory. Raises if one already exists, or if the type is unknown. `**kwargs` are forwarded to the factory (e.g. `backends=["UCX"]` for nixl). |
+| `initialize_transfer_channel_context(transfer_channel_type, l1_memory_desc, listen_url, advertise_url, **kwargs)` | Create the process-global context via the registered factory. Raises if one already exists, or if the type is unknown. `**kwargs` are forwarded to the factory (e.g. `backend="RBLN", backend_params={"listen_ip": "all"}` for nixl). |
 | `get_transfer_channel_context()` | Return the global context (raises if not initialized). |
 | `delete_transfer_channel_context()` | Close and clear the global context. |
 
@@ -142,6 +142,14 @@ points:
 - **One agent per context.** The context creates a single `nixl_agent`, registers
   the whole L1 buffer once, and builds a page-granular transfer-descriptor list
   over `[base, base+size)` using `align_bytes` as the page size.
+- **One backend, created explicitly.** The `backend` kwarg (default `"UCX"`)
+  names the NIXL backend plugin, and `backend_params` holds its init params.
+  The agent is built with `nixl_agent_config(backends=[])`, then
+  `create_backend(backend, backend_params)` runs before the L1 buffer is
+  registered. `nixl_agent_config` would create its backends with empty params,
+  and plugins with a required param reject that (e.g. `RBLN` needs
+  `listen_ip`). P2P sets these from `--p2p-nixl-backend` and
+  `--p2p-nixl-backend-params`.
 - **Handshake over ZMQ.** Metadata is exchanged over a ZMQ `REP`/`REQ` socket
   (not the LMCache MQ — that would be overkill and would leak transfer-channel
   functions into the global MQ). The messages are a small `msgspec` tagged union

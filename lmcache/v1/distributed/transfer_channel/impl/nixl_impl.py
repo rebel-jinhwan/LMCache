@@ -316,7 +316,8 @@ class NixlTransferChannelContext(TransferChannelContext):
         l1_memory_desc: L1MemoryDesc,
         listen_url: str,
         advertise_url: str,
-        backends: Optional[list[str]] = None,
+        backend: str = "UCX",
+        backend_params: dict[str, str] | None = None,
     ) -> None:
         """
         Creates the transfer channel context using nixl.
@@ -325,7 +326,18 @@ class NixlTransferChannelContext(TransferChannelContext):
             l1_memory_desc: The description of the local L1 memory buffer to register.
             listen_url: The URL to listen on for incoming connections.
             advertise_url: The URL to advertise to peers for them to connect to us.
-            backends: Optional list of nixl backends to use (e.g., ["UCX"])
+            backend: Name of the nixl backend plugin to create (e.g. ``"UCX"``,
+                or ``"RBLN"`` for Rebellions NPU hosts). The plugin must
+                support DRAM registration and one-sided READ.
+            backend_params: Init params passed to the backend on creation.
+                Params left out take the plugin's defaults.
+
+        Raises:
+            RuntimeError: If nixl is not importable.
+            nixlNotFoundError: Raised by nixl if it cannot find the ``backend``
+                plugin.
+            nixlBackendError: Raised by nixl if the plugin rejects
+                ``backend_params`` (e.g. RBLN without ``listen_ip``).
         """
         nixl_agent, nixl_agent_config = _load_nixl()
 
@@ -333,10 +345,13 @@ class NixlTransferChannelContext(TransferChannelContext):
         self._align = l1_memory_desc.align_bytes
         self.listen_url = listen_url
         self.advertise_url = advertise_url
-        backends = backends if backends else ["UCX"]
 
         self.agent_name = str(uuid.uuid4())
-        self.agent = nixl_agent(self.agent_name, nixl_agent_config(backends=backends))
+        # nixl_agent_config creates its backends with empty init params, which
+        # backends with required params (e.g. RBLN's listen_ip) reject, so the
+        # backend is created explicitly instead.
+        self.agent = nixl_agent(self.agent_name, nixl_agent_config(backends=[]))
+        self.agent.create_backend(backend, backend_params or {})
 
         # Register the whole L1 buffer once (CPU/DRAM, fixed nixl dev_id=0).
         ptr, size = l1_memory_desc.ptr, l1_memory_desc.size
@@ -609,8 +624,8 @@ def create_nixl_transfer_channel_context(
         l1_memory_desc: Describes the L1 memory region to register.
         listen_url: ``host:port`` this peer's server binds to.
         advertise_url: ``host:port`` this peer advertises as its identity.
-        **kwargs: Accepts ``backends`` (an optional list of nixl backends,
-            e.g. ``["UCX"]``).
+        **kwargs: Accepts ``backend`` (the nixl backend plugin name, default
+            ``"UCX"``) and ``backend_params`` (its init params).
 
     Returns:
         A new ``NixlTransferChannelContext`` instance.
@@ -619,7 +634,7 @@ def create_nixl_transfer_channel_context(
         l1_memory_desc=l1_memory_desc,
         listen_url=listen_url,
         advertise_url=advertise_url,
-        backends=kwargs.get("backends"),
+        **kwargs,
     )
 
 

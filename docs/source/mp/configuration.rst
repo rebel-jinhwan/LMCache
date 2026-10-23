@@ -336,6 +336,14 @@ is set, which additionally requires a coordinator URL via
    * - ``--p2p-transfer-engine``
      - ``nixl``
      - Transfer-channel implementation to use.
+   * - ``--p2p-nixl-backend``
+     - ``UCX``
+     - NIXL backend plugin used by the ``nixl`` engine, e.g. ``RBLN``
+       (Rebellions NPU hosts). Ignored by other engines.
+   * - ``--p2p-nixl-backend-params``
+     - ``{}``
+     - JSON object of string init params for ``--p2p-nixl-backend``. Params
+       left out take the plugin's defaults.
 
 L1 Memory Manager
 ------------------

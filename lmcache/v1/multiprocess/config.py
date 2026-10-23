@@ -229,6 +229,24 @@ class P2PConfig:
     transfer_engine: str = "nixl"
     """Transfer-channel implementation to use."""
 
+    nixl_backend: str = "UCX"
+    """NIXL backend plugin the ``nixl`` transfer engine creates, e.g. ``UCX``
+    or ``RBLN`` (Rebellions NPU hosts). Ignored by other engines."""
+
+    nixl_backend_params: dict[str, str] = field(default_factory=dict)
+    """Init params passed to :attr:`nixl_backend` on creation. Params left out
+    take the plugin's defaults."""
+
+    def __post_init__(self) -> None:
+        """Validate the NIXL backend params.
+
+        Raises:
+            ValueError: If a value in :attr:`nixl_backend_params` is not a
+                string (NIXL takes backend init params as strings only).
+        """
+        if not all(isinstance(v, str) for v in self.nixl_backend_params.values()):
+            raise ValueError("nixl_backend_params values must all be strings")
+
     @property
     def enabled(self) -> bool:
         """Whether P2P is enabled (an advertise URL is configured)."""
@@ -238,6 +256,22 @@ class P2PConfig:
     def effective_listen_url(self) -> str:
         """The listen URL, defaulting to the advertise URL when unset."""
         return self.listen_url or self.advertise_url
+
+    @property
+    def transfer_engine_kwargs(self) -> dict[str, object]:
+        """Implementation-specific keyword arguments for the transfer-channel
+        factory of :attr:`transfer_engine`.
+
+        For ``nixl`` this is ``{"backend": nixl_backend, "backend_params":
+        nixl_backend_params}``. Other engines take no extra arguments, so it is
+        empty for them.
+        """
+        if self.transfer_engine == "nixl":
+            return {
+                "backend": self.nixl_backend,
+                "backend_params": self.nixl_backend_params,
+            }
+        return {}
 
 
 DEFAULT_P2P_CONFIG = P2PConfig()
@@ -705,6 +739,20 @@ def add_p2p_args(
         default="nixl",
         help="Transfer-channel implementation to use. Default is nixl.",
     )
+    group.add_argument(
+        "--p2p-nixl-backend",
+        type=str,
+        default="UCX",
+        help="NIXL backend plugin used by the nixl transfer engine, e.g. UCX "
+        "or RBLN (Rebellions NPU hosts). Default is UCX.",
+    )
+    group.add_argument(
+        "--p2p-nixl-backend-params",
+        type=str,
+        default="{}",
+        help="JSON object of string init params for --p2p-nixl-backend. "
+        'Example for RBLN: \'{"listen_ip": "all"}\'. Default is {}.',
+    )
     return parser
 
 
@@ -718,13 +766,29 @@ def parse_args_to_p2p_config(
 
     Returns:
         The configuration object.
+
+    Raises:
+        ValueError: If ``--p2p-nixl-backend-params`` is not a JSON object of
+            string values.
     """
+    try:
+        nixl_backend_params = json.loads(
+            getattr(args, "p2p_nixl_backend_params", None) or "{}"
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "--p2p-nixl-backend-params is not valid JSON: %s" % exc
+        ) from exc
+    if not isinstance(nixl_backend_params, dict):
+        raise ValueError("--p2p-nixl-backend-params must be a JSON object")
     return P2PConfig(
         advertise_url=getattr(args, "p2p_advertise_url", "") or "",
         listen_url=getattr(args, "p2p_listen_url", "") or "",
         lookup_timeout=getattr(args, "p2p_lookup_timeout", 30.0),
         load_timeout=getattr(args, "p2p_load_timeout", 30.0),
         transfer_engine=getattr(args, "p2p_transfer_engine", "nixl"),
+        nixl_backend=getattr(args, "p2p_nixl_backend", "UCX"),
+        nixl_backend_params=nixl_backend_params,
     )
 
 

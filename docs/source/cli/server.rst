@@ -115,6 +115,12 @@ Commonly used flags include:
        (default ``30``).
    * - ``--p2p-transfer-engine ENGINE``
      - Transfer-channel implementation for P2P reads (default ``nixl``).
+   * - ``--p2p-nixl-backend NAME``
+     - NIXL backend plugin used by the ``nixl`` engine (default ``UCX``), e.g.
+       ``RBLN`` on Rebellions NPU hosts. See :doc:`/mp/p2p`.
+   * - ``--p2p-nixl-backend-params JSON``
+     - JSON object of string init params for ``--p2p-nixl-backend``
+       (default ``{}``), e.g. ``'{"listen_ip": "all"}'`` for ``RBLN``.
    * - ``--server-module JSON``
      - Import out-of-tree ``DiscoverableModule`` classes. Repeatable.
        See :doc:`/developer_guide/extending_lmcache/server_modules`.

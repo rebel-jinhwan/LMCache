@@ -229,6 +229,7 @@ class P2PController(DiscoverableModule):
             self._ctx.storage_manager.l1_memory_desc,
             listen_url=self._p2p_config.effective_listen_url,
             advertise_url=self._p2p_config.advertise_url,
+            **self._p2p_config.transfer_engine_kwargs,
         )
         self._instances_url = coordinator_config.url.rstrip("/") + "/instances"
         timeout = max(1.0, coordinator_config.heartbeat_interval)

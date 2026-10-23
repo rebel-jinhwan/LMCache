@@ -87,6 +87,12 @@ P2P is enabled per server by the ``--p2p-advertise-url`` flag. The relevant
        (default ``30``).
    * - ``--p2p-transfer-engine ENGINE``
      - Transfer-channel implementation (default ``nixl``).
+   * - ``--p2p-nixl-backend NAME``
+     - NIXL backend plugin used by the ``nixl`` engine (default ``UCX``). See
+       `NIXL backends`_.
+   * - ``--p2p-nixl-backend-params JSON``
+     - JSON object of string init params for ``--p2p-nixl-backend``
+       (default ``{}``).
 
 P2P also reuses the coordinator connection flags (``--coordinator-url``,
 ``--coordinator-advertise-ip``, ``--coordinator-heartbeat-interval``); the
@@ -120,6 +126,29 @@ selected per server with ``--p2p-transfer-engine``.
    * - ``mooncake_te``
      - Uses Mooncake Transfer Engine for P2P transfers. It uses TCP by default
        and can use RDMA when configured through environment variables.
+
+NIXL backends
+~~~~~~~~~~~~~
+
+The ``nixl`` engine creates one NIXL backend and registers the L1 buffer with
+it as host memory (``DRAM_SEG``). The default is NIXL's ``UCX`` backend. To use
+a different NIXL backend plugin, name it with ``--p2p-nixl-backend`` and pass its
+init params with ``--p2p-nixl-backend-params``. Params you leave out take the
+plugin's defaults. Any backend works if it supports ``DRAM_SEG`` registration and
+one-sided ``READ``, and NIXL can find its plugin, either in NIXL's own plugin
+directory or through ``NIXL_PLUGIN_DIR``. Every server in the fleet must use
+the same backend, because NIXL transfers only between agents that share one.
+
+For example, Rebellions NPU hosts use the ``RBLN`` backend from the Rebellions
+NIXL plugin. It requires ``listen_ip``, which is either the IP of a RoCE NIC or
+``all`` to use every RoCE NIC on the host:
+
+.. code-block:: bash
+
+   lmcache server \
+       <argument-list> \
+       --p2p-nixl-backend RBLN \
+       --p2p-nixl-backend-params '{"listen_ip": "all"}'
 
 Mooncake Transfer Engine
 ~~~~~~~~~~~~~~~~~~~~~~~~
