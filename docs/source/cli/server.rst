@@ -120,7 +120,7 @@ Commonly used flags include:
        ``RBLN`` on Rebellions NPU hosts. See :doc:`/mp/p2p`.
    * - ``--p2p-nixl-backend-params JSON``
      - JSON object of string init params for ``--p2p-nixl-backend``
-       (default ``{}``), e.g. ``'{"listen_ip": "all"}'`` for ``RBLN``.
+       (default ``{}``), e.g. ``'{"listen_ip": "10.0.0.2"}'`` for ``RBLN``.
    * - ``--server-module JSON``
      - Import out-of-tree ``DiscoverableModule`` classes. Repeatable.
        See :doc:`/developer_guide/extending_lmcache/server_modules`.

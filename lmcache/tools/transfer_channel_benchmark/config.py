@@ -7,8 +7,9 @@ without importing them. The runtime imports live in ``benchmark.py``.
 """
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import argparse
+import json
 
 _UNITS = {
     "B": 1,
@@ -59,6 +60,9 @@ class BenchmarkConfig:
             (e.g. ``"nixl"``).
         nixl_backend: The nixl backend name (e.g. ``"UCX"``). Only used by the
             nixl transfer channel type.
+        nixl_backend_params: Init params for ``nixl_backend`` (e.g.
+            ``{"listen_ip": "10.0.0.2"}`` for ``RBLN``). Only used by the nixl
+            transfer channel type.
         url: Server role binds its transfer-channel server here; client role
             dials this as the peer (server) advertise url to read from.
         listen_url: Client role binds its own (mandatory) transfer-channel
@@ -83,6 +87,7 @@ class BenchmarkConfig:
     role: str
     transfer_channel_type: str = "nixl"
     nixl_backend: str = "UCX"
+    nixl_backend_params: dict[str, str] = field(default_factory=dict)
     url: str = "127.0.0.1:7600"
     listen_url: str = "0.0.0.0:7601"
     control_url: str = "0.0.0.0:7610"
@@ -121,6 +126,8 @@ class BenchmarkConfig:
                 f"num_source_objects ({self.num_source_objects}) must be >= "
                 f"num_objects ({self.num_objects})"
             )
+        if not all(isinstance(v, str) for v in self.nixl_backend_params.values()):
+            raise ValueError("nixl_backend_params values must all be strings")
 
 
 def add_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
@@ -148,6 +155,12 @@ def add_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
         "--nixl-backend",
         default="UCX",
         help="nixl backend name (nixl-specific), e.g. UCX.",
+    )
+    parser.add_argument(
+        "--nixl-backend-params",
+        default="{}",
+        help="JSON object of string init params for --nixl-backend "
+        '(nixl-specific), e.g. \'{"listen_ip": "10.0.0.2"}\' for RBLN.',
     )
     parser.add_argument(
         "--url",
@@ -230,11 +243,22 @@ def build_config(args: argparse.Namespace) -> BenchmarkConfig:
 
     Returns:
         The resolved, validated benchmark configuration.
+
+    Raises:
+        ValueError: If ``--nixl-backend-params`` is not a JSON object of string
+            values, or any field fails :class:`BenchmarkConfig` validation.
     """
+    try:
+        nixl_backend_params = json.loads(args.nixl_backend_params)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--nixl-backend-params is not valid JSON: {exc}") from exc
+    if not isinstance(nixl_backend_params, dict):
+        raise ValueError("--nixl-backend-params must be a JSON object")
     return BenchmarkConfig(
         role=args.role,
         transfer_channel_type=args.transfer_channel_type,
         nixl_backend=args.nixl_backend,
+        nixl_backend_params=nixl_backend_params,
         url=args.url,
         listen_url=args.listen_url,
         control_url=args.control_url,

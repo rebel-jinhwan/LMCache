@@ -751,7 +751,7 @@ def add_p2p_args(
         type=str,
         default="{}",
         help="JSON object of string init params for --p2p-nixl-backend. "
-        'Example for RBLN: \'{"listen_ip": "all"}\'. Default is {}.',
+        'Example for RBLN: \'{"listen_ip": "10.0.0.2"}\'. Default is {}.',
     )
     return parser
 

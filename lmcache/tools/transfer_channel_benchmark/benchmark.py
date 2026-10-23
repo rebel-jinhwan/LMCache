@@ -145,7 +145,8 @@ def server_main(cfg: BenchmarkConfig) -> None:
             l1_memory_desc=manager.get_l1_memory_desc(),
             listen_url=cfg.url,
             advertise_url=cfg.url,
-            backends=[cfg.nixl_backend],
+            backend=cfg.nixl_backend,
+            backend_params=cfg.nixl_backend_params,
         )
         try:
             _serve_catalog(cfg, catalog)
@@ -242,7 +243,8 @@ def client_main(cfg: BenchmarkConfig) -> bool:
             l1_memory_desc=manager.get_l1_memory_desc(),
             listen_url=cfg.listen_url,
             advertise_url=cfg.listen_url,
-            backends=[cfg.nixl_backend],
+            backend=cfg.nixl_backend,
+            backend_params=cfg.nixl_backend_params,
         )
         try:
             local_addrs = ctx.get_transfer_channel_address(

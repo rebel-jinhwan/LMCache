@@ -98,7 +98,7 @@ The normal way application code obtains a context:
 
 | Function | Purpose |
 |---|---|
-| `initialize_transfer_channel_context(transfer_channel_type, l1_memory_desc, listen_url, advertise_url, **kwargs)` | Create the process-global context via the registered factory. Raises if one already exists, or if the type is unknown. `**kwargs` are forwarded to the factory (e.g. `backend="RBLN", backend_params={"listen_ip": "all"}` for nixl). |
+| `initialize_transfer_channel_context(transfer_channel_type, l1_memory_desc, listen_url, advertise_url, **kwargs)` | Create the process-global context via the registered factory. Raises if one already exists, or if the type is unknown. `**kwargs` are forwarded to the factory (e.g. `backend="RBLN", backend_params={"listen_ip": "10.0.0.2"}` for nixl). |
 | `get_transfer_channel_context()` | Return the global context (raises if not initialized). |
 | `delete_transfer_channel_context()` | Close and clear the global context. |
 

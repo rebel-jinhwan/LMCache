@@ -66,7 +66,8 @@ the transferred bytes against that pattern (no `--verify` needed on the server).
 | --- | --- | --- |
 | `--role {server,client}` | both | Which side to run (required). |
 | `--transfer-channel-type` | both | Implementation to benchmark (default `nixl`). |
-| `--nixl-backend` | both | nixl backend, e.g. `UCX` (nixl-specific). |
+| `--nixl-backend` | both | nixl backend, e.g. `UCX` or `RBLN` (nixl-specific). |
+| `--nixl-backend-params` | both | JSON object of string init params for `--nixl-backend`, e.g. `'{"listen_ip": "10.0.0.2"}'` for `RBLN` (nixl-specific). |
 | `--url` | both | Server binds its transfer-channel server here; client dials it. |
 | `--listen-url` | client | Client's own (mandatory) transfer-channel server bind. |
 | `--control-url` | both | Catalog side-channel: server binds, client connects. |

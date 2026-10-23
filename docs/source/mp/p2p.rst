@@ -140,15 +140,20 @@ directory or through ``NIXL_PLUGIN_DIR``. Every server in the fleet must use
 the same backend, because NIXL transfers only between agents that share one.
 
 For example, Rebellions NPU hosts use the ``RBLN`` backend from the Rebellions
-NIXL plugin. It requires ``listen_ip``, which is either the IP of a RoCE NIC or
-``all`` to use every RoCE NIC on the host:
+NIXL plugin. It requires ``listen_ip``, the IP of the RoCE NIC to use (replace
+``<RDMA_IP>`` below):
 
 .. code-block:: bash
 
    lmcache server \
        <argument-list> \
        --p2p-nixl-backend RBLN \
-       --p2p-nixl-backend-params '{"listen_ip": "all"}'
+       --p2p-nixl-backend-params '{"listen_ip": "<RDMA_IP>"}'
+
+``listen_ip`` also accepts ``all``, which uses every active RoCE NIC except
+the one that holds the default route. The plugin treats that NIC as the
+management interface. On a host whose only RoCE NIC holds the default route,
+``all`` finds no NIC and the server fails to start, so pass the IP instead.
 
 Mooncake Transfer Engine
 ~~~~~~~~~~~~~~~~~~~~~~~~
