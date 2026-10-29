@@ -232,8 +232,14 @@ cannot check them, so `auto` never selects this mode:
   placed it. Export pins the device layout: memory exported before placement
   is laid out flat on chiplet 0, which overflows that chiplet for a
   production-sized cache and then refuses the layout the model asks for.
-  vLLM-RBLN's dynamic-KV path (`VLLM_RBLN_USE_DYNAMIC_KV_CACHE`, active by
-  default) already registers after `materialize()`.
+  vLLM-RBLN's dynamic-KV path (active by default) registers after
+  `materialize()`, and has been open to `LMCacheMPConnector` since
+  [vllm-rbln#1322](https://github.com/RBLN-SW/vllm-rbln/pull/1322).
+
+vLLM-RBLN meets both with `--rbln-use-exportable-kv-cache`, which is on the
+[`feat/exportable-kv-cache`](https://github.com/RBLN-SW/vllm-rbln/tree/feat/exportable-kv-cache)
+branch and not merged yet. The flag allocates the KV cache with
+`empty_exportable` and refuses to start unless the dynamic-KV resize is active.
 
 **Descriptor and fds** (`ipc_wrapper.py`). `RblnIPCData` carries the opaque
 layout payload, the byte size, the number of fds, an export id and the

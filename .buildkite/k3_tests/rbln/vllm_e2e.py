@@ -11,9 +11,9 @@ through LMCache. The check fails unless:
 
 ``--transfer-mode engine_driven`` (default) has the worker copy KV through
 host memory. ``--transfer-mode lmcache_driven`` has the server open the
-worker's KV over ``torch.rbln.ipc`` and copy it itself; vLLM then runs with
-``lmcache_driven_shim`` on its ``PYTHONPATH`` for the engine-side
-prerequisites (see that module).
+worker's KV over ``torch.rbln.ipc`` and copy it itself; vLLM-RBLN then
+allocates its KV cache with ``--rbln-use-exportable-kv-cache``, the only memory
+``torch.rbln.ipc`` can export.
 
 The rbln-serve image has no curl, so everything here uses the standard
 library.
@@ -173,12 +173,6 @@ def main() -> None:
     lmcache_log = args.log_dir / f"rbln_e2e_{args.transfer_mode}_lmcache.log"
     vllm_log = args.log_dir / f"rbln_e2e_{args.transfer_mode}_vllm.log"
     env = dict(os.environ, LMCACHE_DEVICE_BACKEND="rbln")
-    vllm_env = dict(env)
-    if args.transfer_mode == "lmcache_driven":
-        shim = str(Path(__file__).resolve().parent / "lmcache_driven_shim")
-        vllm_env["PYTHONPATH"] = os.pathsep.join(
-            p for p in (shim, env.get("PYTHONPATH")) if p
-        )
 
     # Run both CLIs through this interpreter so they import the LMCache under
     # test, whether or not its console scripts are on PATH.
@@ -241,13 +235,15 @@ def main() -> None:
         "--kv-transfer-config",
         json.dumps(kv_transfer_config),
     ]
+    if args.transfer_mode == "lmcache_driven":
+        vllm_cmd.append("--rbln-use-exportable-kv-cache")
 
     try:
         with _process(lmcache_cmd, lmcache_log, env) as lmcache_proc:
             _wait_until_ready(
                 f"http://127.0.0.1:{LMCACHE_HTTP_PORT}/healthcheck", lmcache_proc, 60
             )
-            with _process(vllm_cmd, vllm_log, vllm_env) as vllm_proc:
+            with _process(vllm_cmd, vllm_log, env) as vllm_proc:
                 _wait_until_ready(
                     f"http://127.0.0.1:{VLLM_PORT}/v1/models",
                     vllm_proc,
