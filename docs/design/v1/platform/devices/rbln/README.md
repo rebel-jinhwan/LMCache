@@ -9,7 +9,7 @@ Rebellions NPUs. The engine is
 | path | supported | how it gets there |
 |---|---|---|
 | multiprocess, engine-driven | yes | `gather_paged_kv_to_cpu` / `scatter_cpu_to_paged_kv`, dispatching to `RblnDeviceOps.multi_layer_block_kv_transfer` |
-| multiprocess, LMCache-driven | **no** | refused up front |
+| multiprocess, LMCache-driven | opt-in | `torch.rbln.ipc` dma-buf export, see [LMCache-driven transfer](#lmcache-driven-transfer) |
 | in-process | not yet | `CreateGPUConnector` still raises for `rbln`; a follow-up adds the connector |
 
 Multiprocess is the mode that matters first, and it is self-contained: the MP
@@ -19,17 +19,10 @@ path builds no GPU connector at all, resolving layouts through
 `torch.rbln` comes from
 [torch-rbln](https://github.com/RBLN-SW/torch-rbln) through a torch backend
 entry point, so it is visible on a bare `import torch` -- LMCache never imports
-it explicitly. It provides device discovery, `set_device()` and `synchronize()`,
-but no `Stream` / `Event` types. The LMCache-driven path publishes KV buffers
-across processes by exporting a device IPC handle and ordering the handoff with
-a cross-process event, which cannot be expressed without an event type.
-`RblnDeviceSpec` therefore reports `is_lmcache_driven_available()` as `False`
-and leaves `ipc_wrapper_cls` / `event_ipc_backend` at their `None` defaults, so
-`mp_transfer_mode=lmcache_driven` fails at its documented validation point
-instead of crashing later on an attribute lookup. `mp_transfer_mode=auto`
-resolves to the device spec's declared default, which `RblnDeviceSpec`
-derives from that `False` capability as engine-driven, so the default
-needs no special casing.
+it explicitly. `mp_transfer_mode=auto` resolves to engine-driven:
+`RblnDeviceSpec.default_mp_transfer_mode()` returns it even when the
+LMCache-driven path is available, because that path depends on how the engine
+allocates and registers its KV cache (below), which LMCache cannot check.
 
 ## The 6-D KV cache
 
@@ -206,3 +199,72 @@ All RBLN layouts require the engine's KV caches to be real device tensors
 allocation the per-layer tensors are `meta`, and any transfer -- this
 backend's or the shared path's -- dies at the first host copy with "Cannot
 copy out of meta tensor".
+
+## LMCache-driven transfer
+
+With a torch-rbln that provides `torch.rbln.ipc` (cross-process device memory
+over dma-buf), the server can open the worker's KV cache and move blocks
+itself, so the worker no longer copies KV through host memory on every store
+and retrieve.
+
+```
+worker (vLLM-RBLN)                           LMCache server
+KV = torch.rbln.ipc.empty_exportable(...)
+model runs once -> runtime places KV
+register_kv_caches
+  RblnIPCWrapper.wrap(layer)
+    export_tensor -> payload, dma-buf fds
+    park fds, listen on abstract socket
+  REGISTER_KV_CACHE(descriptors) ----------> RblnCacheContext
+                                               RblnIPCWrapper.to_tensor()
+                    <---- export id ----         connect, request fds
+  SCM_RIGHTS fds --------------------------->    open_tensor(payload, fds)
+store / retrieve(block ids, event b"") ----> RblnDeviceOps gather / scatter
+                                             between opened KV and L1 objects
+```
+
+**Engine contract.** Two requirements sit on the engine side, and LMCache
+cannot check them, so `auto` never selects this mode:
+
+- The KV tensors must come from `torch.rbln.ipc.empty_exportable` and cover
+  their whole allocation. `export_tensor` rejects anything else.
+- The engine must register the KV cache only after the compiled model has
+  placed it. Export pins the device layout: memory exported before placement
+  is laid out flat on chiplet 0, which overflows that chiplet for a
+  production-sized cache and then refuses the layout the model asks for.
+  vLLM-RBLN's dynamic-KV path (active by default) registers after
+  `materialize()`, and has been open to `LMCacheMPConnector` since
+  [vllm-rbln#1322](https://github.com/RBLN-SW/vllm-rbln/pull/1322).
+
+vLLM-RBLN meets both with `--rbln-use-exportable-kv-cache`, which is on the
+[`feat/exportable-kv-cache`](https://github.com/RBLN-SW/vllm-rbln/tree/feat/exportable-kv-cache)
+branch and not merged yet. The flag allocates the KV cache with
+`empty_exportable` and refuses to start unless the dynamic-KV resize is active.
+
+**Descriptor and fds** (`ipc_wrapper.py`). `RblnIPCData` carries the opaque
+layout payload, the byte size, the number of fds, an export id and the
+exporter's socket name; fds cannot ride a data-only descriptor. The exporter
+listens on an abstract Unix socket before the registration message leaves, so
+the server never races it. The socket serves each export id once, to peers
+with the exporter's uid, then closes its copies. A re-registration exports
+again. Because the socket is abstract, worker and server must share a network
+namespace.
+
+**Device identity.** `torch.rbln` device properties carry no UUID, and logical
+indices depend on each process's `RBLN_DEVICES`. The wrapper names the
+physical NPUs behind the logical device (`rbln-npu:<ids>`), and the server maps
+that back to its own logical index.
+
+**Ordering** (`event_ipc.py`). `torch.rbln.Event(interprocess=True)` exists,
+but `ipc_handle()` is not implemented yet. `RblnHostSyncEventIPCBackend`
+therefore synchronizes the recording process's device in `record_event` and
+exports an empty handle, so the receiver has nothing left to wait for. This
+costs one device-wide synchronize per store and retrieve on each side. Swap in
+native events once torch-rbln exports them.
+
+**Transfer** (`cache_context.py`). `RblnCacheContext` reuses
+`CPUCacheContext` for layout discovery and bookkeeping. It overrides
+`transfer_object_group` to call `RblnDeviceOps.multi_layer_block_kv_transfer`
+with tensor operands, straight between the opened KV layers and each memory
+object's region, with no device staging buffer. Only full-attention KV is
+supported.

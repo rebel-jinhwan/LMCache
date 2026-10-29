@@ -2,17 +2,23 @@
 """vLLM-RBLN + LMCache multiprocess end-to-end check on a real NPU.
 
 Starts ``lmcache server`` on the rbln backend and ``vllm serve`` (vllm-rbln)
-with ``LMCacheMPConnector`` in engine-driven mode, then sends the same greedy
-prompt twice. vLLM's own prefix cache is disabled, so the second request can
-only skip prefill through LMCache. The check fails unless:
+with ``LMCacheMPConnector``, then sends the same greedy prompt twice. vLLM's
+own prefix cache is disabled, so the second request can only skip prefill
+through LMCache. The check fails unless:
 
 - the first request stored chunks into L1 and the second read them back;
 - both completions are identical.
 
+``--transfer-mode engine_driven`` (default) has the worker copy KV through
+host memory. ``--transfer-mode lmcache_driven`` has the server open the
+worker's KV over ``torch.rbln.ipc`` and copy it itself; vLLM-RBLN then
+allocates its KV cache with ``--rbln-use-exportable-kv-cache``, the only memory
+``torch.rbln.ipc`` can export.
+
 The rbln-serve image has no curl, so everything here uses the standard
 library.
 
-Usage: python vllm_e2e.py [--model MODEL] [--log-dir DIR]
+Usage: python vllm_e2e.py [--model MODEL] [--transfer-mode MODE] [--log-dir DIR]
 """
 
 # Standard
@@ -155,12 +161,17 @@ def main() -> None:
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument(
+        "--transfer-mode",
+        choices=("engine_driven", "lmcache_driven"),
+        default="engine_driven",
+    )
     parser.add_argument("--log-dir", type=Path, default=Path("/tmp"))
     parser.add_argument("--vllm-timeout", type=float, default=2400.0)
     args = parser.parse_args()
 
-    lmcache_log = args.log_dir / "rbln_e2e_lmcache.log"
-    vllm_log = args.log_dir / "rbln_e2e_vllm.log"
+    lmcache_log = args.log_dir / f"rbln_e2e_{args.transfer_mode}_lmcache.log"
+    vllm_log = args.log_dir / f"rbln_e2e_{args.transfer_mode}_vllm.log"
     env = dict(os.environ, LMCACHE_DEVICE_BACKEND="rbln")
 
     # Run both CLIs through this interpreter so they import the LMCache under
@@ -186,7 +197,7 @@ def main() -> None:
         "--chunk-size",
         str(BLOCK_SIZE),
         "--supported-transfer-mode",
-        "engine_driven",
+        args.transfer_mode,
     ]
     kv_transfer_config = {
         "kv_connector": "LMCacheMPConnector",
@@ -195,6 +206,7 @@ def main() -> None:
         "kv_connector_extra_config": {
             "lmcache.mp.host": "tcp://127.0.0.1",
             "lmcache.mp.port": LMCACHE_PORT,
+            "lmcache.mp.mp_transfer_mode": args.transfer_mode,
         },
     }
     vllm_cmd = [
@@ -223,6 +235,8 @@ def main() -> None:
         "--kv-transfer-config",
         json.dumps(kv_transfer_config),
     ]
+    if args.transfer_mode == "lmcache_driven":
+        vllm_cmd.append("--rbln-use-exportable-kv-cache")
 
     try:
         with _process(lmcache_cmd, lmcache_log, env) as lmcache_proc:
@@ -242,7 +256,7 @@ def main() -> None:
                 print(f"--- tail of {log}", file=sys.stderr)
                 print("\n".join(log.read_text().splitlines()[-200:]), file=sys.stderr)
         raise
-    print("vLLM-RBLN + LMCache e2e ok")
+    print(f"vLLM-RBLN + LMCache e2e ok ({args.transfer_mode})")
 
 
 if __name__ == "__main__":
