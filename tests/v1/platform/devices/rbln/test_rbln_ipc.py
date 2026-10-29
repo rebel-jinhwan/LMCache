@@ -233,7 +233,10 @@ def _importer(descriptor: bytes, conn: Any) -> None:
 
     wrapper = DeviceIPCWrapper.Deserialize(descriptor)
     tensor = wrapper.to_tensor()
-    conn.send(tensor.cpu())
+    # A numpy copy pickles by value. A torch CPU tensor would be shared through
+    # this process's fd server, which is gone if it exits before the parent
+    # unpickles.
+    conn.send(tensor.cpu().numpy())
     tensor.copy_(torch.full(tensor.shape, 7.0, dtype=tensor.dtype))
     torch.rbln.synchronize()  # type: ignore[attr-defined]
     wrapper.close()
@@ -271,6 +274,6 @@ def test_server_opens_worker_tensor_across_processes() -> None:
     proc.join(timeout=60)
 
     assert proc.exitcode == 0
-    assert torch.equal(seen, expected)
+    assert torch.equal(torch.from_numpy(seen), expected)
     assert bool((kv.cpu() == 7.0).all())
     assert bool((layers[0].cpu() == 0).all())
