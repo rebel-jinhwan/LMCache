@@ -213,14 +213,14 @@ class RblnIPCWrapper(DeviceIPCWrapper):
         whole = tensor.new_empty((0,), dtype=torch.uint8).set_(
             storage, 0, (storage.nbytes(),), (1,)
         )
-        exported = torch.rbln.ipc.export_tensor(whole)  # type: ignore[attr-defined]
+        exported, fds = torch.rbln.ipc.export_tensor(whole)  # type: ignore[attr-defined]
         server = _get_fd_server()
         self._export_id = uuid.uuid4().bytes
-        server.park(self._export_id, list(exported.fds))
+        server.park(self._export_id, list(fds))
         self._fd_socket = server.name
         self._payload = bytes(exported.payload)
         self._nbytes = int(exported.nbytes)
-        self._num_fds = len(exported.fds)
+        self._num_fds = int(exported.num_fds)
         self._tensor: torch.Tensor | None = None
 
         self.handle = self._export_id
@@ -280,12 +280,11 @@ class RblnIPCWrapper(DeviceIPCWrapper):
         fds = fetch_fds(self._fd_socket, self._export_id, self._num_fds)
         try:
             handle = torch.rbln.ipc.IpcHandle(  # type: ignore[attr-defined]
-                fds=fds,
                 payload=self._payload,
                 nbytes=self._nbytes,
                 shape=torch.Size((self._nbytes,)),
                 dtype=torch.uint8,
-                device_index=device_index,
+                num_fds=self._num_fds,
             )
             whole = torch.rbln.ipc.open_tensor(  # type: ignore[attr-defined]
                 handle, fds, device=device_index

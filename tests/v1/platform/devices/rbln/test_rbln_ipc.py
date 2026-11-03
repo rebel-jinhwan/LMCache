@@ -56,10 +56,11 @@ def stub_rbln(monkeypatch: pytest.MonkeyPatch) -> Any:
     """
     pipes: list[tuple[int, int]] = []
 
-    def export_tensor(tensor: Any) -> Any:
+    def export_tensor(tensor: Any) -> tuple[Any, list[int]]:
         r, w = os.pipe()
         pipes.append((r, w))
-        return SimpleNamespace(fds=[r], payload=b"layout", nbytes=tensor.nbytes)
+        handle = SimpleNamespace(payload=b"layout", nbytes=tensor.nbytes, num_fds=1)
+        return handle, [r]
 
     ipc = SimpleNamespace(export_tensor=export_tensor, open_tensor=lambda h, f: None)
     monkeypatch.setattr(torch, "rbln", SimpleNamespace(ipc=ipc), raising=False)
