@@ -62,6 +62,7 @@ from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
     get_tokens_per_block,
     is_scratch_spec,
+    kernel_pages_per_block,
 )
 from lmcache.integration.vllm.lazy_offload_manager import LazyOffloadManager
 from lmcache.integration.vllm.lmcache_mp_metadata import (
@@ -965,6 +966,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             kv_caches,
             engine_group_infos=engine_group_infos,
             layout_hints=layout_hints,
+            kernel_pages_per_block=kernel_pages_per_block(
+                kv_cache_config, engine_group_infos, self._dcp_size
+            ),
         )
         if self.dispatcher is not None:
             dispatch(
