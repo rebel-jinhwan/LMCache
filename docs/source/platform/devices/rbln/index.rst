@@ -215,13 +215,13 @@ so it sends the same prompts and retrieves their KV from LMCache:
 
 **Checking the result.** The LMCache server log of terminal 1 confirms the
 transfer path. The KV cache registers through the LMCache-driven module, and
-stores and retrieves report their time:
+each store and retrieve is logged:
 
 .. code-block:: text
 
    LMCache INFO: Registered KV cache for GPU ID ... with 28 layers (lmcache_driven_transfer.py:...)
-   LMCache INFO: Stored 1024 tokens in 0.019 seconds (lmcache_driven_transfer.py:...)
-   LMCache INFO: Retrieved 3072 tokens in 0.052 seconds (lmcache_driven_transfer.py:...)
+   LMCache INFO: Stored 1024 tokens in ... seconds (lmcache_driven_transfer.py:...)
+   LMCache INFO: Retrieved 3072 tokens in ... seconds (lmcache_driven_transfer.py:...)
 
 The server's chunk counters show what run 1 stored and run 2 read back:
 
@@ -233,37 +233,10 @@ With 32 prompts of 3072 tokens, both counters reach 96, three chunks per
 prompt. Stores complete after the responses return, so the write counter can
 lag run 1 by a few seconds.
 
-To compare with engine-driven transfer, restart both servers with
+To run the same check with engine-driven transfer, restart both servers with
 ``--supported-transfer-mode engine_driven``, set
 ``"lmcache.mp.mp_transfer_mode": "engine_driven"``, drop
 ``--rbln-use-exportable-kv-cache``, and run the same two benchmarks.
-
-Example results on one RBLN-CR13 NPU with the commands above:
-
-.. list-table::
-   :header-rows: 1
-
-   * - Mode
-     - Server store, 1024 tokens
-     - Server retrieve, 3072 tokens
-     - Mean TTFT, run 1
-     - Mean TTFT, run 2
-   * - ``engine_driven``
-     - 188 ms
-     - 234 ms
-     - 235 ms
-     - 1293 ms
-   * - ``lmcache_driven``
-     - 16 ms
-     - 50 ms
-     - 128 ms
-     - 141 ms
-
-The server times are the mean of the ``Stored`` and ``Retrieved`` log lines.
-Qwen3-0.6B prefills 3072 tokens about as fast as LMCache retrieves them, so
-run 2 is not faster than run 1 here. This setup checks the transfer path and
-compares the two modes. It does not show the TTFT benefit of a cache hit,
-which needs a model whose prefill costs more than the retrieve.
 
 Supported KV cache layouts
 --------------------------
