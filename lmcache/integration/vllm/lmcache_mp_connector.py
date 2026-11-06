@@ -59,10 +59,9 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
     validate_kv_cache_groups,
 )
 from lmcache.integration.vllm.kv_cache_groups import (
-    create_engine_group_infos_from_vllm,
+    create_engine_groups_from_vllm,
     get_tokens_per_block,
     is_scratch_spec,
-    kernel_pages_per_block,
 )
 from lmcache.integration.vllm.lazy_offload_manager import LazyOffloadManager
 from lmcache.integration.vllm.lmcache_mp_metadata import (
@@ -955,7 +954,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         kv_caches = apply_kv_cache_group_edits(
             kv_cache_config, kv_caches, layout_hints=layout_hints
         )
-        engine_group_infos = create_engine_group_infos_from_vllm(
+        engine_groups = create_engine_groups_from_vllm(
             kv_cache_config,
             kv_caches,
             layout_hints=layout_hints,
@@ -964,11 +963,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self.worker_adapter.register_kv_caches(
             kv_caches,
-            engine_group_infos=engine_group_infos,
+            engine_group_infos=engine_groups.infos,
             layout_hints=layout_hints,
-            kernel_pages_per_block=kernel_pages_per_block(
-                kv_cache_config, engine_group_infos, self._dcp_size
-            ),
+            kernel_pages_per_block=engine_groups.kernel_pages_per_block,
         )
         if self.dispatcher is not None:
             dispatch(
