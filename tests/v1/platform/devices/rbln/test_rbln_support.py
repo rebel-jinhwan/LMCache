@@ -7,8 +7,8 @@ These tests cover the device-backend contract documented in
 - Registry discovery of :class:`~lmcache.v1.platform.devices.rbln.RblnDeviceSpec`.
 - Availability probing, including the case where ``torch.rbln.is_available()``
   raises because every NPU is already claimed.
-- The engine-driven-only capability surface (no IPC handle transfer, no event
-  IPC backend, no cache context).
+- The opt-in LMCache-driven capability surface: available only with
+  ``torch.rbln.ipc``, never the ``auto`` default.
 
 ``torch`` is replaced with a stub in ``sys.modules`` rather than importing
 ``torch_rbln``, so the suite runs on any platform.
@@ -23,11 +23,14 @@ from unittest.mock import patch
 import pytest
 
 # First Party
+from lmcache.v1.multiprocess.transfer_mode import MPTransferMode
 from lmcache.v1.platform import resolve_device_ops
 from lmcache.v1.platform._device_detect import _detect_device, get_device_spec
 from lmcache.v1.platform.base.device_spec import DeviceSpec
 from lmcache.v1.platform.devices.rbln import RblnDeviceSpec
 from lmcache.v1.platform.devices.rbln.device_ops import RblnDeviceOps
+from lmcache.v1.platform.devices.rbln.event_ipc import RblnHostSyncEventIPCBackend
+from lmcache.v1.platform.devices.rbln.ipc_wrapper import RblnIPCWrapper
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -129,32 +132,53 @@ def test_detect_device_selects_rbln_when_forced(
 
 
 # ---------------------------------------------------------------------------
-# Engine-driven-only capability surface
+# Opt-in LMCache-driven capability surface
 # ---------------------------------------------------------------------------
 
 
-def test_handle_transfer_is_unavailable() -> None:
-    """RBLN cannot serve the LMCache-driven path.
+def _with_rbln_ipc(monkeypatch: pytest.MonkeyPatch, ipc: object) -> None:
+    """Install a ``torch.rbln`` exposing ``ipc`` on the real torch module."""
+    # Third Party
+    import torch
 
-    ``torch.rbln`` exposes no ``Event`` type, so ``mp_transfer_mode=
-    lmcache_driven`` must fail at its documented validation point.
-    """
+    monkeypatch.setattr(torch, "rbln", SimpleNamespace(ipc=ipc), raising=False)
+
+
+def test_lmcache_driven_unavailable_without_torch_rbln_ipc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A torch-rbln without cross-process memory cannot serve the path."""
+    _with_rbln_ipc(monkeypatch, None)
     assert DeviceSpec().is_lmcache_driven_available() is False
     assert RblnDeviceSpec().is_lmcache_driven_available() is False
 
 
-def test_no_ipc_wrapper_and_no_event_backend() -> None:
-    """Neither LMCache-driven building block is advertised."""
-    spec = RblnDeviceSpec()
-    assert spec.ipc_wrapper_cls is None
-    assert spec.event_ipc_backend is None
+def test_lmcache_driven_available_with_torch_rbln_ipc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``torch.rbln.ipc`` export and open make the path available."""
+    _with_rbln_ipc(
+        monkeypatch,
+        SimpleNamespace(export_tensor=lambda t: None, open_tensor=lambda h, f: None),
+    )
+    assert RblnDeviceSpec().is_lmcache_driven_available() is True
 
 
-def test_create_cache_context_is_not_implemented() -> None:
-    """The cache context is LMCache-driven only, so it stays unimplemented."""
+def test_auto_mode_stays_engine_driven(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LMCache-driven is opt-in even when available."""
+    _with_rbln_ipc(
+        monkeypatch,
+        SimpleNamespace(export_tensor=lambda t: None, open_tensor=lambda h, f: None),
+    )
+    assert RblnDeviceSpec().default_mp_transfer_mode() is MPTransferMode.ENGINE_DRIVEN
+
+
+def test_lmcache_driven_building_blocks_are_advertised() -> None:
+    """The spec binds the RBLN wrapper and the host-synchronous event backend."""
     spec = RblnDeviceSpec()
-    with pytest.raises(NotImplementedError):
-        spec.create_cache_context()
+    assert spec.ipc_wrapper_cls is RblnIPCWrapper
+    assert isinstance(spec.event_ipc_backend, RblnHostSyncEventIPCBackend)
+    assert spec.event_ipc_backend is spec.event_ipc_backend
 
 
 def test_pin_memory_falls_back_to_the_default_backend() -> None:

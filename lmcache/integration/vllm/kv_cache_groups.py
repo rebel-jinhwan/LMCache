@@ -366,6 +366,11 @@ def create_engine_group_infos_from_vllm(
         if kv_cache_config is not None
         else ()
     )
+    # Every vLLM group shares one block-id space size; aux pools (below) keep
+    # their own and report none.
+    vllm_num_blocks = (
+        getattr(kv_cache_config, "num_blocks", 0) if kv_cache_config is not None else 0
+    )
 
     # Scratch groups skip format discovery: their layers are excluded below and
     # never transferred, so a layout the transfer kernels reject must not fail
@@ -476,6 +481,11 @@ def create_engine_group_infos_from_vllm(
                 tp_replicas=kv_tp_size if replicated else 1,
                 # DCP splits a replicated group's tokens across its replicas.
                 dcp_shards=dcp_size if replicated else 1,
+                num_blocks=(
+                    vllm_num_blocks
+                    if identity.engine_group_idx < len(vllm_groups)
+                    else 0
+                ),
             )
         )
     return infos
