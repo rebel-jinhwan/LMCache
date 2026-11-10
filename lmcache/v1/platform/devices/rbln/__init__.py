@@ -7,14 +7,13 @@ to the CPU stub.  ``torch.rbln`` is contributed by the ``torch_rbln``
 package through a torch backend entry point, so it is visible on a bare
 ``import torch`` -- no explicit ``import torch_rbln`` is required here.
 
-Scope: **engine-driven** multiprocess (MP) transfer only.  ``torch.rbln``
-exposes device discovery and ``synchronize()`` but no ``Stream`` / ``Event``
-types, so the LMCache-driven path (which needs cross-process event IPC and
-an IPC handle wrapper) cannot be supported.  The spec therefore reports
-:meth:`RblnDeviceSpec.is_lmcache_driven_available` as ``False`` and leaves
-``ipc_wrapper_cls`` / ``event_ipc_backend`` at their ``None`` defaults, so
-requesting ``mp_transfer_mode=lmcache_driven`` fails fast with a clear
-error rather than crashing deeper in the transfer path.
+Multiprocess (MP) transfer is **engine-driven** by default. With a torch-rbln
+that provides ``torch.rbln.ipc`` (cross-process device memory),
+``mp_transfer_mode=lmcache_driven`` is available as an opt-in: the worker
+exports its KV tensors (:class:`~.ipc_wrapper.RblnIPCWrapper`) and the server
+moves blocks itself (:class:`~.cache_context.RblnCacheContext`), ordered by
+host synchronization (:class:`~.event_ipc.RblnHostSyncEventIPCBackend`) until
+torch-rbln exports interprocess events.
 
 See ``docs/design/v1/platform/devices/rbln/README.md`` for the full contract.
 """
@@ -23,14 +22,18 @@ See ``docs/design/v1/platform/devices/rbln/README.md`` for the full contract.
 from __future__ import annotations
 
 # Standard
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 # First Party
+from lmcache.v1.multiprocess.transfer_mode import MPTransferMode
 from lmcache.v1.platform.base.device_spec import DeviceSpec
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.platform.base.cache_context import BaseCacheContext
     from lmcache.v1.platform.base.device_ops import DeviceOps
+    from lmcache.v1.platform.base.event_ipc import EventIPCBackend
+    from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
 
 # ---------------------------------------------------------------------------
 # Device detection registry entry
@@ -39,6 +42,8 @@ if TYPE_CHECKING:
 
 class RblnDeviceSpec(DeviceSpec):
     """RBLN device specification for the detection registry."""
+
+    _event_backend_cache: "EventIPCBackend | None" = None
 
     @property
     def device_type(self) -> str:
@@ -79,15 +84,51 @@ class RblnDeviceSpec(DeviceSpec):
             return False
 
     def is_lmcache_driven_available(self) -> bool:
-        """Report that RBLN cannot ship KV tensors as IPC handles.
-
-        ``torch.rbln`` exposes no ``Event`` type, so the ordered
-        cross-process publication the LMCache-driven path depends on cannot
-        be expressed.  Returning ``False`` keeps
-        ``mp_transfer_mode=lmcache_driven`` failing at its documented
-        validation point instead of at an attribute lookup later on.
+        """Report whether torch-rbln can share device memory across processes.
 
         Returns:
-            bool: Always ``False``.
+            bool: ``True`` when ``torch.rbln.ipc`` is present.
         """
-        return False
+        # First Party
+        from lmcache.v1.platform.devices.rbln.ipc_wrapper import (
+            is_rbln_memory_ipc_available,
+        )
+
+        return is_rbln_memory_ipc_available()
+
+    def default_mp_transfer_mode(self) -> MPTransferMode:
+        """LMCache-driven is opt-in; ``auto`` stays engine-driven.
+
+        The engine must allocate KV with ``torch.rbln.ipc.empty_exportable``
+        and register it only after the model has placed it, which ``auto``
+        cannot verify.
+        """
+        return MPTransferMode.ENGINE_DRIVEN
+
+    @property
+    def ipc_wrapper_cls(self) -> type[DeviceIPCWrapper] | None:
+        # First Party
+        from lmcache.v1.platform.devices.rbln.ipc_wrapper import RblnIPCWrapper
+
+        return RblnIPCWrapper
+
+    def create_cache_context(self, *args: Any, **kwargs: Any) -> "BaseCacheContext":
+        """Create the RBLN cache context for LMCache-driven transfer."""
+        # First Party
+        from lmcache.v1.platform.devices.rbln.cache_context import RblnCacheContext
+
+        return RblnCacheContext(*args, **kwargs)
+
+    @property
+    def event_ipc_backend(self) -> "EventIPCBackend":
+        """Return the host-synchronous RBLN event backend."""
+        backend = self._event_backend_cache
+        if backend is None:
+            # First Party
+            from lmcache.v1.platform.devices.rbln.event_ipc import (
+                RblnHostSyncEventIPCBackend,
+            )
+
+            backend = RblnHostSyncEventIPCBackend()
+            self._event_backend_cache = backend
+        return backend

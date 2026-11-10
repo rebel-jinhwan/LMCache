@@ -122,6 +122,25 @@ class MusaIPCData(IPCData, tag="musa"):
         validate_musa_handle(self.handle)
 
 
+class RblnIPCData(IPCData, tag="rbln"):
+    """RBLN dma-buf export; the fds themselves are fetched from ``fd_socket``.
+
+    ``payload`` is the runtime's opaque layout description. ``fd_socket`` is
+    the exporter's abstract Unix socket that hands out the ``num_fds`` dma-buf
+    fds for ``export_id`` over ``SCM_RIGHTS``.
+    """
+
+    export_id: Annotated[bytes, msgspec.Meta(min_length=16, max_length=16)]
+    payload: bytes
+    nbytes: NonNegative
+    num_fds: Annotated[int, msgspec.Meta(ge=1)]
+    fd_socket: Annotated[str, msgspec.Meta(min_length=1, max_length=107)]
+
+    def __post_init__(self) -> None:
+        if self.metadata.byte_span() > self.nbytes:
+            raise ValueError("IPC view exceeds RBLN export")
+
+
 def validate_musa_handle(value: object) -> None:
     """Reject opaque objects and extensions in a MUSA handle.
 
@@ -182,6 +201,7 @@ WireIPCData: TypeAlias = (
     | CpuShmIPCData
     | MusaIPCData
     | NpuIPCData
+    | RblnIPCData
 )
 
 # Only these local implementations can be selected by a decoded descriptor.
@@ -192,4 +212,5 @@ WRAPPER_TYPES: dict[type[msgspec.Struct], tuple[str, str]] = {
     CpuShmIPCData: ("cpu.shm", "CpuShmTensorWrapper"),
     MusaIPCData: ("musa.ipc_wrapper", "MusaIPCWrapper"),
     NpuIPCData: ("npu.ipc_wrapper", "NpuIPCWrapper"),
+    RblnIPCData: ("rbln.ipc_wrapper", "RblnIPCWrapper"),
 }
