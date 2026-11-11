@@ -7,6 +7,11 @@ engine-driven path runs in the worker (:class:`RblnDeviceOps`). Chunks are
 written straight into, and read straight from, the host memory objects, so
 there is no device staging buffer.
 
+A device-staged L1 object (:class:`DeviceStagedMemoryObj`, e.g. an
+external NVMe tier) has no host bytes: it lends a device buffer, which a store
+fills device-to-device before the object persists it, and which a retrieve
+scatters into the KV after the object filled it (see ``device_staging``).
+
 Everything not tied to the device -- layer-group discovery, the CPU block-ID
 buffer, shape bookkeeping -- comes from :class:`CPUCacheContext`.
 """
@@ -25,8 +30,10 @@ from lmcache import device_ops
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import LayoutHints
+from lmcache.v1.memory_management import DeviceStagedMemoryObj
 from lmcache.v1.multiprocess.object_group_transfer import recalculate_blocks_to_skip
 from lmcache.v1.platform.devices.cpu.cache_context import CPUCacheContext
+from lmcache.v1.platform.devices.rbln.device_staging import transfer_blocks_on_device
 import lmcache.lmcache_native as lmcache_native
 
 if TYPE_CHECKING:
@@ -166,33 +173,29 @@ class RblnCacheContext(CPUCacheContext):
             skip_tokens = max(0, skip_first_n_tokens - chunk_start) if is_h2d else 0
             if skip_tokens >= chunk_tokens:
                 continue
+            if isinstance(memory_obj, DeviceStagedMemoryObj):
+                self._transfer_device_staged_chunk(
+                    block_ids_gpu,
+                    memory_obj,
+                    chunk_idx=chunk_idx,
+                    num_chunks=len(memory_objs),
+                    object_group_id=object_group_id,
+                    skip_tokens=skip_tokens,
+                    direction=direction,
+                )
+                continue
             raw = memory_obj.raw_tensor
             if raw is None:
                 raise ValueError(f"MemoryObj for chunk {chunk_idx} has no host tensor")
             for kernel_group_idx in object_group.kernel_group_indices:
                 group = manager.kernel_groups[kernel_group_idx]
-                # Blocks move a tensor page at a time. With kernel paging
-                # (vLLM kernel_block_size < block_size) engine block b covers
-                # pages b*k .. b*k+k-1 and a window can be a fraction of a block.
-                pages_per_block = group.kernel_pages_per_block
-                page_tokens = group.tokens_per_block // pages_per_block
-                pages_per_chunk = chunk_tokens // page_tokens
-                pages_per_window = (
-                    min(
-                        chunk_tokens,
-                        manager.get_subchunk_sw_size_tokens(kernel_group_idx),
-                    )
-                    // page_tokens
+                pages, skip_pages = self._chunk_pages(
+                    block_ids_gpu,
+                    kernel_group_idx,
+                    chunk_idx=chunk_idx,
+                    num_chunks=len(memory_objs),
+                    skip_tokens=skip_tokens,
                 )
-                staged = block_ids_gpu[kernel_group_idx].tolist()
-                ids_per_chunk = len(staged) // len(memory_objs)
-                pages = [
-                    block_id * pages_per_block + page
-                    for block_id in staged[
-                        chunk_idx * ids_per_chunk : (chunk_idx + 1) * ids_per_chunk
-                    ]
-                    for page in range(pages_per_block)
-                ][-pages_per_window:]
                 shape, dtype = self.get_kernel_group_shape_dtype(
                     chunk_tokens, kernel_group_idx
                 )
@@ -201,9 +204,6 @@ class RblnCacheContext(CPUCacheContext):
                 )
                 nbytes = shape.numel() * dtype.itemsize
                 chunk = raw.view(torch.uint8)[offset : offset + nbytes]
-                skip_pages = recalculate_blocks_to_skip(
-                    pages_per_chunk, pages_per_window, skip_tokens // page_tokens
-                )
                 device_ops.multi_layer_block_kv_transfer(
                     [self.kv_caches_[i] for i in group.layer_indices],
                     [chunk.view(dtype).view(shape)],
@@ -215,6 +215,121 @@ class RblnCacheContext(CPUCacheContext):
                     self.get_engine_kv_format(kernel_group_idx),
                     skip_pages,
                 )
+
+    def _chunk_pages(
+        self,
+        block_ids_gpu: list[torch.Tensor],
+        kernel_group_idx: int,
+        *,
+        chunk_idx: int,
+        num_chunks: int,
+        skip_tokens: int,
+    ) -> tuple[list[int], int]:
+        """Return one chunk's tensor pages for a kernel group, and pages to skip.
+
+        Blocks move a tensor page at a time. With kernel paging (vLLM
+        ``kernel_block_size < block_size``) engine block ``b`` covers pages
+        ``b*k .. b*k+k-1``, and a window can be a fraction of a block.
+
+        Args:
+            block_ids_gpu: Staged block IDs per kernel group (host tensors).
+            kernel_group_idx: Kernel group to page.
+            chunk_idx: Chunk position in the transfer.
+            num_chunks: Chunks in the transfer.
+            skip_tokens: Leading tokens of this chunk a retrieve skips.
+
+        Returns:
+            ``(pages, skip_pages)``: the pages in token order, and how many
+            leading ones a retrieve leaves untouched.
+        """
+        manager = self.kv_layer_groups_manager_
+        chunk_tokens = self.lmcache_tokens_per_chunk
+        group = manager.kernel_groups[kernel_group_idx]
+        pages_per_block = group.kernel_pages_per_block
+        page_tokens = group.tokens_per_block // pages_per_block
+        pages_per_chunk = chunk_tokens // page_tokens
+        pages_per_window = (
+            min(chunk_tokens, manager.get_subchunk_sw_size_tokens(kernel_group_idx))
+            // page_tokens
+        )
+        staged = block_ids_gpu[kernel_group_idx].tolist()
+        ids_per_chunk = len(staged) // num_chunks
+        pages = [
+            block_id * pages_per_block + page
+            for block_id in staged[
+                chunk_idx * ids_per_chunk : (chunk_idx + 1) * ids_per_chunk
+            ]
+            for page in range(pages_per_block)
+        ][-pages_per_window:]
+        skip_pages = recalculate_blocks_to_skip(
+            pages_per_chunk, pages_per_window, skip_tokens // page_tokens
+        )
+        return pages, skip_pages
+
+    def _transfer_device_staged_chunk(
+        self,
+        block_ids_gpu: list[torch.Tensor],
+        memory_obj: DeviceStagedMemoryObj,
+        *,
+        chunk_idx: int,
+        num_chunks: int,
+        object_group_id: int,
+        skip_tokens: int,
+        direction: lmcache_native.TransferDirection,
+    ) -> None:
+        """Store one chunk to, or retrieve it from, a device-staged L1 object.
+
+        The object runs the transfer and lends a device buffer of its physical
+        size; this context moves every kernel group of the chunk between the
+        KV and that buffer, device to device, and waits for the copies before
+        handing the buffer back.
+        """
+        is_h2d = direction == lmcache_native.TransferDirection.H2D
+        manager = self.kv_layer_groups_manager_
+        chunk_tokens = self.lmcache_tokens_per_chunk
+
+        def move(area: torch.Tensor) -> None:
+            if area.device != self.device_ or area.numel() * area.element_size() < (
+                memory_obj.get_physical_size()
+            ):
+                raise ValueError(
+                    f"Staging buffer for chunk {chunk_idx} must hold "
+                    f"{memory_obj.get_physical_size()} bytes on {self.device_}"
+                )
+            buffer = area.view(torch.uint8)
+            for kernel_group_idx in manager.object_groups[
+                object_group_id
+            ].kernel_group_indices:
+                group = manager.kernel_groups[kernel_group_idx]
+                pages, skip_pages = self._chunk_pages(
+                    block_ids_gpu,
+                    kernel_group_idx,
+                    chunk_idx=chunk_idx,
+                    num_chunks=num_chunks,
+                    skip_tokens=skip_tokens,
+                )
+                shape, dtype = self.get_kernel_group_shape_dtype(
+                    chunk_tokens, kernel_group_idx
+                )
+                offset = self.get_kernel_group_offset_in_object(
+                    object_group_id, kernel_group_idx
+                )
+                nbytes = shape.numel() * dtype.itemsize
+                transfer_blocks_on_device(
+                    [self.kv_caches_[i] for i in group.layer_indices],
+                    buffer[offset : offset + nbytes].view(dtype).view(shape),
+                    pages,
+                    direction,
+                    self.get_shape_desc(kernel_group_idx),
+                    self.get_slots_per_chunk_in_sw(kernel_group_idx),
+                    self.get_engine_kv_format(kernel_group_idx),
+                    skip_pages,
+                )
+            # The object persists, or the next transfer overwrites, what the
+            # copies above have queued on the device.
+            torch.rbln.synchronize(self.device_)  # type: ignore[attr-defined]
+
+        memory_obj.transfer_through_device(self.device_, not is_h2d, move)
 
     def _check_shm_capacity(self) -> None:
         """The KV cache lives in device memory, not ``/dev/shm``."""
