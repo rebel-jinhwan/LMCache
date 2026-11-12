@@ -10,13 +10,20 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.v1.gpu_connector.utils import LayoutHints
+    from lmcache.v1.common.utils import LayoutHints
 
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 
 logger = init_logger(__name__)
+
+# vLLM's BlockPool reserves block 0 as the null block that stands in for blocks
+# a sliding-window or Mamba group dropped; the LMCache server's default
+# ``null_block_id`` is the same ID. Mirrors
+# ``vllm.v1.attention.backends.utils.NULL_BLOCK_ID`` (an internal module) so
+# this module stays importable without vLLM; a test pins the two together.
+VLLM_NULL_BLOCK_ID = 0
 
 
 def _is_attention_spec(spec: Any) -> bool:
@@ -63,6 +70,32 @@ def is_scratch_spec(spec: Any) -> bool:
     return not getattr(spec, "participates_in_prefix_caching", True)
 
 
+def is_per_request_state_spec(spec: Any) -> bool:
+    """Return whether the spec is a per-request ring.
+
+    vLLM's ``CircularBufferSpec`` (``KpoolTailSpec`` on older vLLM) gives each
+    request one block for its whole lifetime, written at ``position % capacity``
+    and holding the raw keys of the compression group that is still open. It
+    is a scratch spec (see :func:`is_scratch_spec`), but unlike the other
+    scratch specs its content is needed to resume a request mid-group, e.g.
+    from an unfull chunk. Checked by class name so this module stays
+    importable without vLLM; ``UniformTypeKVCacheSpecs`` is unwrapped first.
+
+    Args:
+        spec: A vLLM KV cache spec, or a ``UniformTypeKVCacheSpecs`` container.
+
+    Returns:
+        ``True`` for a per-request ring spec.
+    """
+    inner = getattr(spec, "kv_cache_specs", None)
+    if isinstance(inner, dict) and inner:
+        spec = next(iter(inner.values()))
+    return is_scratch_spec(spec) and any(
+        cls.__name__ in ("CircularBufferSpec", "KpoolTailSpec")
+        for cls in type(spec).__mro__
+    )
+
+
 def get_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
     """Global tokens covered by one block id of ``kv_cache_spec``.
 
@@ -79,6 +112,92 @@ def get_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
     if _is_attention_spec(kv_cache_spec):
         return block_size * dcp_size
     return block_size
+
+
+def is_align_mode_mamba_spec(spec: Any) -> bool:
+    """Return whether the spec is a Mamba/linear-attention spec in align mode.
+
+    Align mode keeps state snapshots only at chosen boundaries and may move
+    them between blocks, so a block-table position does not identify one;
+    vLLM hands each snapshot's block to connectors instead
+    (``SchedulerOutput.kv_connector_block_state.boundary_state_offloads``).
+    Checked by class name so this module stays importable without vLLM.
+
+    Args:
+        spec: A vLLM KV cache spec.
+
+    Returns:
+        True for a ``MambaSpec`` with ``mamba_cache_mode == "align"``.
+    """
+    return (
+        any(cls.__name__ == "MambaSpec" for cls in type(spec).__mro__)
+        and getattr(spec, "mamba_cache_mode", "none") == "align"
+    )
+
+
+def _kernel_pages_per_block(
+    num_pages: int,
+    num_blocks: int,
+    page_tokens: int,
+    block_tokens: int,
+) -> int:
+    """Return how many tensor pages one vLLM block ID covers.
+
+    When the attention backend cannot page at the configured block size, vLLM
+    pages the tensor at a smaller kernel block size and maps block ``b`` to
+    pages ``b*k .. b*k+k-1`` (``BlockTable.map_to_kernel_blocks``). The tensor
+    then holds ``k`` pages per block ID, which tells it apart from slot
+    compression (one page per block ID, fewer slots than tokens).
+
+    Args:
+        num_pages: Pages along the registered tensor's block axis.
+        num_blocks: Block IDs vLLM allocated (``KVCacheConfig.num_blocks``).
+        page_tokens: Token slots in one tensor page.
+        block_tokens: Tokens one vLLM block ID covers on this rank
+            (``kv_cache_spec.block_size``).
+
+    Returns:
+        ``k`` when ``k`` pages per block ID tile each block's tokens exactly,
+        else ``1``.
+    """
+    if num_pages % num_blocks != 0:
+        return 1
+    pages = num_pages // num_blocks
+    if pages > 1 and page_tokens * pages == block_tokens:
+        return pages
+    return 1
+
+
+def expand_block_ids_to_kernel_pages(
+    block_ids: Sequence[int], pages_per_block: int
+) -> list[int]:
+    """Expand vLLM block IDs into a kernel-paged group's tensor page IDs.
+
+    Mirrors vLLM's ``BlockTable.map_to_kernel_blocks``: block ``b`` covers
+    pages ``b*k .. b*k+k-1``, so block IDs ``[3, 7]`` with ``k = 2`` become
+    pages ``[6, 7, 14, 15]``. The null block becomes ``k`` copies of the null
+    ID instead, so the server still recognizes a chunk of dropped
+    (out-of-window) blocks as all-null and never stores it.
+
+    Args:
+        block_ids: vLLM block IDs of one LMCache group, in token order.
+        pages_per_block: The group's ``k`` from
+            :func:`create_engine_group_infos_from_vllm`.
+
+    Returns:
+        The page IDs, ``k`` per block ID; a copy of ``block_ids`` when
+        ``k == 1``.
+    """
+    if pages_per_block == 1:
+        return list(block_ids)
+    pages: list[int] = []
+    for block_id in block_ids:
+        if block_id == VLLM_NULL_BLOCK_ID:
+            pages.extend([VLLM_NULL_BLOCK_ID] * pages_per_block)
+        else:
+            start = block_id * pages_per_block
+            pages.extend(range(start, start + pages_per_block))
+    return pages
 
 
 def _is_sliding_window_spec(spec: Any) -> bool:
@@ -305,7 +424,7 @@ def create_engine_group_infos_from_vllm(
     layout_hints: "LayoutHints | None" = None,
     dcp_size: int = 1,
     kv_tp_size: int = 1,
-) -> list[EngineGroupInfo]:
+) -> tuple[list[EngineGroupInfo], list[int]]:
     """Build the LMCache engine group infos from vLLM metadata and registered tensors.
 
     This is the single entry point for the vLLM -> LMCache conversion. It reads
@@ -339,13 +458,21 @@ def create_engine_group_infos_from_vllm(
         scratch groups (see :func:`is_scratch_spec`) are excluded and never
         form an info.
 
+        A kernel-paged group (``k`` tensor pages per vLLM block ID, see
+        :func:`_kernel_pages_per_block`) reports ``tokens_per_block`` per
+        page, so LMCache sees an ordinary uncompressed group indexed by page
+        ID. Its block IDs must then be expanded by its ``k`` with
+        :func:`expand_block_ids_to_kernel_pages` before any transfer.
+
     Returns:
-        The list of ``EngineGroupInfo`` in protocol order, i.e. the LMCache group
-        order used by store/retrieve block IDs.
+        ``(infos, pages_per_block)``: the ``EngineGroupInfo`` list in protocol
+        order, i.e. the LMCache group order used by store/retrieve block IDs,
+        and one ``k`` per info (``1`` except for kernel-paged groups).
     """
     # First Party
     from lmcache.utils import EngineType
-    from lmcache.v1.gpu_connector.utils import (
+    from lmcache.v1.common.utils import (
+        get_num_blocks,
         normalize_and_discover_per_layer_formats,
     )
     from lmcache.v1.kv_layer_groups import (
@@ -453,6 +580,7 @@ def create_engine_group_infos_from_vllm(
     # shared, engine-neutral primitive the server reuses to reproduce the same
     # grouping from the registered tensors.
     infos: list[EngineGroupInfo] = []
+    pages_per_block: list[int] = []
     for identity, indices in group_layers_by_identity(
         normalized_kv_caches,
         engine_kv_formats,
@@ -461,13 +589,30 @@ def create_engine_group_infos_from_vllm(
         # A group's object is stored once per TP group only if every layer in
         # it is replicated: one sharded layer makes the object differ per rank.
         replicated = all(per_layer_tp_replicated[idx] for idx in indices)
+        # Only a vLLM group has a spec and a block count to detect kernel pages
+        # against; connector-private aux pools (IDs past the vLLM groups) and a
+        # missing config keep one page per block ID.
+        pages = 1
+        if identity.engine_group_idx < len(vllm_groups):
+            pages = _kernel_pages_per_block(
+                get_num_blocks(
+                    [normalized_kv_caches[indices[0]]], identity.engine_kv_format
+                ),
+                kv_cache_config.num_blocks,
+                identity.block_size,
+                vllm_groups[identity.engine_group_idx].kv_cache_spec.block_size,
+            )
+        pages_per_block.append(pages)
+        # A kernel-paged group is described per tensor page, the unit the
+        # transfer kernels index; the worker expands its block IDs to match.
+        tokens_per_block = (
+            group_tokens_per_block.get(identity.engine_group_idx, 0) // pages
+        )
         infos.append(
             EngineGroupInfo(
                 engine_group_id=identity.engine_group_idx,
                 layer_indices=tuple(indices),
-                tokens_per_block=group_tokens_per_block.get(
-                    identity.engine_group_idx, 0
-                ),
+                tokens_per_block=tokens_per_block,
                 sw_size_tokens=_merge_layer_sw_sizes(per_layer_sw_size, indices),
                 # Connector-private pools bucket by tag under
                 # --separate-object-groups, after the regular groups.
@@ -478,4 +623,4 @@ def create_engine_group_infos_from_vllm(
                 dcp_shards=dcp_size if replicated else 1,
             )
         )
-    return infos
+    return infos, pages_per_block
